@@ -11,7 +11,11 @@ from typing import Final, Union, Callable, Sequence, Awaitable
 from pathlib import Path
 
 import httpx
-from fastembed import SparseTextEmbedding
+try:
+    from fastembed import SparseTextEmbedding
+except ImportError:
+    SparseTextEmbedding = None  # type: ignore[assignment]
+    # onnxruntime 缺少当前平台 wheel（如 macOS x86_64），fastembed 无法加载
 from qdrant_client import AsyncQdrantClient
 from huggingface_hub import constants as hf_constants, snapshot_download
 
@@ -650,6 +654,10 @@ def _get_sparse_model():
 
     if not is_enable_ai():
         return
+
+    if SparseTextEmbedding is None:
+        logger.warning(t("🧠 [Memory] fastembed 不可用（当前平台缺少 onnxruntime），BM25 稀疏嵌入将跳过"))
+        return None
 
     if _sparse_model is None:
         with _sparse_model_lock:

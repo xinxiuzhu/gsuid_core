@@ -25,7 +25,14 @@ class LocalRerankerProvider:
     """本地 fastembed Reranker 提供方。"""
 
     def __init__(self, model_name: str):
-        from fastembed.rerank.cross_encoder import TextCrossEncoder
+        try:
+            from fastembed.rerank.cross_encoder import TextCrossEncoder
+        except ImportError:
+            raise RuntimeError(
+                "fastembed 不可用（当前平台缺少 onnxruntime wheel，如 macOS x86_64）。"
+                "请将 rerank_provider 改为 'openai' 使用远程 Rerank API，"
+                "或切换到 Apple Silicon / Linux / Windows 平台。"
+            ) from None
 
         logger.info(t("🧠 [Reranker] 正在加载本地Reranker模型: {model_name}", model_name=model_name))
         self._model = TextCrossEncoder(

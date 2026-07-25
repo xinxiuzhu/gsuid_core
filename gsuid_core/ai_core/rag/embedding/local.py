@@ -52,7 +52,14 @@ class LocalEmbeddingProvider(EmbeddingProvider):
     """本地嵌入模型提供方（基于 fastembed）"""
 
     def __init__(self, model_name: str, cache_dir: str, threads: int | None = None):
-        from fastembed import TextEmbedding
+        try:
+            from fastembed import TextEmbedding
+        except ImportError:
+            raise RuntimeError(
+                "fastembed 不可用（当前平台缺少 onnxruntime wheel，如 macOS x86_64）。"
+                "请将 embedding_provider 改为 'openai' 使用远程嵌入，"
+                "或切换到 Apple Silicon / Linux / Windows 平台。"
+            ) from None
 
         if threads is None:
             threads = _resolve_threads()
