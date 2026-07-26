@@ -20,18 +20,23 @@ GsCore 群聊**全群共享一个 Session 与记忆**（Session ID 不含 user_i
 | `scope_type` | 含义 | 关键字段 | 典型用途 |
 |------|------|---------|---------|
 | `global` | 兜底全局总额（对所有会话求和） | 无 | 全局成本闸门/熔断 |
+| `group_each` | 所有群使用同一配额，但按实际群号**分别统计** | 无 | 配置一次，为每个群提供相同且互不共享的额度 |
 | `group` | 某群**全员共享**额度 | `scope_id`=群号 | 限制某个群的总消耗 |
 | `member` | 某群内**某个人** | `scope_id`=群号, `member_id`=用户号 | 限制群里某个话痨 |
 | `user` | 某人的**私聊** | `scope_id`=用户号 | 限制某人私聊消耗 |
 
+> `group_each` 只匹配群聊。一条规则会在每个实际群下形成独立用量桶：群 A 的消耗不会占用
+> 群 B 的额度；如需为某个群追加更严格的限制，可同时创建 `group` 规则，两条规则继续叠加生效。
+>
 > **「某个人」如何限制**：群聊里限制某人用 `member` 维度；私聊里限制某人用 `user` 维度。
 > 群聊不存在「按人独立」的 Session，因此没有「某人跨所有群的统一额度」这一维度
 > （需要的话给每个群各建 `member` 规则，或用 `global` 兜底）。
 
 ### 多规则叠加
 
-一条消息可能命中**多条**规则（如 `group` 群额度 + 该群某 `member` 额度 + `global` 总额）。
-**任一规则的任一窗口超限即拦截**，返回首个触发的窗口明细。
+一条消息可能命中**多条**规则（如 `group_each` 默认单群额度 + `group` 指定群额度 +
+该群某 `member` 额度 + `global` 总额）。**任一规则的任一窗口超限即拦截**，返回首个触发的
+窗口明细。`priority` 只决定同时超限时先报告哪条规则，不会让指定群规则覆盖默认单群规则。
 
 ### 窗口（window）与模式（period_mode）
 
@@ -60,8 +65,10 @@ GsCore 群聊**全群共享一个 Session 与记忆**（Session ID 不含 user_i
 
 ### 已知边界
 
-- **记账点**：仅**交互式**（带事件上下文）的 AI run 计入对应 Session 额度；子 Agent /
-  心跳 / 定时任务等后台调用的 Token 只进全局统计、**不占** Session 预算。
+- **记账点**：交互式 AI run，以及能够恢复或显式绑定预算 scope 的心跳、定时任务、记忆摄入等
+  后台调用，会计入对应群/用户额度；完全没有预算 scope 的后台调用不会进入预算账本。
+- **部署边界**：当前额度真值源是单进程内存账本；多 worker / 多副本不会实时共享新用量，不能视为
+  分布式硬配额。
 - **软上限**：判定发生在调用 LLM **之前**，用量在 run **之后**记账，故最后一次请求可能略微
   超出上限，下一条消息才会被拦（标准的「软封顶」语义）。
 - 账本流水仅保留约 8 天（最长只需周窗），每日凌晨自动清理。
@@ -112,7 +119,7 @@ PUT /api/ai/budget/config
 GET /api/ai/budget/rules?scope_type=&enabled=&q=&with_usage=false
 ```
 **Query 参数**：
-- `scope_type`：按维度筛选 `global/group/member/user`（可选）
+- `scope_type`：按规则维度筛选 `global/group_each/group/member/user`（可选）
 - `enabled`：按启用状态筛选（可选）
 - `q`：按名称 / `scope_id` / `member_id` 模糊筛选（可选）
 - `with_usage`：为 `true` 时每条规则附带 `usage`（实时逐窗口用量，见 41.5）
@@ -170,12 +177,25 @@ POST /api/ai/budget/rules
     "note": "群聊总额度"
 }
 ```
+`group_each` 示例（配置一次，每个群分别拥有日额度 300000）：
+```json
+{
+    "name": "全局单群默认额度",
+    "scope_type": "group_each",
+    "scope_id": "",
+    "member_id": "",
+    "limit_short": 0,
+    "limit_day": 300000,
+    "limit_week": 0
+}
+```
 **字段校验**：
-- `scope_type` ∈ `global/group/member/user`；`group/member/user` 时 `scope_id` 必填，
-  `member` 时 `member_id` 必填。
+- `scope_type` ∈ `global/group_each/group/member/user`；`group/member/user` 时 `scope_id`
+  必填，`member` 时 `member_id` 必填。
+- `group_each` 与 `global` 的 `scope_id/member_id` 会被清空；`group/user` 的 `member_id` 会被清空。
 - `period_mode` ∈ `rolling/fixed`；`short_window_hours` ∈ `1~168`。
-- 三个 `limit_*` 至少有一个 `> 0`（否则该规则毫无约束）。
-- `name` 留空时自动用维度标签（如「群 789012」）。
+- 三个 `limit_*` 至少有一个 `> 0`（创建和更新后的最终值均校验）。
+- `name` 留空时自动用维度标签（如「群 789012」或「全局单群」）。
 
 **响应**：`data` 为新建规则完整对象。
 
@@ -214,6 +234,10 @@ GET /api/ai/budget/rules/{rule_id}
 ```
 > `reset_at` 为窗口预计恢复时间戳（秒）。`fixed` 模式精确；`rolling` 模式按窗口内最早一笔
 > 流水估算（窗口内无流水时为 `null`）。
+>
+> `group_each` 一条规则对应多个独立群桶，因此列表/详情不返回会误解为全群共享总量的 `usage`，
+> 而返回 `usage_summary`：`active_group_count`、`blocked_group_count`、`top_group_id`、
+> `top_utilization` 和最高利用率群的 `top_status`。查看某个具体群的完整状态仍使用 41.13。
 
 ---
 
@@ -321,9 +345,10 @@ GET /api/ai/budget/usage?dimension=group&window=day&limit=20&bot_id=&include_exe
 ```
 GET /api/ai/budget/usage/scope?scope_type=group&scope_id=789012&member_id=&bot_id=
 ```
-返回该 scope 下**所有适用规则**的逐窗口 `used/limit/remaining/reset_at`（即 41.5 的
-`usage` 结构数组）。`ignore_exempt` 内部恒为真，故即便代表用户是白名单/主人也会照常展示规则
-明细。
+返回该具体 scope 下**所有适用规则**的逐窗口 `used/limit/remaining/reset_at`（即 41.5 的
+`usage` 结构数组）。查询维度仅接受 `global/group/member/user`；要查看 `group_each` 对某个群的
+状态，传 `scope_type=group&scope_id=<实际群号>`，返回的适用规则中会包含该 `group_each` 规则。
+接口会强制评估，故即便代表用户是白名单/主人也会照常展示规则明细。
 
 **响应**：
 ```json
@@ -393,8 +418,9 @@ POST /api/ai/budget/check
 ```
 POST /api/ai/budget/reset
 ```
-清除某 scope 的用量流水，立即放行。`window` 留空 = 清该 scope **全部**流水；指定窗口则只清
-该窗口默认时长（5h/24h/7d）内的流水。
+清除某个具体 scope 的用量流水，立即放行。`window` 留空 = 清该 scope **全部**流水；指定窗口
+则只清对应时长内的流水。reset 仅接受 `global/group/member/user`；要放行 `group_each` 下的某个
+群，仍传 `scope_type=group` 和实际群号，不存在直接清除抽象 `group_each` scope 的操作。
 
 **请求体**：
 ```json
@@ -435,10 +461,11 @@ GET /api/ai/budget/overview
 ## 41.17 前端 UX 建议
 
 - **总开关 + 计费口径**置顶（41.1/41.2）；提示「关闭时仍记录用量」，鼓励先观察后启用。
-- **规则表**用 `GET /rules?with_usage=true`（41.3）直接渲染「上限 vs 已用」进度条 +
-  `reset_at` 倒计时；行内提供 toggle（41.7）。
-- **新建规则向导**：先选维度→填对象→三档上限（可只填一档）→选滚动/固定。维度的语义差异
-  （群共享 vs 群内某人 vs 私聊）务必在 UI 上点明。
+- **规则表**用 `GET /rules?with_usage=true`（41.3）：固定 scope 规则渲染「上限 vs 已用」进度条
+  和 `reset_at` 倒计时；`group_each` 渲染最高使用群、活跃群数、超限群数和最高群进度；行内提供
+  toggle（41.7）。
+- **新建规则向导**：先选维度→按需填对象→三档上限（可只填一档）→选滚动/固定。维度的语义
+  差异（全局共享 vs 所有群分别计额 vs 指定群共享 vs 群内某人 vs 私聊）务必在 UI 上点明。
 - **白名单**与规则分区管理；强调「全局豁免 vs 仅某群豁免」。
 - **排障入口**：给运营一个输入框（群号 + 用户号）直接打 `POST /check`（41.14）渲染「会不会
   被限 + 命中哪条规则哪个窗口 + 多久恢复」；旁边放「立即放行」按钮调 `POST /reset`（41.15）。

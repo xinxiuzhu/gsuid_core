@@ -1,7 +1,7 @@
 """AI 预算限制数据模型。
 
 三张表（均 `BaseIDModel`，受 AI 总开关控制创建）：
-- `AIBudgetRule`：预算规则（按 global/group/member/user 维度设 5h/天/周上限）。
+- `AIBudgetRule`：预算规则（按 global/group_each/group/member/user 维度设 5h/天/周上限）。
 - `AIBudgetWhitelist`：白名单（命中即整体豁免，永不拦截）。
 - `AIBudgetUsageRecord`：用量流水的持久化后备（真值源是 `manager` 的内存账本，本表只
   供定时落库与重启回载；闸门 / 看板一律读内存，不查本表）。
@@ -20,8 +20,9 @@ from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.utils.database.base_models import BaseIDModel, with_session
 
-# 维度合法值
-SCOPE_TYPES = ("global", "group", "member", "user")
+# 规则维度合法值；group_each 是抽象规则维度，不用于 reset / 具体 scope 查询。
+SCOPE_TYPES = ("global", "group_each", "group", "member", "user")
+CONCRETE_SCOPE_TYPES = ("global", "group", "member", "user")
 # 窗口合法值
 WINDOW_KEYS = ("short", "day", "week")
 
@@ -32,9 +33,9 @@ class AIBudgetRule(BaseIDModel, table=True):
     __table_args__ = {"extend_existing": True}
 
     name: str = Field(default="", title="规则名称")
-    # global=兜底全局总额; group=该群全员共享; member=群内某人; user=该用户私聊
+    # global=兜底总额; group_each=所有群分别计额; group=单群共享; member=群内某人; user=私聊
     scope_type: str = Field(default="global", title="作用维度")
-    # group/member 填群号, user 填用户号, global 留空
+    # group/member 填群号, user 填用户号, global/group_each 留空
     scope_id: str = Field(default="", title="作用对象ID")
     # 仅 member 维度: 群内用户号
     member_id: str = Field(default="", title="群内成员ID")

@@ -22,7 +22,13 @@ from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 
 from .config import budget_config, compute_billable_tokens
-from .models import WINDOW_KEYS, AIBudgetRule, AIBudgetWhitelist, AIBudgetUsageRecord
+from .models import (
+    WINDOW_KEYS,
+    CONCRETE_SCOPE_TYPES,
+    AIBudgetRule,
+    AIBudgetWhitelist,
+    AIBudgetUsageRecord,
+)
 
 # 规则/白名单缓存有效期（秒）。它们仅经 API 变更，命中后 invalidate 立即失效
 _CACHE_TTL = 30.0
@@ -58,7 +64,19 @@ class RuleStatus:
     scope_label: str
     period_mode: str
     blocked: bool
+    effective_group_id: str = ""
     windows: List[WindowStatus] = field(default_factory=list)
+
+
+@dataclass
+class GroupEachUsageSummary:
+    """group_each 规则跨群摘要；每个群仍是独立额度桶，不汇总成共享用量。"""
+
+    active_group_count: int
+    blocked_group_count: int
+    top_group_id: str
+    top_utilization: float
+    top_status: Optional[RuleStatus]
 
 
 @dataclass
@@ -182,9 +200,11 @@ class BudgetManager:
     # ==================== scope / 规则过滤 ====================
 
     @staticmethod
-    def scope_label(scope_type: str, scope_id: str, member_id: str) -> str:
+    def scope_label(scope_type: str, scope_id: str, member_id: str, effective_group_id: str = "") -> str:
         if scope_type == "global":
             return "全局"
+        if scope_type == "group_each":
+            return f"全局单群（群 {effective_group_id}）" if effective_group_id else "全局单群"
         if scope_type == "group":
             return f"群 {scope_id}"
         if scope_type == "member":
@@ -192,9 +212,13 @@ class BudgetManager:
         return f"私聊 {scope_id}"
 
     @staticmethod
-    def _rule_filter(rule: AIBudgetRule) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    def _rule_filter(
+        rule: AIBudgetRule, effective_group_id: str = ""
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """规则的用量求和过滤器：(group_id, user_id, bot_id)；None=不过滤。"""
         bid = rule.bot_id or None
+        if rule.scope_type == "group_each":
+            return effective_group_id, None, bid
         if rule.scope_type == "group":
             return rule.scope_id, None, bid
         if rule.scope_type == "member":
@@ -250,6 +274,8 @@ class BudgetManager:
             return False
         if rule.scope_type == "global":
             return True
+        if rule.scope_type == "group_each":
+            return bool(group_id)
         if rule.scope_type == "group":
             return bool(group_id) and rule.scope_id == group_id
         if rule.scope_type == "member":
@@ -260,9 +286,16 @@ class BudgetManager:
 
     # ==================== 状态计算 ====================
 
-    async def _rule_status(self, rule: AIBudgetRule, now: int, include_exempt: bool, with_reset: bool) -> RuleStatus:
-        """按规则自身过滤器计算各窗口用量与是否超限（全程读内存账本，不查库）。"""
-        gid, uid, bid = self._rule_filter(rule)
+    async def _rule_status(
+        self,
+        rule: AIBudgetRule,
+        now: int,
+        include_exempt: bool,
+        with_reset: bool,
+        effective_group_id: str = "",
+    ) -> RuleStatus:
+        """按规则与实际群过滤器计算各窗口状态（全程读内存账本，不查库）。"""
+        gid, uid, bid = self._rule_filter(rule, effective_group_id)
         mode = str(budget_config.get_config("count_mode").data)
         windows: List[WindowStatus] = []
         blocked = False
@@ -294,16 +327,119 @@ class BudgetManager:
             rule_id=int(rule.id),
             rule_name=rule.name,
             scope_type=rule.scope_type,
-            scope_label=self.scope_label(rule.scope_type, rule.scope_id, rule.member_id),
+            scope_label=self.scope_label(rule.scope_type, rule.scope_id, rule.member_id, effective_group_id),
             period_mode=rule.period_mode,
             blocked=blocked,
+            effective_group_id=effective_group_id if rule.scope_type == "group_each" else "",
             windows=windows,
         )
 
-    async def rule_live_status(self, rule: AIBudgetRule, with_reset: bool = True) -> RuleStatus:
-        """单条规则的实时用量状态（供 API 列表/详情/看板复用）。"""
+    async def rule_live_status(
+        self, rule: AIBudgetRule, with_reset: bool = True, effective_group_id: str = ""
+    ) -> RuleStatus:
+        """单条规则的实时状态；group_each 必须传入要查看的实际群号。"""
+        if rule.scope_type == "group_each" and not effective_group_id:
+            raise ValueError("group_each 状态必须指定 effective_group_id")
         include_exempt = bool(budget_config.get_config("count_exempt_usage").data)
-        return await self._rule_status(rule, int(time.time()), include_exempt, with_reset)
+        return await self._rule_status(rule, int(time.time()), include_exempt, with_reset, effective_group_id)
+
+    async def group_each_usage_summary(
+        self, rule: AIBudgetRule, with_reset: bool = True
+    ) -> GroupEachUsageSummary:
+        """计算 group_each 的跨群摘要；账本只遍历一次，每个群仍独立判限。"""
+        if rule.scope_type != "group_each":
+            raise ValueError("usage_summary 仅适用于 group_each 规则")
+
+        now = int(time.time())
+        include_exempt = bool(budget_config.get_config("count_exempt_usage").data)
+        mode = str(budget_config.get_config("count_mode").data)
+        bid = rule.bot_id or None
+        configured: List[Tuple[str, int, int, Optional[int]]] = []
+        for window in WINDOW_KEYS:
+            limit = rule.limit_for(window)
+            if limit <= 0:
+                continue
+            since, fixed_reset = self._window_start(window, rule.period_mode, rule.short_window_hours, now)
+            configured.append((window, limit, since, fixed_reset))
+
+        used_by_group: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        earliest_by_group: Dict[str, Dict[str, int]] = defaultdict(dict)
+        if configured:
+            oldest_since = min(item[2] for item in configured)
+            for row in self._usage:
+                if row.created_at < oldest_since or not row.group_id:
+                    continue
+                if bid and row.bot_id != bid:
+                    continue
+                if not include_exempt and row.exempt:
+                    continue
+                billable = compute_billable_tokens(
+                    row.input_tokens,
+                    row.output_tokens,
+                    row.cache_read_tokens,
+                    row.cache_write_tokens,
+                    mode,
+                )
+                group_used = used_by_group[row.group_id]
+                group_earliest = earliest_by_group[row.group_id]
+                for window, _limit, since, _fixed_reset in configured:
+                    if row.created_at < since:
+                        continue
+                    group_used[window] += billable
+                    previous = group_earliest.get(window)
+                    if previous is None or row.created_at < previous:
+                        group_earliest[window] = row.created_at
+
+        statuses: List[Tuple[float, RuleStatus]] = []
+        blocked_count = 0
+        for group_id, group_used in used_by_group.items():
+            windows: List[WindowStatus] = []
+            blocked = False
+            utilization = 0.0
+            for window, limit, _since, fixed_reset in configured:
+                used = group_used.get(window, 0)
+                over = used >= limit
+                reset_at = fixed_reset
+                if reset_at is None and (over or with_reset):
+                    earliest = earliest_by_group[group_id].get(window)
+                    if earliest is not None:
+                        reset_at = earliest + self._window_seconds(window, rule.short_window_hours)
+                windows.append(
+                    WindowStatus(
+                        window=window,
+                        window_seconds=self._window_seconds(window, rule.short_window_hours),
+                        limit=limit,
+                        used=used,
+                        remaining=max(0, limit - used),
+                        over=over,
+                        reset_at=reset_at,
+                    )
+                )
+                blocked = blocked or over
+                utilization = max(utilization, used / limit)
+            status = RuleStatus(
+                rule_id=int(rule.id),
+                rule_name=rule.name,
+                scope_type=rule.scope_type,
+                scope_label=self.scope_label(rule.scope_type, rule.scope_id, rule.member_id, group_id),
+                period_mode=rule.period_mode,
+                blocked=blocked,
+                effective_group_id=group_id,
+                windows=windows,
+            )
+            statuses.append((utilization, status))
+            if blocked:
+                blocked_count += 1
+
+        statuses.sort(key=lambda item: (-item[0], item[1].effective_group_id))
+        top_utilization, top_status = statuses[0] if statuses else (0.0, None)
+        return GroupEachUsageSummary(
+            active_group_count=len(statuses),
+            blocked_group_count=blocked_count,
+            top_group_id=top_status.effective_group_id if top_status else "",
+            top_utilization=top_utilization,
+            top_status=top_status,
+        )
 
     async def _exempt_status(self, user_id: str, group_id: str, bot_id: str) -> Tuple[bool, str]:
         """判定该用户在该会话是否豁免，返回 (是否豁免, 原因)。"""
@@ -352,7 +488,8 @@ class BudgetManager:
         block_window: Optional[WindowStatus] = None
 
         for r in matched:
-            status = await self._rule_status(r, now, include_exempt, with_reset)
+            effective_group_id = group_id if r.scope_type == "group_each" else ""
+            status = await self._rule_status(r, now, include_exempt, with_reset, effective_group_id)
             statuses.append(status)
             # 仅在真正生效(启用且不豁免)时把超限计为拦截; 强制评估的展示态不拦截
             if active and block_window is None:
@@ -371,7 +508,12 @@ class BudgetManager:
             rule_statuses=statuses,
             block_rule_id=int(block_rule.id) if block_rule is not None else None,
             block_scope_label=(
-                self.scope_label(block_rule.scope_type, block_rule.scope_id, block_rule.member_id)
+                self.scope_label(
+                    block_rule.scope_type,
+                    block_rule.scope_id,
+                    block_rule.member_id,
+                    group_id if block_rule.scope_type == "group_each" else "",
+                )
                 if block_rule is not None
                 else ""
             ),
@@ -634,7 +776,9 @@ class BudgetManager:
         bot_id: str = "",
         window: str = "",
     ) -> int:
-        """清除某 scope 的用量（管理员手动放行）：内存账本 + DB 双删。window 留空=清全部。"""
+        """清除某具体 scope 的用量：内存账本 + DB 双删。window 留空=清全部。"""
+        if scope_type not in CONCRETE_SCOPE_TYPES:
+            raise ValueError(f"scope_type 必须为具体维度: {CONCRETE_SCOPE_TYPES}")
         gid, uid, bid = self._scope_filter(scope_type, scope_id, member_id, bot_id)
         if window in WINDOW_KEYS:
             short_hours = await self._scope_short_window_hours(scope_type, scope_id, member_id, bot_id)

@@ -21,10 +21,11 @@ from gsuid_core.ai_core.budget.config import COUNT_MODES, budget_config
 from gsuid_core.ai_core.budget.models import (
     SCOPE_TYPES,
     WINDOW_KEYS,
+    CONCRETE_SCOPE_TYPES,
     AIBudgetRule,
     AIBudgetWhitelist,
 )
-from gsuid_core.ai_core.budget.manager import RuleStatus, budget_manager
+from gsuid_core.ai_core.budget.manager import RuleStatus, GroupEachUsageSummary, budget_manager
 
 from ._api_tags import BUDGET
 
@@ -153,6 +154,7 @@ def _rule_status_to_dict(status: RuleStatus) -> Dict[str, Any]:
         "scope_label": status.scope_label,
         "period_mode": status.period_mode,
         "blocked": status.blocked,
+        "effective_group_id": status.effective_group_id,
         "windows": [
             {
                 "window": w.window,
@@ -165,6 +167,16 @@ def _rule_status_to_dict(status: RuleStatus) -> Dict[str, Any]:
             }
             for w in status.windows
         ],
+    }
+
+
+def _group_each_summary_to_dict(summary: GroupEachUsageSummary) -> Dict[str, Any]:
+    return {
+        "active_group_count": summary.active_group_count,
+        "blocked_group_count": summary.blocked_group_count,
+        "top_group_id": summary.top_group_id,
+        "top_utilization": summary.top_utilization,
+        "top_status": _rule_status_to_dict(summary.top_status) if summary.top_status else None,
     }
 
 
@@ -200,6 +212,21 @@ def _validate_rule_fields(
     if short_window_hours is not None and not (1 <= short_window_hours <= 168):
         return "short_window_hours 应在 1~168 之间"
     return None
+
+
+def _normalize_rule_scope(scope_type: str, scope_id: str, member_id: str) -> tuple[str, str]:
+    """按最终维度清理无意义字段，避免维度切换后残留旧对象 ID。"""
+    scope_id = scope_id.strip()
+    member_id = member_id.strip()
+    if scope_type in ("global", "group_each"):
+        return "", ""
+    if scope_type in ("group", "user"):
+        return scope_id, ""
+    return scope_id, member_id
+
+
+def _limits_valid(limit_short: int, limit_day: int, limit_week: int) -> bool:
+    return limit_short > 0 or limit_day > 0 or limit_week > 0
 
 
 # ============ 全局配置 ============
@@ -245,7 +272,7 @@ async def update_budget_config(
 
 @app.get("/api/ai/budget/rules", summary="规则列表", tags=BUDGET)
 async def list_rules(
-    scope_type: Optional[str] = Query(None, description="按维度筛选 global/group/member/user"),
+    scope_type: Optional[str] = Query(None, description="按维度筛选 global/group_each/group/member/user"),
     enabled: Optional[bool] = Query(None, description="按启用状态筛选"),
     q: Optional[str] = Query(None, description="按名称/对象ID模糊筛选"),
     with_usage: bool = Query(False, description="是否附带每条规则的实时用量状态"),
@@ -265,8 +292,12 @@ async def list_rules(
     for r in rules:
         item = _rule_to_dict(r)
         if with_usage:
-            status = await budget_manager.rule_live_status(r, with_reset=True)
-            item["usage"] = _rule_status_to_dict(status)
+            if r.scope_type == "group_each":
+                summary = await budget_manager.group_each_usage_summary(r, with_reset=True)
+                item["usage_summary"] = _group_each_summary_to_dict(summary)
+            else:
+                status = await budget_manager.rule_live_status(r, with_reset=True)
+                item["usage"] = _rule_status_to_dict(status)
         data.append(item)
     return {"status": 0, "msg": "ok", "data": data}
 
@@ -282,15 +313,16 @@ async def create_rule(
     )
     if err:
         return {"status": 1, "msg": err, "data": None}
-    if body.limit_short <= 0 and body.limit_day <= 0 and body.limit_week <= 0:
+    if not _limits_valid(body.limit_short, body.limit_day, body.limit_week):
         return {"status": 1, "msg": "至少需设置一个窗口的 Token 上限（>0）", "data": None}
 
+    scope_id, member_id = _normalize_rule_scope(body.scope_type, body.scope_id, body.member_id)
     now = int(time.time())
     rule_id = await AIBudgetRule.create(
-        name=body.name or budget_manager.scope_label(body.scope_type, body.scope_id, body.member_id),
+        name=body.name or budget_manager.scope_label(body.scope_type, scope_id, member_id),
         scope_type=body.scope_type,
-        scope_id=body.scope_id.strip(),
-        member_id=body.member_id.strip(),
+        scope_id=scope_id,
+        member_id=member_id,
         bot_id=body.bot_id.strip(),
         enabled=body.enabled,
         priority=body.priority,
@@ -318,8 +350,12 @@ async def get_rule(
     if rule is None:
         return {"status": 1, "msg": "规则不存在", "data": None}
     item = _rule_to_dict(rule)
-    status = await budget_manager.rule_live_status(rule, with_reset=True)
-    item["usage"] = _rule_status_to_dict(status)
+    if rule.scope_type == "group_each":
+        summary = await budget_manager.group_each_usage_summary(rule, with_reset=True)
+        item["usage_summary"] = _group_each_summary_to_dict(summary)
+    else:
+        status = await budget_manager.rule_live_status(rule, with_reset=True)
+        item["usage"] = _rule_status_to_dict(status)
     return {"status": 0, "msg": "ok", "data": item}
 
 
@@ -355,6 +391,23 @@ async def update_rule(
     for key in ("limit_short", "limit_day", "limit_week"):
         if key in updates:
             updates[key] = max(0, int(updates[key]))
+
+    final_scope_type = str(updates.get("scope_type", rule.scope_type))
+    final_scope_id = str(updates.get("scope_id", rule.scope_id))
+    final_member_id = str(updates.get("member_id", rule.member_id))
+    normalized_scope_id, normalized_member_id = _normalize_rule_scope(
+        final_scope_type, final_scope_id, final_member_id
+    )
+    updates["scope_id"] = normalized_scope_id
+    updates["member_id"] = normalized_member_id
+
+    final_limits = (
+        int(updates.get("limit_short", rule.limit_short)),
+        int(updates.get("limit_day", rule.limit_day)),
+        int(updates.get("limit_week", rule.limit_week)),
+    )
+    if not _limits_valid(*final_limits):
+        return {"status": 1, "msg": "至少需设置一个窗口的 Token 上限（>0）", "data": None}
     updates["updated_at"] = int(time.time())
 
     await AIBudgetRule.update_data_by_data(select_data={"id": rule_id}, update_data=updates)
@@ -505,15 +558,20 @@ async def get_usage_ranking(
 
 @app.get("/api/ai/budget/usage/scope", summary="查看某 scope 的逐窗口用量", tags=BUDGET)
 async def get_scope_usage(
-    scope_type: str = Query(..., description="维度 global/group/member/user"),
+    scope_type: str = Query(..., description="具体维度 global/group/member/user"),
     scope_id: str = Query("", description="群号或用户号"),
     member_id: str = Query("", description="member 维度的群内用户号"),
     bot_id: str = Query("", description="平台（可选）"),
     _user: Dict[str, Any] = Depends(require_auth),
 ) -> Dict[str, Any]:
     """查看某 scope 的逐窗口用量/上限/剩余/恢复时间（含所有适用规则）。"""
-    if scope_type not in SCOPE_TYPES:
-        return {"status": 1, "msg": f"scope_type 非法，应为 {SCOPE_TYPES} 之一", "data": None}
+    if scope_type not in CONCRETE_SCOPE_TYPES:
+        return {"status": 1, "msg": f"scope_type 非法，应为 {CONCRETE_SCOPE_TYPES} 之一", "data": None}
+    scope_id, member_id = _normalize_rule_scope(scope_type, scope_id, member_id)
+    if scope_type in ("group", "member", "user") and not scope_id:
+        return {"status": 1, "msg": f"scope_type={scope_type} 时 scope_id 必填", "data": None}
+    if scope_type == "member" and not member_id:
+        return {"status": 1, "msg": "scope_type=member 时 member_id 必填", "data": None}
     # 构造代表性消息以复用 evaluate（拿到该 scope 下所有适用规则的明细）
     if scope_type == "group":
         rep_group, rep_user = scope_id, ""
@@ -562,8 +620,8 @@ async def reset_scope_usage(
     _user: Dict[str, Any] = Depends(require_auth),
 ) -> Dict[str, Any]:
     """手动清除某 scope 的用量流水（立即放行）。window 留空=清全部。"""
-    if body.scope_type not in SCOPE_TYPES:
-        return {"status": 1, "msg": f"scope_type 非法，应为 {SCOPE_TYPES} 之一", "data": None}
+    if body.scope_type not in CONCRETE_SCOPE_TYPES:
+        return {"status": 1, "msg": f"scope_type 非法，应为 {CONCRETE_SCOPE_TYPES} 之一", "data": None}
     if body.window and body.window not in WINDOW_KEYS:
         return {"status": 1, "msg": f"window 非法，应为 {WINDOW_KEYS} 之一或留空", "data": None}
     if body.scope_type in ("group", "member", "user") and not body.scope_id.strip():
@@ -571,10 +629,11 @@ async def reset_scope_usage(
     if body.scope_type == "member" and not body.member_id.strip():
         return {"status": 1, "msg": "scope_type=member 时 member_id 必填", "data": None}
 
+    scope_id, member_id = _normalize_rule_scope(body.scope_type, body.scope_id, body.member_id)
     deleted = await budget_manager.reset_scope(
         scope_type=body.scope_type,
-        scope_id=body.scope_id.strip(),
-        member_id=body.member_id.strip(),
+        scope_id=scope_id,
+        member_id=member_id,
         bot_id=body.bot_id.strip(),
         window=body.window,
     )
@@ -595,6 +654,13 @@ async def get_overview(_user: Dict[str, Any] = Depends(require_auth)) -> Dict[st
 
     blocked: List[Dict[str, Any]] = []
     for r in enabled_rules:
+        if r.scope_type == "group_each":
+            summary = await budget_manager.group_each_usage_summary(r, with_reset=True)
+            if summary.blocked_group_count:
+                item = _rule_to_dict(r)
+                item["usage_summary"] = _group_each_summary_to_dict(summary)
+                blocked.append(item)
+            continue
         status = await budget_manager.rule_live_status(r, with_reset=True)
         if status.blocked:
             blocked.append(_rule_status_to_dict(status))
