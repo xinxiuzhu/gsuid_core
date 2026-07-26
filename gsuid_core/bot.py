@@ -250,6 +250,7 @@ class _Bot:
         task_event: Optional[asyncio.Event] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
         wait_recall: bool = False,
+        observe_memory: bool = True,
     ) -> Optional[List[str]]:
         try:
             from gsuid_core.buildin_plugins.core_command.core_ai_control.state import (
@@ -462,7 +463,7 @@ class _Bot:
                 enable_ai: bool = ai_config.get_config("enable").data
                 is_enable_memory: bool = ai_config.get_config("enable_memory").data
                 memory_mode: list[str] = memory_config.memory_mode
-                if enable_ai and is_enable_memory and "主动会话" in memory_mode:
+                if observe_memory and enable_ai and is_enable_memory and "主动会话" in memory_mode:
                     from gsuid_core.ai_core.memory import observe
 
                     try:
@@ -585,6 +586,46 @@ class _Bot:
                 group_id=group_id,
                 user_id=user_id,
                 duration=duration,
+            )
+        )
+        body = msgjson.encode(send)
+
+        async def _do_send(body: bytes = body):
+            if self.bot is not None:
+                await self.bot.send_bytes(body)
+            else:
+                logger.warning(t("log.bot.ws_not_connected_drop"))
+
+        await self._enqueue_send(_do_send())
+
+    async def poke_user(
+        self,
+        user_id: Union[str, int],
+        group_id: Optional[Union[str, int]],
+        target_type: Literal["group", "direct"],
+        target_id: str,
+        bot_id: str,
+        bot_self_id: str,
+    ) -> None:
+        """请求 adapter 戳一戳指定用户（fire-and-forget，无回执）。"""
+        data: Dict[str, str] = {"user_id": str(user_id)}
+        if group_id is not None:
+            data["group_id"] = str(group_id)
+        send = MessageSend(
+            content=[Message(type="excute_poke_user", data=data)],
+            bot_id=bot_id,
+            bot_self_id=bot_self_id,
+            target_type=target_type,
+            target_id=target_id,
+        )
+        logger.info(
+            t(
+                "[Bot] 请求回戳用户: bot={bot_id}, target_type={target_type}, "
+                "target_id={target_id}, user_id={user_id}",
+                bot_id=bot_id,
+                target_type=target_type,
+                target_id=target_id,
+                user_id=user_id,
             )
         )
         body = msgjson.encode(send)
@@ -973,6 +1014,7 @@ class Bot:
         at_sender: bool = False,
         extra_metadata: Optional[Dict[str, Any]] = None,
         wait_recall: bool = False,
+        observe_memory: bool = True,
     ) -> Optional[List[str]]:
         return await self.bot.target_send(
             message,
@@ -988,6 +1030,7 @@ class Bot:
             self.ev.task_event,
             extra_metadata=extra_metadata,
             wait_recall=wait_recall,
+            observe_memory=observe_memory,
         )
 
     async def ban(
@@ -1019,6 +1062,29 @@ class Bot:
             str(user_id),
             self.ev.real_bot_id,
             self.bot_self_id,
+        )
+
+    async def poke(self) -> None:
+        """尝试回戳当前事件的发起者。"""
+        if self.ev.task_event is not None:
+            logger.debug("[Bot] HTTP 模式不支持回戳")
+            return
+        user_id = str(self.ev.get_meta("user_id", self.ev.user_id) or "")
+        if not user_id or user_id == str(self.bot_self_id):
+            return
+        target_type: Literal["group", "direct"] = (
+            "direct" if self.ev.user_type == "direct" else "group"
+        )
+        target_id = user_id if target_type == "direct" else str(self.ev.group_id or "")
+        if not target_id:
+            return
+        await self.bot.poke_user(
+            user_id=user_id,
+            group_id=self.ev.group_id if target_type == "group" else None,
+            target_type=target_type,
+            target_id=target_id,
+            bot_id=self.ev.real_bot_id,
+            bot_self_id=self.bot_self_id,
         )
 
     async def unsend(

@@ -65,6 +65,7 @@ async def pick(
     scene: str,
     persona: str,
     session_id: str,
+    fallback_common: bool = True,
 ) -> Tuple[Optional[AiMemeRecord], str]:
     """根据情境选择一张表情包
 
@@ -99,8 +100,13 @@ async def pick(
 
     query_text = f"{mood} {scene}".strip()
 
-    # persona 为 common 时无独立专属文件夹，避免一次必然为空的查询
-    folders = ["common"] if persona == "common" else [f"persona_{persona}", "common"]
+    # persona 为 common 时无独立专属文件夹；调用方可关闭 common 回退，严格只取人格专属表情。
+    if persona == "common":
+        folders = ["common"]
+    elif fallback_common:
+        folders = [f"persona_{persona}", "common"]
+    else:
+        folders = [f"persona_{persona}"]
 
     had_candidates = False
     for folder in folders:

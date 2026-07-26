@@ -18,6 +18,7 @@ from gsuid_core.utils.plugins_config.models import (
     GSC,
     GsIntConfig,
     GsStrConfig,
+    GsBoolConfig,
     GsListStrConfig,
 )
 from gsuid_core.utils.plugins_config.gs_config import StringConfig, ConfigSetManager
@@ -56,6 +57,11 @@ DEFAULT_PERSONA_CONFIG: Dict[str, GSC] = {
         "当消息中包含这些关键词时，即使没有@机器人也会触发AI响应。多个关键词用换行分隔",
         [],
         options=[],
+    ),
+    "poke_response_enabled": GsBoolConfig(
+        "戳一戳回应",
+        "被戳时使用当前人格生成简短回应，并可发送专属表情或尝试回戳",
+        False,
     ),
     # AgentNode 同构：persona 投影节点的工具装配声明（GSC 模板 append-only 自动升级）
     "tool_packs": GsListStrConfig(
@@ -250,6 +256,21 @@ class PersonaConfigManager(ConfigSetManager):
             return True, "ok"
         else:
             return False, "配置写入失败"
+
+    def set_poke_response_enabled(self, persona_name: str, enabled: bool) -> tuple[bool, str]:
+        """设置 Persona 是否响应戳一戳事件。"""
+        config = self.get_config(persona_name)
+        success = config.set_config("poke_response_enabled", enabled)
+        if success:
+            logger.info(
+                t(
+                    "[PersonaConfig] 已更新 '{persona_name}' 的戳一戳回应: {enabled}",
+                    persona_name=persona_name,
+                    enabled=enabled,
+                )
+            )
+            return True, "ok"
+        return False, "配置写入失败"
 
     def set_inspect_interval(self, persona_name: str, inspect_interval: int) -> tuple[bool, str]:
         """
@@ -460,6 +481,7 @@ class PersonaConfigManager(ConfigSetManager):
             "target_groups": config.get_config("target_groups").data,
             "inspect_interval": config.get_config("inspect_interval").data,
             "keywords": config.get_config("keywords").data,
+            "poke_response_enabled": config.get_config("poke_response_enabled").data,
             "tool_packs": config.get_config("tool_packs").data,
             "tool_names": config.get_config("tool_names").data,
         }

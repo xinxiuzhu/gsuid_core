@@ -715,6 +715,27 @@ async def update_persona_config(
 
             start_heartbeat_inspector()
 
+    # 更新戳一戳回应开关（如果提供）
+    if "poke_response_enabled" in data:
+        poke_response_enabled = data["poke_response_enabled"]
+        if not isinstance(poke_response_enabled, bool):
+            return {
+                "status": 1,
+                "msg": "poke_response_enabled 必须是布尔值",
+                "data": None,
+            }
+        success, msg = persona_config_manager.set_poke_response_enabled(
+            persona_name,
+            poke_response_enabled,
+        )
+        if not success:
+            return {
+                "status": 1,
+                "msg": msg,
+                "data": None,
+            }
+        results.append(f"poke_response_enabled: {poke_response_enabled}")
+
     # 更新 inspect_interval（如果提供）
     if "inspect_interval" in data:
         inspect_interval = data["inspect_interval"]

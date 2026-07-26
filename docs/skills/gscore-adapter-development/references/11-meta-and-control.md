@@ -255,11 +255,34 @@ elif _c.type == "excute_ban_user":
 
 ---
 
-## 11.5 三类交互的隔离与边界
+## 11.5 回戳（`excute_poke_user`）
+
+`await bot.poke()` 只回戳当前事件的发起者，core 下发单段控制包：
+
+```python
+MessageSend(
+    content=[Message("excute_poke_user", {
+        "user_id": "999999",
+        "group_id": "888888",  # 仅群聊携带
+    })],
+    target_type="group" | "direct",
+    target_id="<群号或私聊用户 id>",
+    bot_id=...,
+    bot_self_id=...,
+)
+```
+
+适配器必须在普通消息转换前短路该单段控制包：群聊调用平台 poke/nudge 成员 API，
+私聊仅在平台支持好友 nudge 时执行；不支持时 warning 后丢弃，不能误发空消息。
+该动作是 fire-and-forget，MVP 没有成功回执，因此 core 历史只记录“尝试回戳”。
+
+---
+
+## 11.6 四类交互的隔离与边界
 
 - **互不冲突**：回执在 **core 收包处**按 `type=="recall_message_id"` 拦截；meta 在 **上报分发顶部**按
-  `type` 前缀 `meta-` 拦截；撤回/禁言是**下行**单段控制包。各自作用于不同 `type`，不会串。
-- **撤回/禁言与普通消息共用同一发送队列**：保持与在途消息的相对顺序；断连时同样暂存、重连后发出。
+  `type` 前缀 `meta-` 拦截；撤回/禁言/回戳是**下行**单段控制包。各自作用于不同 `type`，不会串。
+- **撤回/禁言/回戳与普通消息共用同一发送队列**：保持与在途消息的相对顺序；断连时同样暂存、重连后发出。
 - **回执降级**：旧适配器从不回执 ⇒ core 等满 10 秒（`RECALL_WAIT_TIMEOUT`）后返回 `[]`；
   连续 3 次（`RECALL_DISABLE_AFTER_TIMEOUTS`）整次零回执会把该连接 latch 为"不支持回执"，
   此后 `wait_recall=True` 立即返回 `[]` 不再空等（任意一帧成功回执即清零计数并判定支持）。
@@ -269,7 +292,7 @@ elif _c.type == "excute_ban_user":
 
 ---
 
-## 11.6 自查清单
+## 11.7 自查清单
 
 - [ ] meta 段 `type` 带 `meta-` 前缀，且**单独成包**、不与文本混发
 - [ ] meta `data` 带齐 `user_id`/`group_id`，顶层字段也照常填
@@ -278,3 +301,4 @@ elif _c.type == "excute_ban_user":
 - [ ] `echo` 非空就回执，**即便没拿到 id 也回**（`id=None`）；node 逐条发回 `List[str]`
 - [ ] `excute_delete_message` 在分发前短路、按 `bot_id` 调撤回 API、带会话定位、不误发空消息
 - [ ] `excute_ban_user` 的 `duration=0` 当解禁；无能力平台 warning 跳过、不抛异常
+- [ ] `excute_poke_user` 在普通消息转换前短路；只戳指定用户，不支持时 warning 丢弃、不误发空消息
