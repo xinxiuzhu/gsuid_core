@@ -357,6 +357,7 @@
     "[Meme] 打标 worker 已停止": "[Meme] 打标 worker 已停止",
     "[Meme] 打标 worker 已启动，并发上限: {semaphore_count}，当前状态: {state}": "[Meme] 打标 worker 已启动，并发上限: {semaphore_count}，当前状态: {state}",
     "[Meme] 打标 worker 异常: {e}": "[Meme] 打标 worker 异常: {e}",
+    "[Meme] 删除操作执行异常: {exc}": "[Meme] 删除操作执行异常: {exc}",
     "[Meme] 打标完成: {meme_id} -> {target_folder}": "[Meme] 打标完成: {meme_id} -> {target_folder}",
     "[Meme] 打标完成但移动文件失败，置为待人工处理: {meme_id}": "[Meme] 打标完成但移动文件失败，置为待人工处理: {meme_id}",
     "[Meme] 打标时找不到记录: {meme_id}": "[Meme] 打标时找不到记录: {meme_id}",

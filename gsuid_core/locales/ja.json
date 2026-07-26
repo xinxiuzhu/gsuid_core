@@ -357,6 +357,7 @@
     "[Meme] 打标 worker 已停止": "[Meme] タグ付け worker 停止",
     "[Meme] 打标 worker 已启动，并发上限: {semaphore_count}，当前状态: {state}": "[Meme] タグ付け worker 起動済み、並行上限: {semaphore_count}、現在の状態: {state}",
     "[Meme] 打标 worker 异常: {e}": "[Meme] タグ付け worker 異常: {e}",
+    "[Meme] 删除操作执行异常: {exc}": "[Meme] 削除操作で予期しないエラーが発生しました: {exc}",
     "[Meme] 打标完成: {meme_id} -> {target_folder}": "[Meme] タグ付け完了: {meme_id} -> {target_folder}",
     "[Meme] 打标完成但移动文件失败，置为待人工处理: {meme_id}": "[Meme] タグ付け完了したがファイル移動失敗、手動処理待ちに設定: {meme_id}",
     "[Meme] 打标时找不到记录: {meme_id}": "[Meme] タグ付け時にレコードが見つかりません: {meme_id}",

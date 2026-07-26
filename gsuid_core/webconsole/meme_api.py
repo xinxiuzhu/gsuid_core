@@ -18,7 +18,7 @@ from pydantic import Field, BaseModel
 from fastapi.responses import StreamingResponse
 
 from gsuid_core.webconsole.app_app import app
-from gsuid_core.webconsole.web_api import require_auth
+from gsuid_core.webconsole.web_api import require_auth, require_admin
 from gsuid_core.ai_core.meme.tagger import enqueue_tag, is_tagging_enabled
 from gsuid_core.ai_core.meme.library import (
     MemeLibrary,
@@ -74,6 +74,7 @@ _RESERVED_MEME_IDS = frozenset(
         "import",
         "batch_delete",
         "purge_rejected",
+        "delete_operations",
         "batch_retag_pending",
     }
 )
@@ -96,6 +97,43 @@ class MemeBatchDeleteRequest(BaseModel):
     """批量删除表情包请求"""
 
     meme_ids: List[str] = Field(..., min_length=1, description="要删除的表情包 ID 列表")
+
+
+class MemeDeleteFilter(BaseModel):
+    folder: Optional[str] = Field(None, max_length=64)
+    persona_hint: Optional[str] = Field(None, max_length=64)
+    status: Optional[str] = Field(None, max_length=32)
+    q: Optional[str] = Field(None, description="不支持模糊/语义筛选，传入即拒绝")
+
+
+class MemeDeleteSelector(BaseModel):
+    ids: Optional[List[str]] = Field(None, min_length=1)
+    filter: Optional[MemeDeleteFilter] = None
+
+
+class MemeDeleteSelection(BaseModel):
+    mode: str = Field(..., pattern="^(ids|filter)$")
+    meme_ids: Optional[List[str]] = None
+    filter: Optional[MemeDeleteFilter] = None
+    exclude_ids: List[str] = Field(default_factory=list)
+
+
+class MemeDeletePreviewRequest(BaseModel):
+    """安全删除预览，主契约为 selection/action。"""
+
+    selection: Optional[MemeDeleteSelection] = None
+    action: str = Field(default="delete", pattern="^delete$")
+    # 兼容开发期 selector 与 underscore 平铺调用。
+    selector: Optional[MemeDeleteSelector] = None
+    folder: Optional[str] = Field(None, max_length=64)
+    persona_hint: Optional[str] = Field(None, max_length=64)
+    status: Optional[str] = Field(None, max_length=32)
+    q: Optional[str] = Field(None, description="不支持模糊/语义筛选，传入即拒绝")
+
+
+class MemeDeleteConfirmRequest(BaseModel):
+    preview_id: Optional[str] = Field(None, max_length=32)
+    confirmation: str = Field(..., max_length=64, description="字面确认串 DELETE N")
 
 
 class MemeBatchExportRequest(BaseModel):
@@ -225,6 +263,12 @@ async def get_meme_list(
                 "total": total,
                 "page": page,
                 "page_size": page_size,
+                "canonical_filter": {
+                    "folder": effective_folder,
+                    "status": status,
+                },
+                "select_all_supported": not bool(q),
+                "reason": "semantic_search_not_exhaustive" if q else None,
             },
         }
     except Exception as e:
@@ -483,7 +527,7 @@ async def move_meme(
 @app.delete("/api/meme/{meme_id}", summary="删除表情包", tags=MEME)
 async def delete_meme(
     meme_id: str,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     删除表情包（文件+记录）
@@ -648,14 +692,208 @@ async def get_meme_stats(
 
 
 # ─────────────────────────────────────────────
-# 10. 批量删除表情包
+# 10. 持久化全库删除操作
+# ─────────────────────────────────────────────
+
+
+def _admin_email(session: Dict[str, Any]) -> str:
+    return str(session.get("email") or session.get("user", {}).get("email") or "")
+
+
+def _delete_operation_data(operation: Any, targets: List[Any]) -> Dict[str, Any]:
+    failures = [
+        {
+            "meme_id": target.meme_id,
+            "phase": "file",
+            "reason": target.error_message,
+            "attempts": target.attempts,
+        }
+        for target in targets
+        if target.state == "failed"
+    ]
+    progress = (
+        100.0
+        if operation.total_count == 0
+        else round(operation.processed_count * 100 / operation.total_count, 2)
+    )
+    public_status = "succeeded" if operation.state == "completed" else operation.state
+    return {
+        "operation_id": operation.operation_id,
+        "status": public_status,
+        "matched": operation.total_count,
+        "processed": operation.processed_count,
+        "succeeded": operation.deleted_count,
+        "failed": operation.failed_count,
+        "progress": progress,
+        "failures": failures,
+        "error_summary": operation.error_message or None,
+        "created_at": operation.created_at.isoformat(),
+        "started_at": operation.started_at.isoformat() if operation.started_at else None,
+        "finished_at": operation.finished_at.isoformat() if operation.finished_at else None,
+    }
+
+
+@app.post("/api/meme/delete-operations/preview", summary="安全删除预览", tags=MEME)
+@app.post("/api/meme/delete_operations/preview", summary="安全删除预览（兼容）", tags=MEME)
+async def preview_meme_delete(
+    req: MemeDeletePreviewRequest,
+    admin: Dict[str, Any] = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Persist an exact ID or folder/persona/status target snapshot."""
+    selection = req.selection
+    selector = req.selector
+    if selection is not None and selector is not None:
+        return {"status": 1, "msg": "selection 与 selector 互斥", "data": None}
+    if selector is not None and selector.ids is not None and selector.filter is not None:
+        return {"status": 1, "msg": "selector.ids 与 selector.filter 互斥", "data": None}
+
+    meme_ids: Optional[List[str]] = None
+    exclude_ids: List[str] = []
+    filter_data: Optional[MemeDeleteFilter] = None
+    if selection is not None:
+        exclude_ids = selection.exclude_ids
+        if selection.mode == "ids":
+            if not selection.meme_ids:
+                return {"status": 1, "msg": "ids 模式必须提供 meme_ids", "data": None}
+            meme_ids = selection.meme_ids
+        else:
+            if selection.filter is None:
+                return {"status": 1, "msg": "filter 模式必须提供 filter", "data": None}
+            filter_data = selection.filter
+    elif selector is not None:
+        meme_ids = selector.ids
+        filter_data = selector.filter
+
+    q = filter_data.q if filter_data is not None else req.q
+    if q is not None:
+        return {"status": 1, "msg": "删除预览不支持 q 模糊或语义筛选", "data": None}
+    folder = filter_data.folder if filter_data is not None else req.folder
+    persona_hint = filter_data.persona_hint if filter_data is not None else req.persona_hint
+    effective_folder = (
+        folder
+        if folder is not None
+        else (_folder_for_persona(persona_hint) if persona_hint is not None else None)
+    )
+    status = filter_data.status if filter_data is not None else req.status
+    if status is not None and status not in _VALID_MEME_STATUSES:
+        return {"status": 1, "msg": f"无效的状态: {status}", "data": None}
+    try:
+        from gsuid_core.ai_core.meme.deletion import create_delete_preview
+
+        operation, targets = await create_delete_preview(
+            _admin_email(admin),
+            meme_ids=meme_ids,
+            exclude_ids=exclude_ids,
+            folder=effective_folder,
+            persona_hint=persona_hint,
+            status=status,
+        )
+        status_counts: Dict[str, int] = {}
+        for target in targets:
+            status_counts[target.meme_status] = status_counts.get(target.meme_status, 0) + 1
+        data = {
+            "preview_id": operation.operation_id,
+            "matched_count": operation.total_count,
+            "status_counts": status_counts,
+            "file_bytes": sum(target.file_size for target in targets),
+            "expires_at": operation.expires_at.isoformat(),
+            "requires_confirmation": True,
+            "confirmation_phrase": f"DELETE {operation.total_count}",
+            "sample_ids": [target.meme_id for target in targets[:20]],
+        }
+        return {"status": 0, "msg": "预览已固化，15 分钟内确认有效", "data": data}
+    except Exception as e:
+        return {"status": 1, "msg": f"生成删除预览失败: {e}", "data": None}
+
+
+@app.post("/api/meme/delete-operations", summary="确认安全删除", tags=MEME)
+async def confirm_meme_delete_contract(
+    req: MemeDeleteConfirmRequest,
+    admin: Dict[str, Any] = Depends(require_admin),
+) -> Dict[str, Any]:
+    if not req.preview_id:
+        return {"status": 1, "msg": "缺少 preview_id", "data": None}
+    return await _confirm_meme_delete(req.preview_id, req.confirmation, admin)
+
+
+@app.post("/api/meme/delete_operations/{operation_id}/confirm", summary="确认安全删除（兼容）", tags=MEME)
+async def confirm_meme_delete(
+    operation_id: str,
+    req: MemeDeleteConfirmRequest,
+    admin: Dict[str, Any] = Depends(require_admin),
+) -> Dict[str, Any]:
+    return await _confirm_meme_delete(operation_id, req.confirmation, admin)
+
+
+async def _confirm_meme_delete(
+    operation_id: str,
+    confirmation: str,
+    admin: Dict[str, Any],
+) -> Dict[str, Any]:
+    try:
+        from gsuid_core.ai_core.meme.deletion import confirm_delete_operation
+
+        operation = await confirm_delete_operation(operation_id, _admin_email(admin), confirmation)
+        return {
+            "status": 0,
+            "msg": "删除操作已进入后台队列",
+            "data": {
+                "operation_id": operation.operation_id,
+                "status": "succeeded" if operation.state == "completed" else operation.state,
+                "matched_count": operation.total_count,
+            },
+        }
+    except PermissionError as e:
+        return {"status": 1, "msg": str(e), "data": None}
+    except (ValueError, RuntimeError) as e:
+        return {"status": 1, "msg": str(e), "data": None}
+
+
+@app.get("/api/meme/delete-operations/{operation_id}", summary="查询安全删除进度", tags=MEME)
+@app.get("/api/meme/delete_operations/{operation_id}", summary="查询安全删除进度（兼容）", tags=MEME)
+async def get_meme_delete_status(
+    operation_id: str,
+    admin: Dict[str, Any] = Depends(require_admin),
+) -> Dict[str, Any]:
+    from gsuid_core.ai_core.meme.deletion import get_delete_operation
+
+    operation, targets = await get_delete_operation(operation_id)
+    if operation is None:
+        return {"status": 1, "msg": "删除操作不存在", "data": None}
+    if operation.owner_email != _admin_email(admin):
+        return {"status": 1, "msg": "只能查询自己创建的删除操作", "data": None}
+    return {"status": 0, "msg": "ok", "data": _delete_operation_data(operation, targets)}
+
+
+@app.post("/api/meme/delete-operations/{operation_id}/retry", summary="重试安全删除失败项", tags=MEME)
+@app.post("/api/meme/delete_operations/{operation_id}/retry", summary="重试安全删除失败项（兼容）", tags=MEME)
+async def retry_meme_delete(
+    operation_id: str,
+    admin: Dict[str, Any] = Depends(require_admin),
+) -> Dict[str, Any]:
+    try:
+        from gsuid_core.ai_core.meme.deletion import get_delete_operation, retry_delete_operation
+
+        operation = await retry_delete_operation(operation_id, _admin_email(admin))
+        _, targets = await get_delete_operation(operation_id)
+        return {
+            "status": 0,
+            "msg": "失败项已重新进入后台队列",
+            "data": _delete_operation_data(operation, targets),
+        }
+    except (PermissionError, ValueError, RuntimeError) as e:
+        return {"status": 1, "msg": str(e), "data": None}
+
+
+# ─────────────────────────────────────────────
+# 10b. 兼容批量删除表情包
 # ─────────────────────────────────────────────
 
 
 @app.post("/api/meme/batch_delete", summary="批量删除表情包", tags=MEME)
 async def batch_delete_memes(
     req: MemeBatchDeleteRequest,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     批量删除表情包（文件+记录）
@@ -685,18 +923,15 @@ async def batch_delete_memes(
         except Exception as e:
             failed_ids.append({"meme_id": meme_id, "reason": str(e)})
 
-    if not failed_ids:
-        return {
-            "status": 0,
-            "msg": f"批量删除成功，共删除 {len(success_ids)} 个",
-            "data": {"success_count": len(success_ids), "failed": []},
-        }
-    else:
-        return {
-            "status": 1,
-            "msg": f"删除完成：成功 {len(success_ids)} 个，失败 {len(failed_ids)} 个",
-            "data": {"success_count": len(success_ids), "failed": failed_ids},
-        }
+    return {
+        "status": 0,
+        "msg": (
+            f"批量删除成功，共删除 {len(success_ids)} 个"
+            if not failed_ids
+            else f"删除完成：成功 {len(success_ids)} 个，失败 {len(failed_ids)} 个"
+        ),
+        "data": {"success_count": len(success_ids), "failed": failed_ids},
+    }
 
 
 # ─────────────────────────────────────────────
@@ -706,7 +941,7 @@ async def batch_delete_memes(
 
 @app.post("/api/meme/purge_rejected", summary="b. 清除所有已拒绝的表情包", tags=MEME)
 async def purge_rejected_memes(
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     批量删除所有状态为 rejected 的表情包（源文件+数据库记录+Qdrant 向量）
@@ -735,18 +970,15 @@ async def purge_rejected_memes(
             except Exception as e:
                 failed_items.append({"meme_id": record.meme_id, "reason": str(e)})
 
-        if not failed_items:
-            return {
-                "status": 0,
-                "msg": f"已清除 {len(success_ids)} 个已拒绝的表情包",
-                "data": {"purged_count": len(success_ids), "failed": []},
-            }
-        else:
-            return {
-                "status": 1,
-                "msg": f"清除完成：成功 {len(success_ids)} 个，失败 {len(failed_items)} 个",
-                "data": {"purged_count": len(success_ids), "failed": failed_items},
-            }
+        return {
+            "status": 0,
+            "msg": (
+                f"已清除 {len(success_ids)} 个已拒绝的表情包"
+                if not failed_items
+                else f"清除完成：成功 {len(success_ids)} 个，失败 {len(failed_items)} 个"
+            ),
+            "data": {"purged_count": len(success_ids), "failed": failed_items},
+        }
     except Exception as e:
         return {"status": 1, "msg": f"清除失败: {e}", "data": None}
 
