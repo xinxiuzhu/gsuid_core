@@ -333,6 +333,12 @@ async def _tag_single(meme_id: str) -> None:
         await MemeLibrary.mark_tag_failed(meme_id)
         return
 
+    # VLM 调用期间记录可能被管理员删除。任何移动/标签更新前重新确认。
+    record = await AiMemeRecord.get_by_meme_id(meme_id)
+    if record is None:
+        logger.info(t("[Meme] 打标时找不到记录: {meme_id}", meme_id=meme_id))
+        return
+
     # NSFW 检查：rejected 前也写入标签，方便后期人工审核
     nsfw_threshold: float = meme_config.get_config("meme_nsfw_threshold").data
     if tag_result["nsfw_score"] >= nsfw_threshold:

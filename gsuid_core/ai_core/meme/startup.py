@@ -42,11 +42,13 @@ async def init_meme_module():
     except Exception as e:
         logger.warning(t("[Meme] Qdrant Collection 初始化失败（非致命）: {e}", e=e))
 
-    # 3. 启动后台打标 worker
+    # 3. 启动后台打标与安全删除 worker
     try:
         from gsuid_core.ai_core.meme.tagger import start_tag_worker
+        from gsuid_core.ai_core.meme.deletion import recover_delete_operations
 
         await start_tag_worker()
+        await recover_delete_operations()
         logger.info(t("[Meme] 打标 worker 启动完成"))
     except Exception as e:
         logger.error(t("[Meme] 打标 worker 启动失败: {e}", e=e))
@@ -76,7 +78,9 @@ async def shutdown_meme_module():
     """关闭表情包模块"""
     try:
         from gsuid_core.ai_core.meme.tagger import stop_tag_worker
+        from gsuid_core.ai_core.meme.deletion import stop_delete_worker
 
         await stop_tag_worker()
+        await stop_delete_worker()
     except Exception:
         pass

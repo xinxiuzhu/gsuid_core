@@ -20,6 +20,52 @@ from gsuid_core.ai_core.meme.selector import PICK_COOLDOWN, PICK_EXHAUSTED, pick
 from gsuid_core.ai_core.meme.database_model import AiMemeRecord
 
 
+async def send_meme_record(
+    bot: Bot,
+    ev: Event,
+    record: AiMemeRecord,
+    *,
+    mood: str,
+    scene: str,
+    persona_name: str,
+    interaction: str = "meme",
+    observe_memory: bool = True,
+) -> bool:
+    """发送一条已选中的表情记录，并统一记录使用次数与上下文元数据。"""
+    file_path = get_memes_base_path() / record.file_path
+    if not file_path.exists():
+        logger.warning(t("[Meme] 表情包文件不存在: {file_path}", file_path=file_path))
+        return False
+
+    image_data = await _read_file(file_path)
+
+    from gsuid_core.utils.image.convert import convert_img
+
+    img_base64 = await convert_img(image_data)
+    await bot.send(
+        MessageSegment.image(img_base64),
+        extra_metadata={
+            "interaction": interaction,
+            "mood": mood,
+            "scene": scene,
+            "persona_name": persona_name,
+            "meme_id": record.meme_id,
+        },
+        observe_memory=observe_memory,
+    )
+    await AiMemeRecord.record_usage(record.meme_id, ev.group_id or "")
+    logger.info(
+        t(
+            "[Meme] 发送表情包: {p0} (mood={mood}, scene={scene}, persona={persona_name})",
+            p0=record.meme_id,
+            mood=mood,
+            scene=scene,
+            persona_name=persona_name,
+        )
+    )
+    return True
+
+
 @ai_tools(category="common", capability_domain="表情")
 async def send_meme(
     ev: Event,
@@ -66,33 +112,16 @@ async def send_meme(
             return "匹配的表情包最近都已发送过，本次跳过以避免重复，不要重试"
         return "库中没有与该情绪/场景匹配的表情包"
 
-    # 发送图片
-    file_path = get_memes_base_path() / record.file_path
-    if not file_path.exists():
-        logger.warning(t("[Meme] 表情包文件不存在: {file_path}", file_path=file_path))
-        return "表情包文件不存在"
-
-    image_data = await _read_file(file_path)
-
-    from gsuid_core.utils.image.convert import convert_img
-
-    img_base64 = await convert_img(image_data)
-    message = MessageSegment.image(img_base64)
-
-    await bot.send(message)
-
-    # 记录使用
-    await AiMemeRecord.record_usage(record.meme_id, ev.group_id or "")
-
-    logger.info(
-        t(
-            "[Meme] 发送表情包: {p0} (mood={mood}, scene={scene}, persona={persona_name})",
-            p0=record.meme_id,
-            mood=mood,
-            scene=scene,
-            persona_name=persona_name,
-        )
+    sent = await send_meme_record(
+        bot,
+        ev,
+        record,
+        mood=mood,
+        scene=scene,
+        persona_name=persona_name,
     )
+    if not sent:
+        return "表情包文件不存在"
     return f"已发送表情包: {record.description or record.meme_id}"
 
 

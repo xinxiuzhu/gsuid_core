@@ -220,23 +220,31 @@ class MemeLibrary:
         Returns:
             是否成功
         """
+        from sqlmodel import delete
+
+        from gsuid_core.ai_core.meme.deletion import safe_meme_path, meme_index_lock
+        from gsuid_core.utils.database.base_models import async_maker
+
         record = await AiMemeRecord.get_by_meme_id(meme_id)
         if record is None:
             return False
 
-        # 删除文件
-        file_path = get_memes_base_path() / record.file_path
+        # 仅允许删除 memes 根目录中的普通文件；先预检，SQL 成功后才 unlink。
+        file_path = safe_meme_path(get_memes_base_path(), record.file_path)
+        if file_path.exists() and not file_path.is_file():
+            raise ValueError(f"unsafe meme target is not a regular file: {file_path}")
+
+        # 与 tagger upsert 互斥，避免删向量后、删 SQL 前被重新写回。
+        async with meme_index_lock():
+            try:
+                await _remove_from_qdrant(meme_id)
+            except Exception as e:
+                logger.warning(t("[Meme] 删除 Qdrant 向量失败: {e}", e=e))
+            async with async_maker() as session:
+                await session.execute(delete(AiMemeRecord).where(AiMemeRecord.meme_id == meme_id))
+                await session.commit()
         if file_path.exists():
             await _unlink_file(file_path)
-
-        # 删除 Qdrant 向量（无条件按 meme_id 过滤删点，兼顾 qdrant_id 缺失的历史数据）
-        try:
-            await _remove_from_qdrant(meme_id)
-        except Exception as e:
-            logger.warning(t("[Meme] 删除 Qdrant 向量失败: {e}", e=e))
-
-        # 删除数据库记录
-        await AiMemeRecord.delete_by_meme_id(meme_id)
         logger.info(t("[Meme] 删除表情包: {meme_id}", meme_id=meme_id))
         return True
 
@@ -400,26 +408,33 @@ class MemeLibrary:
         Args:
             record: 表情包记录
         """
+        from gsuid_core.ai_core.meme.deletion import meme_index_lock
+
         content = f"{record.description} {' '.join(record.all_tags)}".strip()
         if not content:
             return
 
-        point_id = await _upsert_to_qdrant(
-            meme_id=record.meme_id,
-            content=content,
-            folder=record.folder,
-            persona_hint=record.persona_hint,
-            status=record.status,
-            use_count=record.use_count,
-            file_mime=record.file_mime,
-        )
-        if point_id:
-            await AiMemeRecord.update_record(
-                record.meme_id,
-                {
-                    "qdrant_id": point_id,
-                },
+        async with meme_index_lock():
+            # 打标可能在读取记录后碰上删除。锁内重查，防止删除完成后重新 upsert。
+            current = await AiMemeRecord.get_by_meme_id(record.meme_id)
+            if current is None or current.status not in ("tagged", "manual"):
+                return
+            point_id = await _upsert_to_qdrant(
+                meme_id=current.meme_id,
+                content=f"{current.description} {' '.join(current.all_tags)}".strip(),
+                folder=current.folder,
+                persona_hint=current.persona_hint,
+                status=current.status,
+                use_count=current.use_count,
+                file_mime=current.file_mime,
             )
+            if point_id and await AiMemeRecord.exists_by_meme_id(current.meme_id):
+                await AiMemeRecord.update_record(
+                    current.meme_id,
+                    {
+                        "qdrant_id": point_id,
+                    },
+                )
 
     @staticmethod
     async def remove_from_index(meme_id: str) -> None:
@@ -794,11 +809,16 @@ async def _search_qdrant(
 
 async def _remove_from_qdrant(meme_id: str) -> None:
     """从 Qdrant 中删除指定 meme_id 的向量"""
-    from qdrant_client.models import Filter, MatchValue, FieldCondition
+    await _remove_many_from_qdrant([meme_id])
+
+
+async def _remove_many_from_qdrant(meme_ids: List[str]) -> None:
+    """Use one MatchAny selector to delete a batch of meme vectors."""
+    from qdrant_client.models import Filter, MatchAny, FieldCondition
 
     from gsuid_core.ai_core.rag.base import client
 
-    if client is None:
+    if client is None or not meme_ids:
         return
 
     await client.delete(
@@ -807,7 +827,7 @@ async def _remove_from_qdrant(meme_id: str) -> None:
             must=[
                 FieldCondition(
                     key="meme_id",
-                    match=MatchValue(value=meme_id),
+                    match=MatchAny(any=list(dict.fromkeys(meme_ids))),
                 )
             ]
         ),

@@ -119,6 +119,8 @@ exec_list = [
     "ALTER TABLE aihourlyperformance ADD COLUMN ttft_sample_count INTEGER DEFAULT 0;",
     "ALTER TABLE aihourlyperformance ADD COLUMN tps_sum FLOAT DEFAULT 0.0;",
     "ALTER TABLE aihourlyperformance ADD COLUMN tps_sample_count INTEGER DEFAULT 0;",
+    # 安全表情删除 target 快照补文件大小（兼容运行过开发期中间版本的数据库）
+    "ALTER TABLE aimemedeletetarget ADD COLUMN file_size INTEGER DEFAULT 0;",
 ]
 
 

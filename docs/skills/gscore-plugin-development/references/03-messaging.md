@@ -225,6 +225,18 @@ async def _(bot: Bot, ev: Event) -> None:
   必须**连同 `target_id` 一起显式传入**。
 - fire-and-forget：**无回执、无返回值**，不保证平台一定撤回成功（超时窗口 / 权限由平台决定）。
 
+### 回戳当前用户（`bot.poke`）
+
+```python
+@sv.on_meta("poke")
+async def _(bot: Bot, ev: Event) -> None:
+    await bot.poke()
+```
+
+- `bot.poke()` 不接受用户 ID，只能尝试回戳当前事件的发起者，避免误操作其他成员。
+- fire-and-forget，无成功回执；平台不支持时由适配器 warning 后丢弃。
+- 仅 WebSocket 适配器模式可用，HTTP 模式会静默忽略。
+
 ### 禁言群成员（`bot.ban`）
 
 ```python
@@ -243,10 +255,10 @@ await bot.ban(ev.at, ev.group_id, duration=0)
 - 同样是 fire-and-forget，无返回值。**平台能力差异大**：OneBot/Milky 等支持，Telegram/Discord
   概念不同、私聊无意义时 adapter 会 warning 跳过。
 
-> ⚠️ **HTTP 模式（`/api/send_msg`）三者均不可用**：`wait_recall` 被忽略（返回 `None` 而非 `[]`），
-> `unsend` / `ban` 被静默忽略并记 debug 日志（无 adapter WS 连接）。
-> 这三个 API 的下行协议与适配器落地见适配器 SKILL 的
-> [§11.2–§11.4](../../gscore-adapter-development/references/11-meta-and-control.md)。
+> ⚠️ **HTTP 模式（`/api/send_msg`）这些控制能力均不可用**：`wait_recall` 被忽略（返回 `None` 而非 `[]`），
+> `unsend` / `ban` / `poke` 被静默忽略并记 debug 日志（无 adapter WS 连接）。
+> 下行协议与适配器落地见适配器 SKILL 的
+> [§11.2–§11.5](../../gscore-adapter-development/references/11-meta-and-control.md)。
 
 ### 常用参数
 

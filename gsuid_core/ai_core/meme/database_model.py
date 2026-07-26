@@ -6,11 +6,12 @@ AiMemeRecord 表情包主表，使用 SQLModel 直接定义。
 """
 
 import json
+import uuid
 from typing import List, Optional, Sequence
 from datetime import datetime, timezone
 
 from sqlmodel import JSON, Field, Column, SQLModel, col, select
-from sqlalchemy import String, or_, cast, func
+from sqlalchemy import Text, String, or_, cast, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gsuid_core.utils.database.base_models import with_session
@@ -604,3 +605,40 @@ class AiMemeRecord(SQLModel, table=True):
         # 按使用次数降序排序
         matched.sort(key=lambda r: r.use_count, reverse=True)
         return matched[:limit]
+
+
+class AiMemeDeleteOperation(SQLModel, table=True):
+    """Persistent, owner-bound deletion operation created from an exact snapshot."""
+
+    operation_id: str = Field(default_factory=lambda: uuid.uuid4().hex, primary_key=True, max_length=32)
+    owner_email: str = Field(index=True, max_length=320)
+    folder_filter: Optional[str] = Field(default=None, max_length=64)
+    persona_filter: Optional[str] = Field(default=None, max_length=64)
+    status_filter: Optional[str] = Field(default=None, max_length=32)
+    state: str = Field(default="preview", index=True, max_length=32)
+    total_count: int = Field(default=0)
+    processed_count: int = Field(default=0)
+    deleted_count: int = Field(default=0)
+    failed_count: int = Field(default=0)
+    error_message: str = Field(default="", sa_column=Column(Text))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc), index=True)
+    expires_at: datetime = Field(index=True)
+    confirmed_at: Optional[datetime] = Field(default=None)
+    started_at: Optional[datetime] = Field(default=None)
+    finished_at: Optional[datetime] = Field(default=None)
+
+
+class AiMemeDeleteTarget(SQLModel, table=True):
+    """Immutable target snapshot plus per-item execution result."""
+
+    operation_id: str = Field(primary_key=True, max_length=32, index=True)
+    meme_id: str = Field(primary_key=True, max_length=16, index=True)
+    file_path: str = Field(max_length=512)
+    file_size: int = Field(default=0)
+    folder: str = Field(max_length=64)
+    persona_hint: str = Field(max_length=64)
+    meme_status: str = Field(max_length=32)
+    state: str = Field(default="pending", index=True, max_length=32)
+    attempts: int = Field(default=0)
+    error_message: str = Field(default="", sa_column=Column(Text))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

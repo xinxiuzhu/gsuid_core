@@ -10,7 +10,7 @@ Provides RESTful APIs for the React frontend
 
 from typing import Any, Dict, Optional
 
-from fastapi import Header
+from fastapi import Header, HTTPException
 from pydantic import BaseModel
 
 from gsuid_core.webconsole.session_store import SessionRecord, session_store
@@ -38,10 +38,28 @@ def require_auth(authorization: str | None = Header(default=None), token: str | 
     """FastAPI dependency for authentication"""
     user_data = verify_token(authorization, token)
     if not user_data:
-        from fastapi import HTTPException
-
         raise HTTPException(status_code=401, detail="未授权，请先登录")
     return user_data
+
+
+async def require_admin(
+    authorization: str | None = Header(default=None),
+    token: str | None = None,
+) -> SessionRecord:
+    """Require the user's current database role to be admin.
+
+    Session roles are login-time snapshots. Destructive APIs query ``WebUser``
+    on every request so a role change takes effect immediately.
+    """
+    session_data = require_auth(authorization=authorization, token=token)
+
+    from gsuid_core.utils.database.auth_models import WebUser
+
+    email = session_data.get("email") or session_data.get("user", {}).get("email")
+    user = await WebUser.get_user_by_email(email=email) if email else None
+    if user is None or user.role != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可执行此操作")
+    return session_data
 
 
 # ===================

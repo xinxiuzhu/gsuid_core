@@ -133,6 +133,9 @@ class _Bot:
         self._supports_recall: Optional[bool] = None
         # 连续「整次调用零回执」计数，达到阈值后将 _supports_recall 置 False
         self._recall_timeout_streak: int = 0
+        # ── 数据请求回执机制（如群成员列表）──
+        # echo -> Future[Optional[Any]]，与 _recall_waiters 隔离，避免类型混淆
+        self._data_waiters: Dict[str, asyncio.Future] = {}
 
     def _add_bg_task(self, task: asyncio.Task) -> None:
         """将后台任务加入 bg_tasks，并注册完成时自动移除的回调。
@@ -218,6 +221,24 @@ class _Bot:
                     fut.set_result(str(_mid))
         return True
 
+    def resolve_data_resp(self, msg: MessageReceive) -> bool:
+        """若 msg 是数据请求回执（如 group_member_list）则消费并唤醒对应 future。
+
+        返回 True 表示这是数据回执消息（调用方应跳过正常消息处理）。
+        """
+        content = msg.content
+        if not content or len(content) != 1:
+            return False
+        seg = content[0]
+        if seg.type != "group_member_list":
+            return False
+        data = seg.data
+        if isinstance(data, dict) and data.get("echo") is not None:
+            fut = self._data_waiters.pop(str(data["echo"]), None)
+            if fut is not None and not fut.done():
+                fut.set_result(data.get("members"))
+        return True
+
     def start_send_worker(self):
         """启动独立的发送 worker。
 
@@ -250,6 +271,7 @@ class _Bot:
         task_event: Optional[asyncio.Event] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
         wait_recall: bool = False,
+        observe_memory: bool = True,
     ) -> Optional[List[str]]:
         try:
             from gsuid_core.buildin_plugins.core_command.core_ai_control.state import (
@@ -462,7 +484,7 @@ class _Bot:
                 enable_ai: bool = ai_config.get_config("enable").data
                 is_enable_memory: bool = ai_config.get_config("enable_memory").data
                 memory_mode: list[str] = memory_config.memory_mode
-                if enable_ai and is_enable_memory and "主动会话" in memory_mode:
+                if observe_memory and enable_ai and is_enable_memory and "主动会话" in memory_mode:
                     from gsuid_core.ai_core.memory import observe
 
                     try:
@@ -596,6 +618,105 @@ class _Bot:
                 logger.warning(t("log.bot.ws_not_connected_drop"))
 
         await self._enqueue_send(_do_send())
+
+    async def poke_user(
+        self,
+        user_id: Union[str, int],
+        group_id: Optional[Union[str, int]],
+        target_type: Literal["group", "direct"],
+        target_id: str,
+        bot_id: str,
+        bot_self_id: str,
+    ) -> None:
+        """请求 adapter 戳一戳指定用户（fire-and-forget，无回执）。"""
+        data: Dict[str, str] = {"user_id": str(user_id)}
+        if group_id is not None:
+            data["group_id"] = str(group_id)
+        send = MessageSend(
+            content=[Message(type="excute_poke_user", data=data)],
+            bot_id=bot_id,
+            bot_self_id=bot_self_id,
+            target_type=target_type,
+            target_id=target_id,
+        )
+        logger.info(
+            t(
+                "[Bot] 请求回戳用户: bot={bot_id}, target_type={target_type}, "
+                "target_id={target_id}, user_id={user_id}",
+                bot_id=bot_id,
+                target_type=target_type,
+                target_id=target_id,
+                user_id=user_id,
+            )
+        )
+        body = msgjson.encode(send)
+
+        async def _do_send(body: bytes = body):
+            if self.bot is not None:
+                await self.bot.send_bytes(body)
+            else:
+                logger.warning(t("log.bot.ws_not_connected_drop"))
+
+        await self._enqueue_send(_do_send())
+
+    async def get_group_member_list(
+        self,
+        group_id: Union[str, int],
+        bot_id: str,
+        bot_self_id: str,
+        timeout: float = 15.0,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """请求 adapter 获取群成员列表（echo/future 回执机制）。
+
+        下发单段控制包 Message(type="excute_get_group_member_list",
+        data={"group_id": str, "echo": str})，adapter 以单段
+        Message(type="group_member_list", data={"echo": str, "members": [...]})
+        回执。超时或 adapter 不支持时返回 None。
+        """
+        self._echo_seq += 1
+        echo = str(self._echo_seq)
+        fut: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._data_waiters[echo] = fut
+
+        send = MessageSend(
+            content=[
+                Message(
+                    type="excute_get_group_member_list",
+                    data={"group_id": str(group_id), "echo": echo},
+                )
+            ],
+            bot_id=bot_id,
+            bot_self_id=bot_self_id,
+            target_type="group",
+            target_id=str(group_id),
+        )
+        body = msgjson.encode(send)
+
+        async def _do_send(body: bytes = body):
+            if self.bot is not None:
+                await self.bot.send_bytes(body)
+            else:
+                logger.warning(t("log.bot.ws_not_connected_drop"))
+
+        await self._enqueue_send(_do_send())
+
+        try:
+            result = await asyncio.wait_for(fut, timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                t(
+                    "[Bot] 获取群成员列表超时: group_id={group_id}, echo={echo}",
+                    group_id=group_id,
+                    echo=echo,
+                )
+            )
+            result = None
+        finally:
+            self._data_waiters.pop(echo, None)
+
+        if isinstance(result, list):
+            return result
+        return None
 
     async def unsend(
         self,
@@ -973,6 +1094,7 @@ class Bot:
         at_sender: bool = False,
         extra_metadata: Optional[Dict[str, Any]] = None,
         wait_recall: bool = False,
+        observe_memory: bool = True,
     ) -> Optional[List[str]]:
         return await self.bot.target_send(
             message,
@@ -988,6 +1110,7 @@ class Bot:
             self.ev.task_event,
             extra_metadata=extra_metadata,
             wait_recall=wait_recall,
+            observe_memory=observe_memory,
         )
 
     async def ban(
@@ -1019,6 +1142,52 @@ class Bot:
             str(user_id),
             self.ev.real_bot_id,
             self.bot_self_id,
+        )
+
+    async def poke(self) -> None:
+        """尝试回戳当前事件的发起者。"""
+        if self.ev.task_event is not None:
+            logger.debug(t("[Bot] HTTP 模式不支持回戳"))
+            return
+        user_id = str(self.ev.get_meta("user_id", self.ev.user_id) or "")
+        if not user_id or user_id == str(self.bot_self_id):
+            return
+        target_type: Literal["group", "direct"] = (
+            "direct" if self.ev.user_type == "direct" else "group"
+        )
+        target_id = user_id if target_type == "direct" else str(self.ev.group_id or "")
+        if not target_id:
+            return
+        await self.bot.poke_user(
+            user_id=user_id,
+            group_id=self.ev.group_id if target_type == "group" else None,
+            target_type=target_type,
+            target_id=target_id,
+            bot_id=self.ev.real_bot_id,
+            bot_self_id=self.bot_self_id,
+        )
+
+    async def get_group_member_list(
+        self,
+        group_id: Optional[Union[str, int]] = None,
+        timeout: float = 15.0,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """获取群成员列表。缺省使用当前事件所在群。
+
+        返回成员 dict 列表（含 user_id / nickname / card 等字段），
+        超时或 adapter 不支持时返回 None。
+        """
+        if self.ev.task_event is not None:
+            logger.debug(t("[Bot] HTTP 模式不支持获取群成员列表"))
+            return None
+        gid = str(group_id or self.ev.group_id or "")
+        if not gid:
+            return None
+        return await self.bot.get_group_member_list(
+            group_id=gid,
+            bot_id=self.ev.real_bot_id,
+            bot_self_id=self.bot_self_id,
+            timeout=timeout,
         )
 
     async def unsend(

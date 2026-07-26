@@ -568,6 +568,12 @@ class GsServer:
             bot._recall_waiters.clear()
             bot._recall_timeout_streak = 0
 
+            # 同步唤醒并清空数据请求回执（如群成员列表）的 future
+            for _fut in list(bot._data_waiters.values()):
+                if not _fut.done():
+                    _fut.set_result(None)
+            bot._data_waiters.clear()
+
             # 3. 清理 Bot.instances 中属于该 bot_id 的条目
             session_ids_to_remove = [sid for sid, b in Bot.instances.items() if b.bot_id == bot_id]
             for sid in session_ids_to_remove:
