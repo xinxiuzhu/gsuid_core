@@ -1875,5 +1875,14 @@
     "[数据库] with_session 未知失败": "[Database] Unknown with_session failure",
     "[数据库] 连接池耗尽/超时，停止重试: {e}": "[Database] Connection pool exhausted/timed out; stopping retries: {e}",
     "[数据库] 重试耗尽仍失败: {e}": "[Database] Still failing after retries exhausted: {e}",
-    "log.webconsole.dashboard_daily_command_counts_fail": "Failed to fetch daily command counts: {error}"
+    "log.webconsole.dashboard_daily_command_counts_fail": "Failed to fetch daily command counts: {error}",
+    "[Bot] 请求回戳用户: bot={bot_id}, target_type={target_type}, target_id={target_id}, user_id={user_id}": "[Bot] Poke-back request: bot={bot_id}, target_type={target_type}, target_id={target_id}, user_id={user_id}",
+    "[Bot] HTTP 模式不支持回戳": "[Bot] Poke-back is not supported in HTTP mode",
+    "[Bot] HTTP 模式不支持获取群成员列表": "[Bot] Fetching group member list is not supported in HTTP mode",
+    "[Bot] 获取群成员列表超时: group_id={group_id}, echo={echo}": "[Bot] Group member list request timed out: group_id={group_id}, echo={echo}",
+    "[PersonaConfig] 已更新 '{persona_name}' 的戳一戳回应: {enabled}": "[PersonaConfig] Updated poke response for '{persona_name}': {enabled}",
+    "[Poke] 发送人格表情失败: {exc}": "[Poke] Failed to send persona meme: {exc}",
+    "[Poke] 预算预检失败，继续尝试低级模型: {exc}": "[Poke] Budget pre-check failed, still trying low-level model: {exc}",
+    "[Poke] 低级模型响应超时，降级为人格表情": "[Poke] Low-level model timed out, falling back to persona meme",
+    "[Poke] 低级模型响应失败，降级为人格表情: {exc}": "[Poke] Low-level model failed, falling back to persona meme: {exc}"
 }

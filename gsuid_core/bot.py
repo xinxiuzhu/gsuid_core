@@ -704,7 +704,11 @@ class _Bot:
             result = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
             logger.warning(
-                f"[Bot] 获取群成员列表超时: group_id={group_id}, echo={echo}"
+                t(
+                    "[Bot] 获取群成员列表超时: group_id={group_id}, echo={echo}",
+                    group_id=group_id,
+                    echo=echo,
+                )
             )
             result = None
         finally:
@@ -1143,7 +1147,7 @@ class Bot:
     async def poke(self) -> None:
         """尝试回戳当前事件的发起者。"""
         if self.ev.task_event is not None:
-            logger.debug("[Bot] HTTP 模式不支持回戳")
+            logger.debug(t("[Bot] HTTP 模式不支持回戳"))
             return
         user_id = str(self.ev.get_meta("user_id", self.ev.user_id) or "")
         if not user_id or user_id == str(self.bot_self_id):
@@ -1174,7 +1178,7 @@ class Bot:
         超时或 adapter 不支持时返回 None。
         """
         if self.ev.task_event is not None:
-            logger.debug("[Bot] HTTP 模式不支持获取群成员列表")
+            logger.debug(t("[Bot] HTTP 模式不支持获取群成员列表"))
             return None
         gid = str(group_id or self.ev.group_id or "")
         if not gid:
