@@ -152,6 +152,9 @@ async def main():
                             # 优先拦截 recall_message_id 回执，避免其进入正常消息管道
                             if bot.resolve_recall(msg):
                                 continue
+                            # 拦截数据请求回执（如群成员列表）
+                            if bot.resolve_data_resp(msg):
+                                continue
                             await handle_event(bot, msg)
                         except asyncio.TimeoutError:
                             continue
