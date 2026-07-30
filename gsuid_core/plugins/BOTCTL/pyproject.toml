@@ -1,0 +1,8 @@
+[project]
+name = "BOTCTL"
+version = "0.4.0"
+description = "通过 dk 指令管理 QQ 机器人（自动发现、登录、重启、状态与反检测配置）"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.24",
+]
