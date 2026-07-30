@@ -1,5 +1,6 @@
 import asyncio
 import sqlite3
+import threading
 from typing import (
     Any,
     Dict,
@@ -17,6 +18,7 @@ from typing_extensions import ParamSpec, Concatenate
 from sqlmodel import Field, SQLModel, col, and_, delete, select, update
 from sqlalchemy import MetaData, exc, text, event, inspect, create_engine
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.pool import NullPool
 from sqlalchemy.engine import Engine, Connection
 from sqlalchemy.schema import CreateTable
 from sqlalchemy.ext.asyncio import (
@@ -25,7 +27,6 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,  # type: ignore
     create_async_engine,
 )
-from sqlalchemy.pool import NullPool
 from sqlalchemy.orm.attributes import InstrumentedAttribute
 from sqlalchemy.sql.expression import func, null, true
 
@@ -74,6 +75,82 @@ server_engine = None
 _db_init_lock = asyncio.Lock()
 _db_initialized = False
 sqlite_semaphore = None
+sqlite_write_lock = None
+
+
+class _CrossLoopAsyncLock:
+    """可跨线程和事件循环等待的可重入异步锁。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._owner: tuple[int, asyncio.Task[Any]] | None = None
+        self._depth = 0
+
+    @staticmethod
+    def _current_owner() -> tuple[int, asyncio.Task[Any]]:
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("数据库异步锁必须在 asyncio Task 中使用")
+        return threading.get_ident(), task
+
+    async def acquire(self) -> None:
+        owner = self._current_owner()
+        with self._state_lock:
+            if self._owner == owner:
+                self._depth += 1
+                return
+
+        acquire_task = asyncio.create_task(asyncio.to_thread(self._lock.acquire))
+        try:
+            await asyncio.shield(acquire_task)
+        except asyncio.CancelledError:
+            await acquire_task
+            self._lock.release()
+            raise
+
+        with self._state_lock:
+            self._owner = owner
+            self._depth = 1
+
+    def release(self) -> None:
+        owner = self._current_owner()
+        with self._state_lock:
+            if self._owner != owner:
+                raise RuntimeError("数据库异步锁只能由持有者释放")
+            self._depth -= 1
+            if self._depth > 0:
+                return
+            self._owner = None
+        self._lock.release()
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
+class _CrossLoopAsyncSemaphore:
+    """基于线程信号量实现，避免 asyncio.Semaphore 跨事件循环绑定。"""
+
+    def __init__(self, value: int) -> None:
+        self._semaphore = threading.BoundedSemaphore(value)
+
+    async def __aenter__(self):
+        acquire_task = asyncio.create_task(asyncio.to_thread(self._semaphore.acquire))
+        try:
+            await asyncio.shield(acquire_task)
+        except asyncio.CancelledError:
+            await acquire_task
+            self._semaphore.release()
+            raise
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self._semaphore.release()
+
 
 if _db_type == "sqlite":
     sync_url = "sqlite:///"
@@ -99,7 +176,7 @@ else:
 
 
 async def init_database():
-    global _db_initialized, engine, finally_url, async_maker, sqlite_semaphore
+    global _db_initialized, engine, finally_url, async_maker, sqlite_semaphore, sqlite_write_lock
 
     if _db_initialized:
         return
@@ -120,26 +197,35 @@ async def init_database():
                 # 显式 NullPool：每次 checkout 新建连接，并发上限交给下方 semaphore。
                 db_config.update(
                     {
-                        "connect_args": {"check_same_thread": False},
+                        "connect_args": {
+                            "check_same_thread": False,
+                            "timeout": 30.0,
+                        },
                         "poolclass": NullPool,
                     }
                 )
+
+                # journal_mode 是数据库级持久配置，只在初始化时设置一次。
+                # 若在 NullPool 的每次新连接上执行，高并发写入期间该 PRAGMA
+                # 自身也可能参与锁竞争，并且发生在 busy_timeout 生效之前。
+                with sqlite3.connect(db_url, timeout=30.0) as sqlite_connection:
+                    sqlite_connection.execute("PRAGMA journal_mode=WAL")
+
                 engine = create_async_engine(f"{base_url}{db_url}", **db_config)
                 finally_url = f"{base_url}{db_url}"
 
                 @event.listens_for(engine.sync_engine, "connect")
                 def set_sqlite_pragma(dbapi_connection: sqlite3.Connection, connection_record):
                     cursor = dbapi_connection.cursor()
-                    cursor.execute("PRAGMA journal_mode=WAL")
+                    cursor.execute("PRAGMA busy_timeout=30000")
                     cursor.execute("PRAGMA synchronous=NORMAL")
-                    # 5s 太短：大图落盘/大 BLOB 快照写时其它连接会立刻 OperationalError
-                    # 再被 with_session 重试放大；15s 给写者一点喘息。
-                    cursor.execute("PRAGMA busy_timeout=15000")
                     cursor.close()
 
-                # 并发 session 上限：原先 20 > QueuePool 的 15，信号量比池还松。
-                # NullPool 下信号量才是真正闸门；8 对单写 SQLite 更稳。
-                sqlite_semaphore = asyncio.Semaphore(8)
+                # WWUID 的后台分发器运行在独立线程和事件循环中，不能共享
+                # asyncio.Semaphore/Lock。这里使用跨事件循环限流器，并将所有
+                # 标记为 write=True 的事务放入同一个进程级写锁。
+                sqlite_semaphore = _CrossLoopAsyncSemaphore(8)
+                sqlite_write_lock = _CrossLoopAsyncLock()
             else:
                 db_config.update(
                     {
@@ -213,34 +299,41 @@ def _is_transient_db_error(err: BaseException) -> bool:
     msg = str(err).lower()
     if "unable to open database file" in msg:
         return False
-    return (
-        "database is locked" in msg
-        or "database table is locked" in msg
-        or "busy" in msg
-        or "disk i/o error" in msg
-    )
+    return "database is locked" in msg or "database table is locked" in msg or "busy" in msg or "disk i/o error" in msg
 
 
 def with_session(
-    func: Callable[Concatenate[Any, AsyncSession, P], Awaitable[R]],
-) -> Callable[Concatenate[Any, P], Awaitable[R]]:
+    func: Callable[Concatenate[Any, AsyncSession, P], Awaitable[R]] | None = None,
+    *,
+    write: bool = False,
+):
+    if func is None:
+        return lambda wrapped: with_session(wrapped, write=write)
+
     @wraps(func)
     async def wrapper(self, *args: P.args, **kwargs: P.kwargs):
         max_retries = 3
         last_err: BaseException | None = None
         for attempt in range(max_retries):
             try:
-                if sqlite_semaphore:
-                    async with sqlite_semaphore:
-                        async with async_maker() as session:
-                            data = await func(self, session, *args, **kwargs)
-                            await session.commit()
-                            return data
-                else:
+
+                async def run_with_session():
+                    if sqlite_semaphore:
+                        async with sqlite_semaphore:
+                            async with async_maker() as session:
+                                data = await func(self, session, *args, **kwargs)
+                                await session.commit()
+                                return data
                     async with async_maker() as session:
                         data = await func(self, session, *args, **kwargs)
                         await session.commit()
                         return data
+
+                if write and sqlite_write_lock:
+                    async with sqlite_write_lock:
+                        return await run_with_session()
+                else:
+                    return await run_with_session()
             except Exception as e:
                 last_err = e
                 if _is_pool_timeout(e):
@@ -255,9 +348,7 @@ def with_session(
                     logger.error(i18n_t("[数据库] 数据库无法打开，停止重试"))
                     raise
                 if _is_transient_db_error(e) and attempt < max_retries - 1:
-                    logger.warning(
-                        i18n_t("[数据库] 第 {p0} 次重试失败: {e}", p0=attempt + 1, e=e)
-                    )
+                    logger.warning(i18n_t("[数据库] 第 {p0} 次重试失败: {e}", p0=attempt + 1, e=e))
                     await asyncio.sleep(0.5 * (2**attempt))
                     continue
                 # 业务异常 / 不可恢复：直接抛，禁止静默 return None
@@ -346,7 +437,7 @@ class BaseIDModel(SQLModel):
         return r
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def batch_insert_data(
         cls,
         session: AsyncSession,
@@ -355,7 +446,7 @@ class BaseIDModel(SQLModel):
         session.add_all(datas)
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def batch_insert_data_with_update(
         cls,
         session: AsyncSession,
@@ -398,7 +489,7 @@ class BaseIDModel(SQLModel):
         await session.execute(update_stmt, values_to_insert)
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def update_data_by_data(
         cls,
         session: AsyncSession,
@@ -468,7 +559,7 @@ class BaseIDModel(SQLModel):
             return "uid"
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def full_insert_data(cls, session: AsyncSession, **data) -> int:
         """📝简单介绍:
 
@@ -491,7 +582,7 @@ class BaseIDModel(SQLModel):
         return 0
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def delete_row(
         cls: Type[T_BaseIDModel],
         session: AsyncSession,
@@ -590,7 +681,7 @@ class BaseBotIDModel(BaseIDModel):
     bot_id: str = Field(title="平台")
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def update_data_by_uid_without_bot_id(
         cls,
         session: AsyncSession,
@@ -629,7 +720,7 @@ class BaseBotIDModel(BaseIDModel):
         return -1
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def update_data_by_xx(
         cls,
         session: AsyncSession,
@@ -667,7 +758,7 @@ class BaseBotIDModel(BaseIDModel):
         return -1
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def update_data_by_uid(
         cls,
         session: AsyncSession,
@@ -803,7 +894,7 @@ class BaseModel(BaseBotIDModel):
         return data[0] if data else None
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def insert_data(
         cls: Type[T_BaseModel],
         session: AsyncSession,
@@ -846,7 +937,7 @@ class BaseModel(BaseBotIDModel):
         return 0
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def delete_data(
         cls: Type[T_BaseModel],
         session: AsyncSession,
@@ -878,7 +969,7 @@ class BaseModel(BaseBotIDModel):
         return 0
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def update_data(
         cls: Type[T_BaseModel],
         session: AsyncSession,
@@ -1412,7 +1503,7 @@ class User(BaseModel):
         return getattr(result, attr) if result else None
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def mark_invalid(cls: Type[T_User], session: AsyncSession, cookie: str, mark: str):
         """令一个cookie所对应数据的`status`值为传入的mark
 
@@ -1675,7 +1766,7 @@ class User(BaseModel):
             return None
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def delete_user_data_by_uid(cls, session: AsyncSession, uid: str, game_name: Optional[str] = None) -> bool:
         """根据给定的`uid`获取数据后, 删除整行数据
 
@@ -1706,7 +1797,7 @@ class Cache(BaseIDModel):
         return data[0].cookie if len(data) >= 1 else None
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def delete_error_cache(cls: Type[T_Cache], session: AsyncSession, user: Type["User"]) -> bool:
         """根据给定的`user`模型中, 查找该模型所有数据的status
 
@@ -1723,7 +1814,7 @@ class Cache(BaseIDModel):
         return True
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def delete_all_cache(cls, session: AsyncSession, user: Type["User"]) -> bool:
         """删除整个表的数据
 
@@ -1745,14 +1836,14 @@ class Cache(BaseIDModel):
         return True
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def refresh_cache(cls, session: AsyncSession, uid: str, game_name: Optional[str] = None) -> bool:
         """删除指定`uid`的数据行"""
         await session.execute(delete(cls).where(getattr(cls, cls.get_gameid_name(game_name)) == uid))
         return True
 
     @classmethod
-    @with_session
+    @with_session(write=True)
     async def insert_cache_data(cls, session: AsyncSession, cookie: str, **data) -> bool:
         """新增指定`cookie`的数据行, `**data`为数据"""
         new_data = cls(cookie=cookie, **data)
