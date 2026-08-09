@@ -60,6 +60,7 @@ def test_templates_carry_staleness_and_addressing() -> None:
     assert "{staleness_section}" in DECISION_USER_TEMPLATE
     assert "{staleness_section}" in PROACTIVE_MESSAGE_USER_TEMPLATE
     assert "不是主人发的就绝不称" in PROACTIVE_MESSAGE_USER_TEMPLATE
+    assert "必须调用 poke_user 工具" in PROACTIVE_MESSAGE_USER_TEMPLATE
 
 
 # ─────────────────────────────────────────────

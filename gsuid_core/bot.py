@@ -648,8 +648,7 @@ class _Bot:
         )
         logger.info(
             t(
-                "[Bot] 请求回戳用户: bot={bot_id}, target_type={target_type}, "
-                "target_id={target_id}, user_id={user_id}",
+                "[Bot] 请求回戳用户: bot={bot_id}, target_type={target_type}, target_id={target_id}, user_id={user_id}",
                 bot_id=bot_id,
                 target_type=target_type,
                 target_id=target_id,
@@ -1151,28 +1150,39 @@ class Bot:
             self.bot_self_id,
         )
 
-    async def poke(self) -> None:
-        """尝试回戳当前事件的发起者。"""
+    async def poke_user(self, user_id: Union[str, int]) -> bool:
+        """请求 adapter 戳当前会话中的指定用户。
+
+        群聊目标固定为当前群，私聊目标固定为当前联系人；调用方只能选择用户，
+        不能借此跨会话发送控制包。返回值仅表示请求已成功提交给 adapter，底层
+        协议是否执行成功取决于 adapter 的实现与协议端支持。
+        """
         if self.ev.task_event is not None:
-            logger.debug(t("[Bot] HTTP 模式不支持回戳"))
-            return
-        user_id = str(self.ev.get_meta("user_id", self.ev.user_id) or "")
-        if not user_id or user_id == str(self.bot_self_id):
-            return
-        target_type: Literal["group", "direct"] = (
-            "direct" if self.ev.user_type == "direct" else "group"
-        )
-        target_id = user_id if target_type == "direct" else str(self.ev.group_id or "")
+            logger.debug(t("[Bot] HTTP 模式不支持戳一戳"))
+            return False
+        uid = str(user_id or "").strip()
+        if not uid or uid == str(self.bot_self_id):
+            return False
+        target_type: Literal["group", "direct"] = "direct" if self.ev.user_type == "direct" else "group"
+        if target_type == "direct" and uid != str(self.ev.user_id or ""):
+            return False
+        target_id = uid if target_type == "direct" else str(self.ev.group_id or "")
         if not target_id:
-            return
+            return False
         await self.bot.poke_user(
-            user_id=user_id,
+            user_id=uid,
             group_id=self.ev.group_id if target_type == "group" else None,
             target_type=target_type,
             target_id=target_id,
             bot_id=self.ev.real_bot_id,
             bot_self_id=self.bot_self_id,
         )
+        return True
+
+    async def poke(self) -> bool:
+        """尝试回戳当前事件的发起者。"""
+        user_id = str(self.ev.get_meta("user_id", self.ev.user_id) or "")
+        return await self.poke_user(user_id)
 
     async def get_group_member_list(
         self,

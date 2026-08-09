@@ -106,6 +106,7 @@
   "log.ai.buildintools_markdown_rendering": "[BuildinTools] Markdown rendering failed: {e}",
   "log.ai.buildintools_markdown_rendering_succeeded_ok": "[BuildinTools] Markdown rendering succeeded, image length: {p0} bytes",
   "log.ai.buildintools_memory_retrieval": "[BuildinTools] Memory retrieval failed: {e}",
+  "log.ai.buildintools_poke_user_submitted": "[BuildinTools] Poke request submitted: bot_self_id={bot_self_id}, scope={scope_id}, target_user_id={target_user_id}",
   "log.ai.buildintools_query_user_memory": "[BuildinTools] query_user_memory retrieving user {target_id}: query={query}",
   "log.ai.buildintools_read_image_attempt_fail": "[BuildinTools] read_image {attempt}th attempt to read {image_id} failed: {e}",
   "log.ai.buildintools_read_image_directly_send": "[BuildinTools] read_image directly sending image {image_id} to multimodal main model",

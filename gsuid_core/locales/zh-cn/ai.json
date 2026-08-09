@@ -106,6 +106,7 @@
   "log.ai.buildintools_markdown_rendering": "[BuildinTools] Markdown渲染失败: {e}",
   "log.ai.buildintools_markdown_rendering_succeeded_ok": "[BuildinTools] Markdown渲染成功，图片长度: {p0} bytes",
   "log.ai.buildintools_memory_retrieval": "[BuildinTools] 记忆检索失败: {e}",
+  "log.ai.buildintools_poke_user_submitted": "[BuildinTools] 已提交戳一戳请求: bot_self_id={bot_self_id}, scope={scope_id}, target_user_id={target_user_id}",
   "log.ai.buildintools_query_user_memory": "[BuildinTools] query_user_memory 检索用户 {target_id}: query={query}",
   "log.ai.buildintools_read_image_attempt_fail": "[BuildinTools] read_image 第 {attempt} 次读取 {image_id} 失败: {e}",
   "log.ai.buildintools_read_image_directly_send": "[BuildinTools] read_image 直投图片 {image_id} 给多模态主模型",

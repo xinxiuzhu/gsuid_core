@@ -11,7 +11,7 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 
 - ``get_main_agent_tools()``     → 加载 ``self`` + ``buildin`` 两个分类（**保底池**）；
                                    其中 ``self`` 再经 ``_SELF_CATEGORY_WHITELIST`` 收敛到
-                                   4 个核心工具，防插件滥用 ``category="self"`` 撑大保底池。
+                                   核心工具白名单，防插件滥用 ``category="self"`` 撑大保底池。
 - ``search_tools(query=...)``    → 在 ``planning`` / ``common`` / ``media`` / ``default``
                                    与插件注册的 ``by_trigger`` 等分类里做向量检索按需加载。
 - ``tool_state_signals``         → 按"用户名下持久实体"把 ``planning`` 能力族精确补进工具列表。
@@ -29,12 +29,13 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 
 ### 2.1 ``category="self"`` —— 仅主人格保底（不会装配进能力代理）
 这些是"只能由主人格直接调用"的工具：副作用强、面向用户。``get_main_agent_tools``
-还会用 ``rag.tools._SELF_CATEGORY_WHITELIST`` 把 self 保底池收敛到这 4 个核心工具
+还会用 ``rag.tools._SELF_CATEGORY_WHITELIST`` 把 self 保底池收敛到核心工具
 （防插件滥用 ``category="self"`` 撑大保底池），故下表即当前的 self 白名单全集：
 
 | 工具 | 来源 | 说明 |
 |---|---|---|
 | ``send_message_by_ai`` | ``message_sender.py`` | 主动以当前人格口吻发消息给主人（**仅主人格可用，能力代理禁用**） |
+| ``poke_user`` | ``poke_user.py`` | 在当前会话中戳一戳经过群成员校验的用户 |
 | ``update_user_favorability`` | ``favorability_manager.py`` | 增量更新好感度 |
 | ``add_once_task`` | ``scheduler.py`` | 注册一次性定时任务（口语触发，需常驻主人格手边） |
 | ``add_interval_task`` | ``scheduler.py`` | 注册周期定时任务（同上） |
@@ -284,6 +285,9 @@ from gsuid_core.ai_core.buildin_tools.message_sender import (
     clear_session_reply_mute,
 )
 
+# 群聊互动工具 - 在当前会话中戳一戳指定用户
+from gsuid_core.ai_core.buildin_tools.poke_user import poke_user
+
 # 文件操作工具 - artifacts 路径内的文件移动/复制/打包 zip
 from gsuid_core.ai_core.buildin_tools.file_operations import (
     copy_file,
@@ -352,6 +356,7 @@ __all__ = [
     "send_message_by_ai",
     "set_session_reply_mute",
     "clear_session_reply_mute",
+    "poke_user",
     # 命令执行工具
     "execute_shell_command",
     # 命令执行器（主人专属 buildin）

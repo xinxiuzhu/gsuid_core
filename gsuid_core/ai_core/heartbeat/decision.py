@@ -4,6 +4,7 @@ import time
 from typing import Any, List, Optional
 from datetime import datetime
 
+from gsuid_core.bot import Bot
 from gsuid_core.i18n import t
 from gsuid_core.config import core_config
 from gsuid_core.logger import logger
@@ -74,6 +75,11 @@ PROACTIVE_MESSAGE_USER_TEMPLATE = """[群里最近发生的事]
 - 禁止主动发表专业分析/市场评论/数据罗列（除非主人委派）。
 - 禁止使用表格、编号列表、加粗标题等结构化格式。
 - 默认潜水，非必要不现身：如果只是"想说点什么"但没有明确话头，宁可不说。
+
+[戳一戳动作]
+- 如果你确实想真实地戳某位群友，必须调用 poke_user 工具；只在台词里说“戳你一下”不会执行。
+- target_user_id 只能原样选择上方聊天记录里明确出现的用户 ID，不能填昵称、不能猜测。
+- 戳一戳是可选互动，不要为了展示工具而调用，每次最多戳一人。
 """
 
 # §10 新鲜度门：最后一条人类消息距今超过该分钟数，
@@ -381,12 +387,30 @@ async def run_heartbeat(
         persona_name=persona_name,
         session_id=output_session_id,
         is_subagent=True,
+        dynamic_tools=False,
     )
     # 与决策阶段一致：绑定 scope 记账 + 超额硬拦截。
     output_agent.bind_budget_scope(event)
     output_logger = output_agent._session_logger
     try:
-        result = await output_agent.run(user_message=message_user, budget_gate=True)
+        # Heartbeat 只显式开放戳一戳这一项互动动作，避免把主人格的完整动态工具池
+        # 暴露给自主巡检。工具注册函数的导入本身会确保全局注册表已有该项。
+        from gsuid_core.ai_core.register import find_tool_base
+        from gsuid_core.ai_core.proactive.emitter import _resolve_active_bot
+        from gsuid_core.ai_core.buildin_tools.poke_user import poke_user as _poke_user  # noqa: F401
+
+        raw_bot = _resolve_active_bot(event)
+        heartbeat_bot = Bot(raw_bot, event) if raw_bot is not None else None
+        poke_tool_base = find_tool_base("poke_user")
+        heartbeat_tools = [poke_tool_base.tool] if poke_tool_base is not None else []
+        result = await output_agent.run(
+            user_message=message_user,
+            bot=heartbeat_bot,
+            ev=event,
+            tools=heartbeat_tools,
+            return_mode="return",
+            budget_gate=True,
+        )
     except Exception as e:
         logger.exception(t("log.ai.heartbeat_fail_generation_stage", e=e))
         if output_logger is not None:

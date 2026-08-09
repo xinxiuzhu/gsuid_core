@@ -106,6 +106,7 @@
   "log.ai.buildintools_markdown_rendering": "[BuildinTools] Markdown レンダリング失敗: {e}",
   "log.ai.buildintools_markdown_rendering_succeeded_ok": "[BuildinTools] Markdown レンダリング成功、画像長: {p0} bytes",
   "log.ai.buildintools_memory_retrieval": "[BuildinTools] メモリ検索に失敗: {e}",
+  "log.ai.buildintools_poke_user_submitted": "[BuildinTools] つつくリクエストを送信しました: bot_self_id={bot_self_id}, scope={scope_id}, target_user_id={target_user_id}",
   "log.ai.buildintools_query_user_memory": "[BuildinTools] query_user_memory ユーザー {target_id} を検索: query={query}",
   "log.ai.buildintools_read_image_attempt_fail": "[BuildinTools] read_image {attempt} 回目の {image_id} 読み込みに失敗: {e}",
   "log.ai.buildintools_read_image_directly_send": "[BuildinTools] read_image 画像 {image_id} をマルチモーダル主モデルに直接送信",

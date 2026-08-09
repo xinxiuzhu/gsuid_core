@@ -162,3 +162,28 @@ def test_bot_poke_encodes_single_control_packet() -> None:
         assert packet.content[0].data == {"user_id": "u1", "group_id": "g1"}
 
     _run(run())
+
+
+def test_bot_poke_user_encodes_explicit_group_target() -> None:
+    async def run() -> None:
+        ev = _event(user_id="speaker")
+        raw_bot = _Bot("yunzai")
+        packets: list[bytes] = []
+
+        async def capture(coro):
+            original = raw_bot.bot
+            raw_bot.bot = SimpleNamespace(send_bytes=AsyncMock(side_effect=lambda body: packets.append(body)))
+            try:
+                await coro
+            finally:
+                raw_bot.bot = original
+
+        raw_bot._enqueue_send = capture  # type: ignore[method-assign]
+        assert await Bot(raw_bot, ev).poke_user("chosen-user") is True
+
+        packet = msgjson.decode(packets[0], type=MessageSend)
+        assert packet.target_type == "group"
+        assert packet.target_id == "g1"
+        assert packet.content[0].data == {"user_id": "chosen-user", "group_id": "g1"}
+
+    _run(run())
