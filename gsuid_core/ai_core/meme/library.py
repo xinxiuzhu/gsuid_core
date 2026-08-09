@@ -935,33 +935,12 @@ async def _remove_from_qdrant(meme_id: str) -> None:
 
 
 async def _remove_many_from_qdrant(meme_ids: List[str]) -> None:
-    """Use one MatchAny selector to delete a batch of meme vectors."""
-    from qdrant_client.models import Filter, MatchAny, FieldCondition
-
-    from gsuid_core.ai_core.rag.base import client
-
-    if client is None or not meme_ids:
-        return
-
-    await client.delete(
-        collection_name=MEME_COLLECTION_NAME,
-        points_selector=Filter(
-            must=[
-                FieldCondition(
-                    key="meme_id",
-                    match=MatchAny(any=list(dict.fromkeys(meme_ids))),
-                )
-            ]
-        ),
-    )
-
-
-async def _remove_many_from_qdrant(meme_ids: List[str]) -> None:
     """批量从 Qdrant 删除多个 meme_id 的向量。
 
     优先用 MatchAny 一次删完；客户端不支持时回退为逐条删除。
     """
-    if not meme_ids:
+    unique_ids = list(dict.fromkeys(meme_ids))
+    if not unique_ids:
         return
 
     from gsuid_core.ai_core.rag.base import client
@@ -978,7 +957,7 @@ async def _remove_many_from_qdrant(meme_ids: List[str]) -> None:
                 must=[
                     FieldCondition(
                         key="meme_id",
-                        match=MatchAny(any=list(meme_ids)),
+                        match=MatchAny(any=unique_ids),
                     )
                 ]
             ),
@@ -987,8 +966,20 @@ async def _remove_many_from_qdrant(meme_ids: List[str]) -> None:
     except Exception as e:
         logger.warning(t("log.meme.qdrant_matchany_batch_delete_failed", e=e))
 
-    for meme_id in meme_ids:
+    from qdrant_client.models import Filter, MatchValue, FieldCondition
+
+    for meme_id in unique_ids:
         try:
-            await _remove_from_qdrant(meme_id)
+            await client.delete(
+                collection_name=MEME_COLLECTION_NAME,
+                points_selector=Filter(
+                    must=[
+                        FieldCondition(
+                            key="meme_id",
+                            match=MatchValue(value=meme_id),
+                        )
+                    ]
+                ),
+            )
         except Exception as e:
             logger.warning(t("log.meme.meme_qdrant_fail_delete_vector", e=e))
