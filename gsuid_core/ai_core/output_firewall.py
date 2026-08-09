@@ -1,22 +1,22 @@
-"""出戏防火墙：AI 输出侧的强制后处理闸门（§D）。
+"""出戏防火墙策略：OOC 词表 / ``check_ooc`` / 重说文案（§D）。
 
-见 ``docs/SESSION_LOG_SECURITY_FINDINGS_20260707.md`` §D.4。把 system prompt 里的
-"出戏防火墙"从"建议"变成代码强制点——AI 回复下发前过一遍分类词库，命中即建议重说。
+见 ``docs/SESSION_LOG_SECURITY_FINDINGS_20260707.md`` §D.4。
 
-两条输出路径共用本模块：
-- ``send_message_by_ai``（工具，有 return 通道）：命中 → return 警告让模型重发；
-- ``send_chat_result``（主输出路径，无 return）：命中 → 不发该段 + 注入重说反馈。
+职责分层（勿再写回旧「主路径在 send_chat_result 里注入重说」故事）：
+- **策略**：本模块（分类命中、never-release、兜底句、``build_rewrite_warning``）
+- **编排**：``output_gate.pre_send_gate``（尖括号 → OOC；main / tool 决策）
+- **环内接线 / 收尾重说**：``gs_agent``（defer 列表、轻量重写、history scrub）
+- **呈现末端**：``send_chat_result`` 仅在 ``ooc_check=True`` 时做整段替换兜底
 
-**设计核心**：因为是"命中即重说"而非"永久封禁"，词库可激进高召回、宁可偶尔错杀——
-错杀只多生成一次（用户无感），漏杀才是事故。故不追求正则完备。
+工具路径兼容入口：``gate_warn_once`` → ``output_gate.tool_gate_feedback``。
+
+**设计核心**：命中即重说（非永久封禁）→ 词库可高召回；漏杀才是事故。
 """
 
 import re
 from typing import Any, Dict, List, Tuple, Optional
 from dataclasses import dataclass
 
-from gsuid_core.i18n import t
-from gsuid_core.logger import logger
 from gsuid_core.ai_core.content_guard import normalize_for_match
 
 # ── 分类词库 ────────────────────────────────────────────────────────
@@ -59,6 +59,77 @@ _SYSTEM_TERMS: Tuple[str, ...] = (
     "数据库表",
     "max_tokens",
     "maxtokens",
+    # 框架内部用语（对用户念出即出戏；工具名/句柄见 _FRAMEWORK_LEAK_RE）
+    "主人格",
+    "能力代理",
+    "子代理",
+    "转译",
+)
+
+# 工具 API / 资源句柄 / 编排元话语泄漏到用户台词 → 出戏
+_FRAMEWORK_LEAK_RE = re.compile(
+    r"\bsend_message_by_ai\b"
+    r"|\bcreate_subagent\b"
+    r"|\bartifact_get\b"
+    r"|\bartifact_put\b"
+    r"|\bread_handle\b"
+    r"|\bsearch_handles\b"
+    r"|\bsearch_persisted_outputs\b"
+    r"|\blist_persisted_outputs\b"
+    r"|\bgrep_persisted_outputs\b"
+    r"|\bread_persisted_output\b"
+    r"|\bweb_search_tool\b"
+    r"|\bfind_tools\b"
+    r"|\brender_html_to_image\b"
+    r"|\brender_agent\b"
+    r"|\bresearch_agent\b"
+    r"|\bstock_report_agent\b"
+    r"|\bagent_profile\s*="
+    r"|\bimage_id\s*="
+    r"|\bres_[0-9a-fA-F]{6,}\b"
+    r"|\bimg_[0-9a-fA-F]{6,}\b"
+    r"|\bto_[0-9a-fA-F]{6,}\b"
+    r"|\bsa_[0-9a-fA-F]{6,}\b"
+    r"|persisted\s+id\s*="
+    r"|\[persisted\s+id="
+    r"|交给主人格"
+    r"|主人格发"
+    r"|tool_return"
+    r"|long_structured"
+    r"|inline_head"
+    r"|how_to_read"
+    r"|Kanban"
+    r"|artifact\s*:"
+    r"|产物句柄"
+    r"|资源ID\s*:"
+    r"|框架·任务完成"
+    r"|系统校验",
+    re.IGNORECASE,
+)
+
+# 系统过程文案 / 内部口头禅对用户泄露（gateway 硬拦）
+_SYSTEM_COPY_LEAK_RE = re.compile(
+    r"(时效存疑|自己再验|数据没刷|没刷出来|没法.{0,8}编数字|"
+    r"回炉了?你再|回炉|"
+    r"专域(报价|API)|当前市价|最新读数|"
+    r"（系统提示|（系统校验|\[框架[·・.]|"
+    r"禁止再检索|禁止把句柄|禁止念|"
+    r"create_subagent\(|agent_profile=)",
+    re.IGNORECASE,
+)
+
+# 工具/子代理回灌的技术堆栈或状态 JSON 被模型当台词复读 → 机器腔熔断
+_TECH_DUMP_RE = re.compile(
+    r"Traceback \(most recent call last\)"
+    r"|File \"[^\"]+\", line \d+"
+    r"|\bstatus_code\s*[:=]\s*\d{3}\b"
+    r"|[\"']status[\"']\s*:\s*\d{3}"
+    r"|\{['\"]status['\"]\s*:\s*\d{3}"
+    r"|\b(RuntimeError|ValueError|TypeError|KeyError|AttributeError|HTTPError)\b\s*:"
+    r"|\bat 0x[0-9a-fA-F]+\b"
+    r"|pydantic_core|pydantic_ai\."
+    r"|raise\s+\w+Error\(",
+    re.IGNORECASE,
 )
 # 语境技术词：与第一人称直接绑定才是自我泄露（第三方讨论一律放行）。
 # api密钥/apikey 也在此档：真实密钥泄露由 _SK_KEY_RE 按形态兜底，裸词"备个API key"
@@ -249,6 +320,9 @@ def check_ooc(text: str, tier: str = "roleplay", user_text: str = "") -> Optiona
     _fund = _fund_claim_hit(text, user_text)
     if _fund is not None:
         return FirewallHit(category="fund_claim", matched=[_fund])
+    # 机器腔/堆栈：优先于裸 system 词（traceback 同时在词库里）
+    if _TECH_DUMP_RE.search(text):
+        return FirewallHit(category="machine_dump", matched=["技术堆栈/状态码"])
     if model_hits or _MODEL_ATTRIB_RE.search(text):
         # 精度门：裸词/"由…开发"须与自绑定句式**同小句**共现、或身份追问下的超短直答
         # （"MiniMax 呀"）才算泄露；长文本第三方提及（AI 新闻摘要/讨论）放行。
@@ -265,6 +339,12 @@ def check_ooc(text: str, tier: str = "roleplay", user_text: str = "") -> Optiona
         system_hits.append("错误码")
     if _SAMPLING_PARAM_RE.search(text):
         system_hits.append("temperature")
+    _fw = _FRAMEWORK_LEAK_RE.search(text)
+    if _fw is not None:
+        system_hits.append(f"框架泄漏:{_fw.group(0)[:40]}")
+    _sc = _SYSTEM_COPY_LEAK_RE.search(text)
+    if _sc is not None:
+        system_hits.append(f"系统文案:{_sc.group(0)[:40]}")
     if system_hits:
         return FirewallHit(category="system_term", matched=system_hits)
     return None
@@ -278,7 +358,8 @@ def is_enabled() -> bool:
 
 # 不可放行类别：重写后仍命中不得放行（身份词漏放代价=出戏；资金欺骗漏放代价=事故），
 # gate_warn_once 与 gs_agent 重说闭环共同引用（评审修复 F10 穿透面）。
-NEVER_RELEASE_CATEGORIES: frozenset = frozenset({"fund_claim"})
+# machine_dump 直接兜底句，不重说（重说易继续复读堆栈）。
+NEVER_RELEASE_CATEGORIES: frozenset = frozenset({"fund_claim", "machine_dump"})
 
 
 def build_rewrite_warning(hit: FirewallHit) -> str:
@@ -290,6 +371,15 @@ def build_rewrite_warning(hit: FirewallHit) -> str:
             "也不得代任何人答应出钱或向第三方要钱——用角色口吻明确拒绝或岔开话题，"
             "直接输出重写后的内容。"
         )
+    if hit.category == "machine_dump":
+        return "⛔ 内容像技术堆栈/状态 JSON，禁止当台词。用角色短句说稍后再试，不要复述 Traceback、status、错误码。"
+    if any("框架泄漏" in m or "系统文案" in m for m in hit.matched):
+        return (
+            "⛔ 内容含内部工具名 / 资源句柄 / 编排或系统文案（如 read_handle、res_/to_、"
+            "系统校验、过程口头禅），禁止对用户念出。"
+            "请用【纯角色口吻】重写：只说结论与情绪；查不到就角色化说没查到，"
+            "不要提工具、句柄、代理、流程或内部提示语。"
+        )
     return (
         f"⛔ 你要发送的内容命中出戏红线【类别：{hit.category}，命中：{'、'.join(hit.matched[:4])}】，"
         "会破坏角色扮演。请用【纯角色口吻】重写这条消息，去掉任何模型名 / AI 身份 / 系统术语 / "
@@ -299,33 +389,15 @@ def build_rewrite_warning(hit: FirewallHit) -> str:
 
 # 连续重说仍命中时的角色化兜底（避免死循环）——调用方在第 N 次命中后改用它替换。
 PERSONA_FALLBACK_TEXT = "唔…这个不太想说呢…"
+# 机器腔 / 堆栈熔断专用（用户可见、短、角色可接受）
+MACHINE_FALLBACK_TEXT = "额…出错了，稍后再试"
 
 
 def gate_warn_once(extra: Dict[str, Any], text: str, user_text: str = "") -> Optional[str]:
-    """ "提醒一次→重说→放行"闸门（§D.4）：供有 return 通道的工具路径复用。
+    """工具路径发送前闸门（转发 ``output_gate.tool_gate_feedback``）。"""
+    from gsuid_core.ai_core.output_gate import tool_gate_feedback
 
-    同轮首次命中返回重写警告（模型据此重写重发）；同轮再命中返回 None 放行——
-    防"警告↔重试"死循环，误杀只值一次重写。``extra`` 是 ``ToolContext.extra``
-    （含 gs_agent 每轮写入的 turn_id）；无 turn_id 的后台链路每次都警告。
-    """
-    hit = check_ooc(text, user_text=user_text)
-    if hit is None:
-        return None
-    turn_id = str(extra.get("turn_id", ""))
-    warn_key = f"ooc_warned:{turn_id}"
-    if turn_id and extra.get(warn_key):
-        if hit.category in NEVER_RELEASE_CATEGORIES:
-            # 资金欺骗类不放行：持续要求重写，直到产出不命中的版本（评审修复 F10）
-            logger.warning(
-                t("[OutputFirewall] 不可放行类别仍命中 {p0}: {p1}，继续拦截", p0=hit.category, p1=hit.matched)
-            )
-            return build_rewrite_warning(hit)
-        logger.warning(t("[OutputFirewall] 重写后仍命中 {p0}: {p1}，本轮放行", p0=hit.category, p1=hit.matched))
-        return None
-    if turn_id:
-        extra[warn_key] = True
-    logger.warning(t("[OutputFirewall] 命中出戏红线 {p0}: {p1}，要求重写", p0=hit.category, p1=hit.matched))
-    return build_rewrite_warning(hit)
+    return tool_gate_feedback(text, extra, user_text=user_text)
 
 
 def scrub_or_fallback(text: str, tier: str = "roleplay", user_text: str = "") -> Tuple[str, bool]:
@@ -333,6 +405,32 @@ def scrub_or_fallback(text: str, tier: str = "roleplay", user_text: str = "") ->
 
     返回 ``(输出文本, 是否被拦截替换)``。用于重说闭环兜底或不便重说的场景。
     """
-    if check_ooc(text, tier, user_text=user_text) is None:
+    hit = check_ooc(text, tier, user_text=user_text)
+    if hit is None:
         return text, False
+    if hit.category == "machine_dump":
+        return MACHINE_FALLBACK_TEXT, True
     return PERSONA_FALLBACK_TEXT, True
+
+
+def is_tech_dump(text: str) -> bool:
+    """工具/子代理返回是否为堆栈或状态码技术 dump（供 tool return 入模前屏蔽）。"""
+    if not text or not text.strip():
+        return False
+    if _TECH_DUMP_RE.search(text):
+        return True
+    # 大段 JSON 且含 status + error/detail 形态
+    s = text.strip()
+    if (
+        s.startswith("{")
+        and ('"status"' in s or "'status'" in s)
+        and ("error" in s.lower() or "traceback" in s.lower() or "detail" in s.lower())
+    ):
+        return True
+    return False
+
+
+# 屏蔽后交给模型的中性说明（非用户可见台词）
+TECH_DUMP_TOOL_SHIELD = (
+    "（工具返回了技术错误/堆栈，已屏蔽。禁止复述 JSON/Traceback；请用角色短句表示稍后再试，或换路重试工具。）"
+)

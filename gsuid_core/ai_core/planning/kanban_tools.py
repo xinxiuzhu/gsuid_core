@@ -12,7 +12,9 @@
 
 设计原则：
 - 无 UUID：任务引用走自然语言句柄；artifact 是显式 ``res_xxx`` 句柄。
-- 权限：默认 owner / master 可操作；artifact 跨 root_task_id 严格隔离。
+- 权限：默认 owner / master 可操作；同树 ``artifact_get`` 自由互读；
+  跨树仅允许「同 owner+session/scope」或「当前任务 goal / input_artifact_ids 显式引用」。
+  （``create_subagent`` 叶子根彼此独立 root，调研→渲染接力依赖跨树放行。）
 """
 
 import re
@@ -30,10 +32,13 @@ from gsuid_core.ai_core.register import ai_tools
 
 from . import kanban
 from .models import AIAgentTask, AIAgentArtifact
-from .runtime import get_plan_context
+from .runtime import PlanRunContext, get_plan_context
 from .resolver import resolve_task_ref
 from .workspace import put_artifact
 from ..capability_agents.evaluator import _FUZZY_MIN_OVERLAP
+
+# res_ + 12 hex（与 AIAgentArtifact.id 工厂一致）
+_RES_ID_RE = re.compile(r"res_[0-9a-fA-F]{12}")
 
 _CAP = "长期任务编排"
 
@@ -288,7 +293,7 @@ async def register_kanban_task(
             goal="<任务简称> 最终汇总",
             subtasks=[
                 {"description": "record_list 拉流水 + record_summary 算关键指标 "
-                                "→ render_markdown_to_image 出报告",
+                                "→ create_subagent(render_agent) 出报告图",
                  "agent_profile": "internal_reporter",
                  "not_before": "<结算时刻 ISO>"},
             ],
@@ -833,12 +838,7 @@ async def artifact_put(
         file_path_obj = Path(file_path)
         # 错误用法预警：同时传 payload + file_path 时只走 file_path 分支
         if payload:
-            logger.warning(
-                i18n_t(
-                    "📋 [Kanban] artifact_put 同时收到 payload 和 file_path，"
-                    "按 file_path 模式登记真实文件，payload 会被丢弃。"
-                )
-            )
+            logger.warning(i18n_t("log.ai.kanban_artifact_put_payload_file"))
 
     art = await put_artifact(
         payload=payload,
@@ -872,22 +872,38 @@ async def artifact_put(
 async def artifact_get(
     ctx: RunContext[ToolContext],
     res_id: str,
+    offset: int = 0,
+    limit: int = 8000,
 ) -> str:
-    """按 res 句柄取回某 artifact 的内容（同 root_task_id 才允许跨任务读取）。"""
+    """按 res 句柄取回 artifact 内容（支持分页以避免大件截断）。
+
+    长文按 **字符** offset/limit 分页；返回文首含【读窗口】与续读 offset。
+    续读请用上一页提示的 next offset，勿一直 offset=0。
+
+    访问策略：
+    - 同 ``root_task_id``：放行（多步 Kanban 兄弟节点互读）。
+    - 跨树：仅当当前任务显式引用该句柄（goal / ``input_artifact_ids``），
+      或源树与当前任务同 owner 且同 session（否则同 scope）——覆盖
+      ``create_subagent(调研)`` → ``create_subagent(render_agent)`` 接力。
+    - 无 plan 上下文（主人格）：按当前用户是否为源树 owner 校验。
+    """
     plan_ctx = get_plan_context()
     art = await AIAgentArtifact.get_by_id(res_id)
     if art is None:
         return f"⚠️ artifact 不存在: {res_id}"
-    if plan_ctx is not None and plan_ctx.root_task_id and art.root_task_id != plan_ctx.root_task_id:
+    allowed = await _artifact_access_allowed(art=art, plan_ctx=plan_ctx, ctx=ctx)
+    if not allowed:
         logger.warning(
             i18n_t(
-                "📋 [Kanban] 拒绝跨树读取 artifact: req_root={p0} art_root={p1}",
-                p0=plan_ctx.root_task_id,
+                "log.ai.kanban_rejected_cross_tree",
+                p0=getattr(plan_ctx, "root_task_id", None) or "-",
                 p1=art.root_task_id,
             )
         )
         return "⚠️ 该 artifact 属于其它任务树，跨树读取被拒绝。"
-    return _format_artifact(art)
+    lim = max(1, min(int(limit), 32000))
+    off = max(0, int(offset))
+    return _format_artifact(art, offset=off, limit=lim)
 
 
 @ai_tools(category="planning", capability_domain="产物")
@@ -949,6 +965,62 @@ async def artifact_get_recent(
 # helpers
 
 
+def extract_res_ids(text: str) -> List[str]:
+    """从任务描述中抽取 ``res_`` 句柄（去重、保序）。"""
+    if not text:
+        return []
+    return list(dict.fromkeys(_RES_ID_RE.findall(text)))
+
+
+async def _artifact_access_allowed(
+    *,
+    art: AIAgentArtifact,
+    plan_ctx: PlanRunContext | None,
+    ctx: RunContext[ToolContext],
+) -> bool:
+    """判断当前调用方是否可读该 artifact。
+
+    安全边界：不向其它用户的任务树泄密；允许同一主人会话内显式句柄接力。
+    """
+    # —— 主人格 / 无 Kanban 上下文 ——
+    if plan_ctx is None or not plan_ctx.root_task_id:
+        ev = ctx.deps.ev
+        if ev is None:
+            return True
+        source = await AIAgentTask.get_by_id(art.root_task_id)
+        if source is None or not source.owner_user_id:
+            return True
+        return str(ev.user_id) == str(source.owner_user_id)
+
+    # —— 同树 ——
+    if art.root_task_id == plan_ctx.root_task_id:
+        return True
+
+    current = await AIAgentTask.get_by_id(plan_ctx.task_id)
+    if current is None:
+        return False
+
+    # 显式交接：input_artifact_ids 或 goal 正文里写了该 res_
+    inputs = current.input_artifact_ids
+    if isinstance(inputs, list) and art.id in inputs:
+        return True
+    if art.id and art.id in current.goal:
+        return True
+
+    # 同 owner 叶子根接力（create_subagent 连续两次）
+    source = await AIAgentTask.get_by_id(art.root_task_id)
+    if source is None:
+        return False
+    if not current.owner_user_id or current.owner_user_id != source.owner_user_id:
+        return False
+    if current.session_id and source.session_id:
+        return current.session_id == source.session_id
+    if current.scope_key and source.scope_key:
+        return current.scope_key == source.scope_key
+    # 同 owner 且缺少 session/scope 元数据时仍放行（兼容旧行）
+    return True
+
+
 async def _resolve_root_task_id(ctx: RunContext[ToolContext], task_ref_text: str) -> Optional[str]:
     """按上下文 / 自然语言引用 / 最近活跃根任务，依次解析 root_task_id。"""
     ev = ctx.deps.ev
@@ -966,19 +1038,34 @@ async def _resolve_root_task_id(ctx: RunContext[ToolContext], task_ref_text: str
     return actives[0].id if actives else None
 
 
-def _format_artifact(art: AIAgentArtifact) -> str:
-    head = f"artifact {art.id} | kind={art.artifact_kind} | mime={art.mime}\nsummary: {art.summary}\n"
-    if art.payload_inline:
-        return head + f"payload:\n{art.payload_inline}"
-    if art.payload_path:
-        try:
-            from pathlib import Path
+def _format_artifact(
+    art: AIAgentArtifact,
+    *,
+    offset: int = 0,
+    limit: int = 8000,
+) -> str:
+    """格式化 artifact；与 FileOS 共用分页读协议。"""
+    from gsuid_core.ai_core.planning.tool_output_protocol import (
+        load_payload_text,
+        format_paginated_body,
+    )
 
-            text = Path(art.payload_path).read_text(encoding="utf-8", errors="replace")
-            return head + f"payload:\n{text[:12000]}"
-        except OSError as e:
-            return head + f"⚠️ 读取 artifact 落盘失败: {e}"
-    return head + "（无 inline / 落盘内容）"
+    head = f"artifact {art.id} | kind={art.artifact_kind} | mime={art.mime}\nsummary: {art.summary}\n"
+    text, err = load_payload_text(
+        payload_inline=art.payload_inline,
+        payload_path=art.payload_path or "",
+    )
+    if err:
+        return head + f"⚠️ {err}"
+    if not text:
+        return head + "（无 inline / 落盘内容）"
+    return format_paginated_body(
+        head=head,
+        text=text,
+        offset=offset,
+        limit=limit,
+        read_hint="artifact_get(res_id, offset, limit)",
+    )
 
 
 __all__ = [
@@ -1043,15 +1130,31 @@ async def list_my_kanban_tasks(
     if not roots:
         return f"ℹ️ 过滤后无任务（goal_filter={goal_filter!r}, status={status}）。"
 
-    lines = [f"📋 Kanban 任务树（owner={owner}，{len(roots)} 棵）：", ""]
+    lines = [f"📋 任务树（owner={owner}，{len(roots)} 棵）：", ""]
     lines.append("| # | goal | 状态 | 周期 | 错误 |")
     lines.append("|---|------|------|------|------|")
+    safe_bits: list[str] = []
     for r in roots[:30]:
         trig = (r.recurring_trigger or "-")[:24]
         err = (r.failure_reason or "")[:40]
         lines.append(f"| #{r.ordinal} | {(r.goal or '')[:50]} | {r.status} | {trig} | {err} |")
+        # 聊天通道转述：状态人话，禁止原样念 goal/节点
+        _sc = {
+            "pending": "还没开始",
+            "running": "还在弄、还没好",
+            "paused": "先停着",
+            "waiting_approval": "等你确认",
+            "completed": "弄好了",
+            "failed": "这趟没成",
+            "cancelled": "取消了",
+        }
+        _phrase = _sc[r.status] if r.status in _sc else r.status
+        safe_bits.append(f"事项#{r.ordinal}→{_phrase}")
     if len(roots) > 30:
         lines.append(f"…还有 {len(roots) - 30} 棵未列出。")
+    if safe_bits:
+        lines.append("")
+        lines.append("【user_safe_summary】对用户只转述下列人话（勿念表格/goal/节点名）：" + "；".join(safe_bits))
     return "\n".join(lines)
 
 

@@ -33,23 +33,6 @@ from gsuid_core.models import Event
 from gsuid_core.ai_core.register import get_tools_by_capability_domain
 from gsuid_core.ai_core.rag.tools import ToolList
 
-# 闲聊模式下的最小状态驱动工具白名单。
-# 原则：只保留"追问状态"所需的查询/轻量操作工具，去掉创建/评估/全量编辑等重型 schema。
-# 创建/修改类需求完全交给 L4 向量检索按需召回，不影响"任务怎么样了"这类闲聊追问。
-_MINIMAL_CHITCHAT_TOOLS: Set[str] = {
-    # 长期任务编排：保留取消和审批回复（用户可能口头说"取消吧""我同意"）
-    "fail_task_tree",
-    "respond_approval",
-    # 产物：只保留查询类
-    "artifact_get",
-    "artifact_list",
-    "artifact_get_recent",
-    # 结构化记录：只保留查询/汇总类
-    "record_get",
-    "record_list",
-    "record_summary",
-}
-
 
 async def _user_has_active_schedules(user_id: str) -> bool:
     """用户是否存在未完成(pending/paused)的定时任务。"""
@@ -77,6 +60,25 @@ async def _user_has_record_collections(ev: Event) -> bool:
     return bool(keys)
 
 
+async def _user_has_recent_completed_kanban(user_id: str, within_hours: float = 6.0) -> bool:
+    """近 within_hours 内是否有 completed 根任务（完成后仍要能 artifact_get_recent）。"""
+    from datetime import datetime, timedelta
+
+    from gsuid_core.ai_core.planning.models import AIAgentTask
+
+    rows = await AIAgentTask.list_for_owner(str(user_id), only_active=False, root_only=True)
+    if not rows:
+        return False
+    cutoff = datetime.now() - timedelta(hours=within_hours)
+    for task in rows[:20]:
+        if task.status != "completed":
+            continue
+        updated = task.updated_at
+        if updated is not None and updated >= cutoff:
+            return True
+    return False
+
+
 async def get_state_driven_families(ev: Optional[Event], has_active_task: bool = False) -> List[str]:
     """返回应按"持久状态"补进保底池的能力族名列表。
 
@@ -84,6 +86,7 @@ async def get_state_driven_families(ev: Optional[Event], has_active_task: bool =
     - 有活跃(running/waiting_approval) Kanban 任务 → 长期任务编排 + 产物 两族
       （主人格随时可能 fail_task_tree / respond_approval / 追问产物原文，
       即 A-1 要求"随时可调"的 artifact_get_recent）；
+    - 有近 6h 内刚完成的根任务 → 至少挂 产物 族（追问溯源）；
     - 有未完成(pending/paused)的定时任务 → 定时任务 族（改时间 / 取消 / 暂停…）；
     - 名下存在 record:* 结构化集合 → 结构化记录 族（随时可被追问读取 / 汇总）。
 
@@ -100,6 +103,9 @@ async def get_state_driven_families(ev: Optional[Event], has_active_task: bool =
     # 活跃 Kanban 任务：把任务编排族 + 产物族一起带出（A-1 兜底产物追问溯源）
     if has_active_task:
         domains.append("长期任务编排")
+        domains.append("产物")
+    elif await _user_has_recent_completed_kanban(ev.user_id):
+        # 刚完成：编排工具可卸，但产物追问必须仍可用
         domains.append("产物")
 
     # 定时任务：用户有未完成的定时任务 → 带出整个"定时任务"族（含 modify/cancel/pause...）
@@ -125,9 +131,9 @@ async def get_state_driven_family_tools(
         ev: 当前事件，用于确定用户身份。
         exclude_names: 已在保底池中的工具名，避免重复加载。
         has_active_task: 是否存在需即时介入的 Kanban 任务（透传给族判定）。
-        intent: 本轮意图标签。闲聊时只加载轻量追问工具，避免重型 planning schema
-            在寒暄场景下膨胀工具列表。
+        intent: 保留兼容；**不再**因闲聊裁剪——分类器会误判，有实体就必须整族可用。
     """
+    del intent  # 兼容旧调用方；装配不按意图砍状态族
     domains = await get_state_driven_families(ev, has_active_task=has_active_task)
     if not domains:
         return []
@@ -138,11 +144,8 @@ async def get_state_driven_family_tools(
         for tb in get_tools_by_capability_domain(dom):
             if tb.name in seen:
                 continue
-            # 闲聊意图裁剪：只保留白名单内的工具，创建/编排类靠 L4 向量检索按需召回
-            if intent == "闲聊" and tb.name not in _MINIMAL_CHITCHAT_TOOLS:
-                continue
             seen.add(tb.name)
             out.append(tb.tool)
     if out:
-        logger.debug(t("🧠 [ToolState] 状态驱动补充能力族 {domains}，新增 {p0} 个工具", domains=domains, p0=len(out)))
+        logger.debug(t("log.ai.toolstate_state_driven_supplementary_create", domains=domains, p0=len(out)))
     return out

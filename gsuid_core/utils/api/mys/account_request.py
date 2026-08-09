@@ -346,17 +346,21 @@ class AccountMysApi(PassMysApi):
         return data
 
     async def get_authkey_by_cookie(
-        self, uid: str, game_biz: str = "hk4e_cn", server_id: str = ""
+        self,
+        uid: str,
+        game_biz: str = "hk4e_cn",
+        server_id: str = "",
+        game_name: str = "gs",
     ) -> Union[AuthKeyInfo, int]:
         if not server_id:
             server_id = self.RECOGNIZE_SERVER.get(str(uid)[0], "cn_gf01")
-        is_os = self.check_os(uid, "gs")
+        is_os = self.check_os(uid, game_name)
         if is_os:
             game_biz = "hk4e_global"
             HEADER = deepcopy(self._HEADER_OS)
             HEADER["DS"] = generate_os_ds()
-            device_id = await self.get_user_device_id(uid, "gs")
-            device_fp = await self.get_user_fp(uid, "gs")
+            device_id = await self.get_user_device_id(uid, game_name)
+            device_fp = await self.get_user_fp(uid, game_name)
             if device_id:
                 HEADER["x-rpc-device_id"] = device_id
             if device_fp:
@@ -365,7 +369,7 @@ class AccountMysApi(PassMysApi):
             HEADER = deepcopy(self._HEADER)
             HEADER["DS"] = get_web_ds_token(True)
 
-        stoken = await self.get_stoken(uid)
+        stoken = await self.get_stoken(uid, game_name)
         if stoken is None:
             return -51
         HEADER["Cookie"] = stoken
@@ -391,7 +395,7 @@ class AccountMysApi(PassMysApi):
                 "region": server_id,
             },
             use_proxy=is_os,
-            game_name="gs",
+            game_name=game_name,
         )
         if isinstance(data, Dict):
             data = cast(AuthKeyInfo, data["data"])
@@ -401,7 +405,7 @@ class AccountMysApi(PassMysApi):
         # 获取e_hk4e_token
         server_id = self.RECOGNIZE_SERVER.get(uid[0])
         header = {
-            "Cookie": await self.get_ck(uid, "OWNER", None),
+            "Cookie": await self.get_ck(uid, "OWNER", "gs"),
             "Content-Type": "application/json;charset=UTF-8",
             "Referer": "https://webstatic.mihoyo.com/",
             "Origin": "https://webstatic.mihoyo.com",

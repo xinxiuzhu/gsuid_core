@@ -51,11 +51,9 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 - ``query_user_memory``（``database_query.py``）：查询用户多群组记忆 + 好感度（统一照会）
 - ``get_self_info``（``self_info.py``）：取完整自我认知（身份 / 能力 / 主人）
 - ``get_self_persona_info``（``self_info.py``）：查 Persona 资源（立绘/头像/音频/配置）
-- ``read_image``（``image_reader.py``）：按图片ID（``img_xxx`` / ``res_xxx`` / 直链）
-  取回群聊图片并转述为文字（群聊只给 Agent 图片ID、需看图时再读，保底常驻）
-- ``state_get`` / ``state_set`` / ``state_list``（``state_store/tools.py``）：
-  高频通用持久键值状态（低频的 ``state_delete`` / ``state_append`` 已降为 ``common``，
-  靠"持久状态"能力族按需召回）
+- ``read_image``（``image_reader.py``）：按图片ID取回群聊图片并转述（``visible_when`` 有图才露）
+- ``state_get`` / ``state_set``（``state_store/tools.py``）：高频持久键值
+  （``state_list`` / ``state_delete`` / ``state_append`` 在 common，按能力族召回）
 
 ### 2.2.1 ``category="planning"`` —— 状态驱动 + 向量检索按需（**非保底**）
 长任务编排 / 产物 / 结构化集合工具。**刻意不进保底池**——这 15 个重型 schema 每轮常驻会
@@ -101,11 +99,16 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 - ``cancel_scheduled_task`` / ``pause_scheduled_task`` / ``resume_scheduled_task``
   （``scheduler.py``）：定时任务停 / 起按需
 
-### 2.4 ``category="media"`` —— 向量检索按需（图文渲染）
+### 2.4 ``category="media"`` —— 资料出图（主人格不保底，归 ``render_agent``）
 | 工具 | 来源 | 说明 |
 |---|---|---|
-| ``render_html_to_image`` | ``html_render_tools.py`` | HTML 模板 → 图片（webconsole 复用浏览器） |
+| ``render_html_to_image`` | ``html_render_tools.py`` | 自写 HTML 出图（多数据点主路径） |
+| ``render_card`` | ``html_render_tools.py`` | 结构化 JSON 固定布局 → 图片 |
 | ``render_markdown_to_image`` | ``html_render_tools.py`` | Markdown → 图片 |
+
+> 三者同属 ``capability_domain="资料出图"``，由能力代理 ``render_agent`` 白名单持有；
+> 主人格经 exclusive 剥离后**不应**直调，应
+> ``create_subagent(agent_profile="render_agent", task=事实包)``。
 
 ### 2.5 ``category="default"`` —— 沙盒 / 子 Agent 专用
 ``@ai_tools()`` 不传 category 即落入 ``"default"``。这些工具不在保底池，
@@ -152,7 +155,7 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 ``record_*`` + ``search_knowledge`` + ``web_search_tool`` / ``web_fetch_tool``。
 
 注意：``send_message_by_ai`` 不在此列——能力代理只对主人格交付结果，由
-``kanban_executor._persona_relay`` 用主人格口吻转译后送达，不持有"直接和主人对话"的下行通道。
+交互完成后回灌主 session 由主人格收尾；能力代理不持有对用户直发通道。
 """
 
 # 工具装饰器
@@ -274,9 +277,11 @@ from gsuid_core.ai_core.buildin_tools.identity_tools import (
     remember_user_alias,
 )
 
-# 消息发送工具 - 主动发送消息
+# 消息发送工具 - 主动发送消息；会话静默
 from gsuid_core.ai_core.buildin_tools.message_sender import (
     send_message_by_ai,
+    set_session_reply_mute,
+    clear_session_reply_mute,
 )
 
 # 文件操作工具 - artifacts 路径内的文件移动/复制/打包 zip
@@ -307,8 +312,10 @@ from gsuid_core.ai_core.buildin_tools.plugin_developer import (
     read_plugin_dev_guide,
 )
 
-# HTML渲染工具 - 将HTML/Markdown渲染为图片
+# HTML渲染工具 - 将HTML/Markdown/结构化卡片渲染为图片
+# （外链/icon/资源图在 render_html_to_image 内自动嵌 data URI，无独立嵌图工具）
 from gsuid_core.ai_core.buildin_tools.html_render_tools import (
+    render_card,
     render_html_to_image,
     render_markdown_to_image,
 )
@@ -341,8 +348,10 @@ __all__ = [
     "web_search_tool",
     # 网页抓取工具
     "web_fetch_tool",
-    # 消息发送工具
+    # 消息发送工具；会话静默
     "send_message_by_ai",
+    "set_session_reply_mute",
+    "clear_session_reply_mute",
     # 命令执行工具
     "execute_shell_command",
     # 命令执行器（主人专属 buildin）
@@ -423,6 +432,7 @@ __all__ = [
     "record_delete",
     "record_summary",
     # HTML渲染工具
+    "render_card",
     "render_html_to_image",
     "render_markdown_to_image",
     # Kanban 任务编排工具

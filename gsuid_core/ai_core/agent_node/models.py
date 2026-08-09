@@ -21,10 +21,11 @@ NodeSource = Literal["builtin", "plugin", "user", "persona"]
 DELIVERY_BOUNDARY = """【交付边界 · 子任务向上游交付，绝不直接发用户】
 你是被主人格派出的专职执行者，不持有任何 "和主人对话" 的下行通道：
 - **唯一交付方式**：把主要结论 / 产物登记为 artifact（`artifact_put`），并把
-  纯文本结论作为函数返回值交回。Kanban 调度器会用主人格口吻把你的结果转译
-  后再发给主人——你不需要、也不允许"自己说人话给主人听"。
-- **禁止**调用 `send_message_by_ai` / `send_meme` / `send_*_info`
-  这类"直接下发到主人"的通道；它们仅供主人格本身使用。
+  纯文本结论作为函数返回值交回。出站（文字/图片）**只由主人格**完成。
+- **禁止**调用 `send_message_by_ai` / `send_meme` / 任何终局 `bot.send` 直发；
+  图片渲染工具成功后只登记 artifact / 返回句柄，**不得**推送到用户会话。
+- **禁止** `create_subagent` 再嵌套委派；非渲染节点还禁止 `render_html_to_image` /
+  `render_card` / `render_markdown_to_image`（出图由主人格再委派 `render_agent`）。
 - 任务过程中若需要让主人决策（高风险动作、缺关键信息），把诉求**写进交付摘要**
   让主人格转告，不要替主人决定，也不要自己拉群通知。
 - Kanban 子任务的唯一可写目录是 Artifact Workspace；越界写入会被框架拒绝并
@@ -69,6 +70,8 @@ class AgentNode:
     keywords: List[str] = field(default_factory=list)
     # ── meta ──
     source: NodeSource = "plugin"
+    # 注册来源插件目录名：builtin→"core"；plugin→plugins/<Name>；user/persona→""
+    plugin: str = ""
     version: int = 2
 
 

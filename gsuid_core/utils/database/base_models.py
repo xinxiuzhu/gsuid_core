@@ -185,13 +185,13 @@ async def init_database():
         if _db_initialized:
             return
 
-        logger.info(i18n_t("📀 [数据库] 开始初始化..."))
+        logger.info(i18n_t("log.database.init_start"))
 
         try:
             if _db_type == "sqlite":
                 # ⚠️ SQLAlchemy 2.0 对「文件型」sqlite+aiosqlite 的默认池是
                 # AsyncAdaptedQueuePool(size=5, max_overflow=10, timeout=30)，
-                # 并不是历史文档里写的 NullPool。canvas / 生成任务 / collab 高并发下
+                # 并不是历史文档里写的 NullPool。生成任务 / 协作等业务高并发下
                 # 很容易打满 15 槽 → QueuePool timeout 雪崩(2026-07 线上事故)。
                 # SQLite 单写者本就串行，用 QueuePool 只会让连接在等锁时占着槽。
                 # 显式 NullPool：每次 checkout 新建连接，并发上限交给下方 semaphore。
@@ -245,7 +245,7 @@ async def init_database():
                             t2 = "CHARACTER SET utf8mb4 COLLATE "
                             t3 = "utf8mb4_unicode_ci"
                             conn.execute(text(t1 + t2 + t3))
-                            logger.success(i18n_t("[MySQL] 数据库 {db_name} 创建成功或已存在!", db_name=db_name))
+                            logger.success(i18n_t("log.database.mysql_ok_create_database_db_name", db_name=db_name))
                     elif _db_type == "postgresql":
                         server_engine = create_engine(f"{sync_url}{db_url}", **db_config)
                         try:
@@ -259,11 +259,11 @@ async def init_database():
                                 pass
                             else:
                                 raise
-                        logger.success(i18n_t("[PostgreSQL] 数据库 {db_name} 创建成功或已存在!", db_name=db_name))
+                        logger.success(i18n_t("log.database.postgresql_db_name_created", db_name=db_name))
                 finally:
                     if server_engine:
                         server_engine.dispose()
-                        logger.info(i18n_t("[数据库] 临时数据库连接已释放!"))
+                        logger.info(i18n_t("log.database.temporary_connection"))
 
                 # db_config['poolclass'] = NullPool
                 finally_url = f"{base_url}{db_url}{db_name}"
@@ -278,7 +278,7 @@ async def init_database():
 
             _db_initialized = True
         except Exception as e:  # noqa: E722
-            logger.exception(i18n_t("[GsCore] [数据库] 连接失败: {e}", e=e))
+            logger.exception(i18n_t("log.database.gscore_connection", e=e))
             raise ValueError(i18n_t("[GsCore] [数据库] [{base_url}] 连接失败, 请检查配置文件!", base_url=base_url))
 
 
@@ -339,22 +339,22 @@ def with_session(
                 if _is_pool_timeout(e):
                     logger.error(
                         i18n_t(
-                            "[数据库] 连接池耗尽/超时，停止重试: {e}",
+                            "log.database.connect_timeout_stop",
                             e=e,
                         )
                     )
                     raise
                 if isinstance(e, OperationalError) and "unable to open database file" in str(e):
-                    logger.error(i18n_t("[数据库] 数据库无法打开，停止重试"))
+                    logger.error(i18n_t("log.database.stop_retry"))
                     raise
                 if _is_transient_db_error(e) and attempt < max_retries - 1:
-                    logger.warning(i18n_t("[数据库] 第 {p0} 次重试失败: {e}", p0=attempt + 1, e=e))
+                    logger.warning(i18n_t("log.database.retry_fail_2", p0=attempt + 1, e=e))
                     await asyncio.sleep(0.5 * (2**attempt))
                     continue
                 # 业务异常 / 不可恢复：直接抛，禁止静默 return None
                 if attempt >= max_retries - 1 and _is_transient_db_error(e):
                     logger.error(
-                        i18n_t("[数据库] 重试耗尽仍失败: {e}", e=e),
+                        i18n_t("log.database.retry_fail", e=e),
                         exc_info=True,
                     )
                 raise
@@ -542,6 +542,12 @@ class BaseIDModel(SQLModel):
                     假设传入`None`会返回`uid`，而传入`sr`会返回`sr_uid`
                     特殊的, 传入`gs`也会返回`uid`!
 
+                    注意: 仅接受「模型上真实存在的游戏 UID 列」对应短名。
+                    米游社账号维度（``account``）等非游戏 UID 标识不可传入，
+                    否则会在校验阶段抛出 ``ValueError``，避免拼出
+                    ``account_uid`` 后在 ``getattr`` 处变成难排查的
+                    ``AttributeError``。
+
         🚀使用范例:
 
             `await GsUser.get_gameid_name('sr')`
@@ -550,13 +556,22 @@ class BaseIDModel(SQLModel):
 
             🔸`str`: 游戏uid对应列名，默认为`uid`
         """
-        if game_name == "gs":
-            game_name = None
-
-        if game_name:
-            return f"{game_name}_uid"
+        if not game_name or game_name == "gs":
+            col_name = "uid"
         else:
-            return "uid"
+            col_name = f"{game_name}_uid"
+
+        # 入口统一校验：所有 getattr(cls, get_gameid_name(...)) 依赖此保证
+        if not hasattr(cls, col_name):
+            raise ValueError(
+                f"{cls.__name__} 不存在字段 {col_name!r} "
+                f"(game_name={game_name!r})；"
+                f"game_name 只能是模型上真实存在的游戏 UID 列短名"
+                f"（如 None/'gs'/'sr'/'zzz'/'bb'/'bbb'/'wd'），"
+                f"米游社账号维度请用 mys_id 等字段查询，"
+                f"不要传 game_name='account'"
+            )
+        return col_name
 
     @classmethod
     @with_session(write=True)
@@ -594,7 +609,7 @@ class BaseIDModel(SQLModel):
             🔸`int`: 如为1则删除成功，否则删除失败(数据不存在)
         """
         row_data = await cls.select_rows(**data)
-        logger.trace(i18n_t("[GsCore数据库] 即将删除{row_data}", row_data=row_data))
+        logger.trace(i18n_t("log.database.gscore_db_delete_row_data", row_data=row_data))
         if row_data:
             for row in row_data:
                 await session.delete(row)
@@ -634,7 +649,7 @@ class BaseIDModel(SQLModel):
             stmt = stmt.distinct()
         result = await session.execute(stmt)
         data = result.scalars().all()
-        logger.trace(i18n_t("[GsCore数据库] 选择 {data}", data=data))
+        logger.trace(i18n_t("log.database.gscore_data_selected", data=data))
         return data
 
     @classmethod
@@ -1721,7 +1736,7 @@ class User(BaseModel):
         🚀使用范例:
 
             `await GsUser.get_random_cookie(
-            uid, GsCache, {'region': server}, 'sr' if self.is_sr else None
+            uid, GsCache, {'region': server}, game_name='sr'
         )`
 
         ✅返回值:

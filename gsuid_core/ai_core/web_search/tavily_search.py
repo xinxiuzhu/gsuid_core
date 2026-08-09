@@ -73,7 +73,7 @@ async def _do_tavily_search(
         search_depth=search_depth,  # type: ignore
         include_answer=True,
         include_raw_content=False,
-        include_images=False,
+        include_images=True,
     )
 
     results = []
@@ -86,6 +86,28 @@ async def _do_tavily_search(
                 "score": item.get("score", 0.0),
             }
         )
+
+    # 配图 URL 单独附在结果尾（供 research → render 嵌进 HTML）；限量防刷 token
+    _img_n = 0
+    for img_url in response.get("images") or []:
+        if _img_n >= 6:
+            break
+        if not isinstance(img_url, str):
+            continue
+        u = img_url.strip()
+        if not u.startswith(("http://", "https://")):
+            continue
+        results.append(
+            {
+                "title": "(配图)",
+                "url": u,
+                "content": "",
+                "score": 0.0,
+                "image_url": u,
+                "kind": "image",
+            }
+        )
+        _img_n += 1
 
     return results
 
@@ -113,7 +135,7 @@ async def _do_tavily_search_with_context(
         search_depth="advanced",  # type: ignore
         include_answer=True,
         include_raw_content=False,
-        include_images=False,
+        include_images=True,
     )
 
     results = []
@@ -126,6 +148,27 @@ async def _do_tavily_search_with_context(
                 "score": item.get("score", 0.0),
             }
         )
+
+    _img_n = 0
+    for img_url in response.get("images") or []:
+        if _img_n >= 6:
+            break
+        if not isinstance(img_url, str):
+            continue
+        u = img_url.strip()
+        if not u.startswith(("http://", "https://")):
+            continue
+        results.append(
+            {
+                "title": "(配图)",
+                "url": u,
+                "content": "",
+                "score": 0.0,
+                "image_url": u,
+                "kind": "image",
+            }
+        )
+        _img_n += 1
 
     answer = response.get("answer")
 
@@ -156,7 +199,7 @@ async def tavily_search(
     api_key_pool = _get_api_key_pool()
 
     if not api_key_pool:
-        logger.warning(t("🌐 [WebSearch] Tavily API Key 未配置，跳过搜索"))
+        logger.warning(t("log.ai.websearch_tavily_api_key_skip"))
         return []
 
     if max_results is None:
@@ -181,14 +224,14 @@ async def tavily_search(
                 api_key=api_key,
             )
 
-            logger.info(t("🌐 [WebSearch][Tavily] 搜索: {query}, 返回 {p0} 条结果", query=query, p0=len(results)))
+            logger.info(t("log.ai.websearch_tavily_search_query", query=query, p0=len(results)))
             return results
 
         except Exception:
-            logger.warning(t("🌐 [WebSearch][Tavily] api_key ...{p0} 失败，尝试下一个", p0=api_key[-4:]))
+            logger.warning(t("log.ai.websearch_tavily_api_key_trying", p0=api_key[-4:]))
             continue
 
-    logger.error(t("🌐 [WebSearch][Tavily] 所有 api_key 均失败"))
+    logger.error(t("log.ai.websearch_tavily_api_keys"))
     return []
 
 
@@ -212,7 +255,7 @@ async def tavily_search_with_context(
     api_key_pool = _get_api_key_pool()
 
     if not api_key_pool:
-        logger.warning(t("🌐 [WebSearch] Tavily API Key 未配置，跳过搜索"))
+        logger.warning(t("log.ai.websearch_tavily_api_key_skip"))
         return {"results": [], "answer": None}
 
     tried_keys = set()
@@ -233,7 +276,7 @@ async def tavily_search_with_context(
 
             logger.info(
                 t(
-                    "🌐 [WebSearch][Tavily] 带上下文搜索: {query}, 返回 {p0} 条结果",
+                    "log.ai.websearch_tavily_search_context",
                     query=query,
                     p0=len(result["results"]),
                 )
@@ -241,8 +284,8 @@ async def tavily_search_with_context(
             return result
 
         except Exception:
-            logger.warning(t("🌐 [WebSearch][Tavily] api_key ...{p0} 失败，尝试下一个", p0=api_key[-4:]))
+            logger.warning(t("log.ai.websearch_tavily_api_key_trying", p0=api_key[-4:]))
             continue
 
-    logger.error(t("🌐 [WebSearch][Tavily] 所有 api_key 均失败"))
+    logger.error(t("log.ai.websearch_tavily_api_keys"))
     return {"results": [], "answer": None}

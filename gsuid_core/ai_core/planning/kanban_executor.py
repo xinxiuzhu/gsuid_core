@@ -42,6 +42,37 @@ _VALID_USER_TYPES = ("group", "direct", "channel", "sub_channel")
 _CODE_FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 
 
+def _artifact_text_excerpt(arts: List[AIAgentArtifact], *, limit: int = 4000) -> str:
+    """拼接 text/* artifact 正文摘要（优先 inline，再读 path），供主人格转述。"""
+    from gsuid_core.ai_core.planning.tool_output_protocol import load_payload_text
+
+    if limit <= 0 or not arts:
+        return ""
+    chunks: List[str] = []
+    remaining = limit
+    for a in arts:
+        if remaining <= 0:
+            break
+        mime = (a.mime or "text/plain").strip().lower()
+        if mime.startswith("image/"):
+            continue
+        body, err = load_payload_text(
+            payload_inline=a.payload_inline,
+            payload_path=a.payload_path or "",
+        )
+        if err or not body:
+            summary = (a.summary or "").strip()
+            if not summary:
+                continue
+            piece = summary[:remaining]
+        else:
+            piece = body[:remaining]
+        if piece:
+            chunks.append(piece)
+            remaining -= len(piece)
+    return "\n---\n".join(chunks)
+
+
 def _sanitize_for_user(text: str) -> str:
     """剥离面向用户文本里的围栏代码块并限长，用于转译为空 / 转译异常时的兜底返回。
 
@@ -56,6 +87,33 @@ def _sanitize_for_user(text: str) -> str:
     if "```" in sanitized:
         sanitized = sanitized.split("```", 1)[0].rstrip() + " 〔代码已省略〕"
     return sanitized.strip()[:600]
+
+
+_RELAY_META_LINE_RE = re.compile(
+    r"(?im)^.*(?:artifact|res_[0-9a-f]{6,}|img_[0-9a-f]{6,}|send_message_by_ai|"
+    r"create_subagent|主人格|句柄|Kanban|tool_return).*$"
+)
+
+
+def _sanitize_relay_spoken(text: str) -> str:
+    """转译产物清洗：去掉内部句柄/工具名/元流程台词，并过 OOC。"""
+    from gsuid_core.ai_core.output_firewall import check_ooc
+
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    cleaned = _RELAY_META_LINE_RE.sub("", raw)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    if not cleaned:
+        return "唔…搞定了…呼。"
+    hit = check_ooc(cleaned)
+    if hit is not None:
+        # 再剥一轮框架泄漏后仍脏 → 极短角色兜底，绝不把 API 念给用户
+        cleaned2 = _RELAY_META_LINE_RE.sub("", cleaned).strip()
+        if not cleaned2 or check_ooc(cleaned2) is not None:
+            return "唔…搞定了…图里有…呼。"
+        return cleaned2[:400]
+    return cleaned[:600]
 
 
 def _build_event(task: AIAgentTask) -> Event:
@@ -99,17 +157,26 @@ def _format_subtask_prompt(
 
     is_leaf_root = root.id == child.id
     parts: List[str]
+    # 叶子根常塞完整事实包（create_subagent）；过短上限会裁掉后半段字段
+    _LEAF_GOAL_MAX = 100_000
+    _CHILD_GOAL_MAX = 24_000
+    _ROOT_GOAL_MAX = 4_000
     if is_leaf_root:
+        goal = (
+            child.goal
+            if len(child.goal) <= _LEAF_GOAL_MAX
+            else (child.goal[:_LEAF_GOAL_MAX] + "\n…[任务描述过长已截断；请 artifact_get 上游 res_ 取全文]")
+        )
         parts = [
             "【Kanban 单步任务】你是被任务树调度器派来的专职执行体，请独立完成本任务。",
-            f"任务描述：{child.goal[:1500]}",
+            f"任务描述：{goal}",
             f"分配画像：{child.agent_profile or '（未指定）'}",
         ]
     else:
         parts = [
             "【Kanban 子任务】你是被任务树调度器派来的专职执行体，请独立完成本节点。",
-            f"任务树根目标：{root.goal[:500]}",
-            f"本子任务描述：{child.goal[:1000]}",
+            f"任务树根目标：{root.goal[:_ROOT_GOAL_MAX]}",
+            f"本子任务描述：{child.goal[:_CHILD_GOAL_MAX]}",
             f"分配画像：{child.agent_profile or '（未指定）'}",
         ]
     # 断点续作提示：审批挂起→批准→重新调度后，能力代理 history 为空、会从头重做；
@@ -137,13 +204,13 @@ def _format_subtask_prompt(
         "\n- 真实文件落地产物（PNG / PDF / CSV / 二进制等）必须用"
         ' `artifact_put(file_path="workspace 内文件名", summary=...)` 登记；'
         '**不要**用 `artifact_put(payload=\'{"file": "..."}\')` 这种 JSON 元数据冒充文件——'
-        "主人格之后 `send_message_by_ai(image_id=res_xxx)` 时只有真实文件 artifact "
-        "才能被发出去。"
+        "只有真实文件 artifact 才能被上游作为图片/文件发出。"
         '\n- 纯文本结论 / 报告正文：`artifact_put(payload="...", summary="...")`。'
         "\n- 持久化业务数据（签到名单、流水、任务条目等）：用 `record_put` / "
         "`record_append` / `record_update` 写入框架统一的 `record:<集合名>` 集合，"
         "**不要**只塞进 state_set 大 JSON 块或自己写文件——其它子任务读不到。"
-        "\n- 最后简短返回结论（一段话即可），剩下的让主人格自己转译。"
+        "\n- 返回值：一两句**事实结论摘要**（给上游编排用），禁止写「交给主人格/请转译/发图」"
+        "等流程元话语，禁止对用户会话直发。"
         "\n- 若本轮确实没有值得向主人播报的新进展（如决策全为观望/无变化），请在返回"
         f"结论开头单独一行写 {KANBAN_NO_BROADCAST_MARK}——任务照常完成归档，但不推群打扰。"
     )
@@ -169,17 +236,28 @@ async def _build_resume_hint(child: AIAgentTask) -> str:
 
         return await install_resume_hint_for_task(child.id)
     except Exception as e:
-        logger.debug(t("📋 [Kanban] 构造断点续作提示失败: {e}", e=e))
+        logger.debug(t("log.ai.kanban_construct_resume_checkpoint_fail", e=e))
         return ""
 
 
 async def _collect_upstream_artifacts(child: AIAgentTask) -> List[AIAgentArtifact]:
-    """汇总上游子任务的 output_artifact + 全量 workspace_file 列表。"""
-    deps = child.dependency_task_ids if isinstance(child.dependency_task_ids, list) else []
-    if not deps:
-        return []
+    """汇总上游产出：显式 ``input_artifact_ids`` + 依赖子任务登记的 artifact。
+
+    叶子根（``create_subagent``）常在 goal 里带上游 ``res_``；建树时会写入
+    ``input_artifact_ids``，此处一并注入提示，避免仅靠 agent 自觉 ``artifact_get``。
+    """
     bag: List[AIAgentArtifact] = []
     seen: set = set()
+
+    for rid in child.input_artifact_ids if isinstance(child.input_artifact_ids, list) else []:
+        if not rid or rid in seen:
+            continue
+        art = await AIAgentArtifact.get_by_id(str(rid))
+        if art is not None:
+            bag.append(art)
+            seen.add(art.id)
+
+    deps = child.dependency_task_ids if isinstance(child.dependency_task_ids, list) else []
     for dep_id in deps:
         rows = await AIAgentArtifact.list_for_task(dep_id)
         for r in rows:
@@ -253,18 +331,20 @@ async def _persona_relay(
                 lines.append(
                     f"- {a.id} | kind={a.artifact_kind} | mime={a.mime}{payload_hint} | {a.summary[:80]}{star}"
                 )
-            hint: str = ""
+            hint = ""
             if recommended is not None:
                 hint = (
-                    f"\n⭐ 推荐发送：`{recommended.id}`（{recommended.mime}，"
-                    f"主人最可能想要的真实产物文件）。"
-                    "**只发推荐句柄、不要把 inline 文本 artifact 当图片发**——"
-                    "inline 文本 artifact 没有 payload_path，发送会失败。"
+                    f"\n【待发媒体】优先把 `{recommended.id}`（{recommended.mime}）"
+                    "作为图片/文件发出；不要发纯文本预览档。"
                 )
+            # 句柄只给工具参数用；对用户可见台词禁止提 id / 工具名
             artifact_block = (
-                "\n\n【本子任务登记的 artifact 句柄（如有图片 / 文件，"
-                '请直接用 send_message_by_ai(image_id="res_xxx") 把产物发给主人——'
-                "框架会自动从 Kanban artifact 读 payload 并转 RM 发送）】\n" + "\n".join(lines) + hint
+                "\n\n【内部·勿写入对用户台词】可用媒体/文件列表：\n"
+                + "\n".join(lines)
+                + hint
+                + "\n有图片时：用发送工具把图发出，台词只写一两句角色短句（结论/情绪）。"
+                "\n**严禁**在台词里出现：工具名、res_/img_ 句柄、artifact、主人格、"
+                "「交给谁发」、流程说明。"
             )
 
         base: str = await build_persona_prompt(task.persona_name)
@@ -291,16 +371,17 @@ async def _persona_relay(
         ev = _build_event(task)
         if is_approval_request:
             instruction = (
-                f"【Kanban 审批请求转译】你的专职助手开发好了「{task.display_name}」，但装进框架需要主人点头。"
-                "请用你自己的口吻简短转告主人这件事，并**明确请主人回复同意或拒绝**——不要复述代码/细节，也不要替主人做决定。"
+                f"【播报转译·审批】助手完成了「{task.display_name}」，需要主人点头才能继续。"
+                "用你自己的角色口吻简短转告，并请主人同意或拒绝。"
+                "不要复述代码/细节，不要提工具名或内部流程，不要替主人做决定。"
             )
         else:
             instruction = (
-                f"【Kanban 子任务播报转译】你的专职助手刚完成了「{task.display_name}」，执行结果如下。"
-                "请用你自己的口吻、简短地把这条进展转告主人——只点关键结论与下一步动作，"
-                "**不要复述细节、不要把自己当作做出该决定的人**。"
-                "**严禁原样输出任何代码块、文件内容或大段原始数据**（会造成群聊刷屏）；"
-                "如助手产出了代码 / 文件，只需一句话说明做了什么、放在哪，不要把代码贴出来。"
+                f"【播报转译】助手完成了「{task.display_name}」。"
+                "用你自己的角色口吻、一两句把结论告诉用户；"
+                "有图就调用发送工具把图发出去，台词只留角色短句。"
+                "**禁止**：复述大段数据；说「主人格/代理/句柄/artifact/工具名」；"
+                "把内部流程说明念给用户听；原样贴代码或原始报告。"
             )
         spoken: str = await agent.run(
             user_message=f"{instruction}\n---\n{raw_result[:1500]}" + artifact_block,
@@ -309,10 +390,12 @@ async def _persona_relay(
             tools=relay_tools,
             return_mode="return",
         )
-        # 人格转译正常产出直接用；仅"转译为空"的兜底退路对 raw_result 做去代码处理，
-        return spoken.strip() or _sanitize_for_user(raw_result), relay_log_files
+        clean = _sanitize_relay_spoken(spoken)
+        if clean:
+            return clean, relay_log_files
+        return _sanitize_relay_spoken(_sanitize_for_user(raw_result)), relay_log_files
     except Exception as e:
-        logger.debug(t("📋 [Kanban] 人格转译失败，去代码兜底播报: {e}", e=e))
+        logger.debug(t("log.ai.kanban_persona_rendition_code_fail", e=e))
         return _sanitize_for_user(raw_result), relay_log_files
     finally:
         # 无论成功 / 异常，关闭转译 SubAgent logger；relay_log_files 在 return 表达式求值后才被 append（list 是引用
@@ -346,7 +429,7 @@ async def _notify(
         suppress_when_heartbeat_recent=False,
     )
     if not sent:
-        logger.warning(t("📋 [Kanban] 任务 root=#{p0} 主动消息发送失败 / 被抑制", p0=task.ordinal))
+        logger.warning(t("log.ai.kanban_fail_send_msg_task_failed", p0=task.ordinal))
 
 
 # 子任务播报静默信号 能力代理在最终输出里以本标记单独成段/作行首前缀，声明"本轮没有值得播报的
@@ -374,27 +457,230 @@ def _strip_no_broadcast(raw: str) -> Tuple[str, bool]:
     return stripped.strip(), True
 
 
-# 交互式 create_subagent 的"执行体静默"登记（leaf-root root_task_id）：主人格亲自转述、执行体不推群， 避免双份播报。
-# 进程内 set 即可；消费/超时兜底的无竞态语义见 references/08 §能力代理。
+# 交互式 create_subagent：主人格转述、执行体不推群（进程内 set，见 §能力代理）。
 _INTERACTIVE_RELAY_ROOTS: set[str] = set()
+# 同步等待已超时：完成后唤醒主人格交付，禁止 _persona_relay 替发（2026-08-04）。
+_DEFERRED_MAIN_DELIVERY_ROOTS: set[str] = set()
 
 
 def mark_interactive_relay_root(root_id: str) -> None:
-    """登记一个"由主人格转述、执行体静默"的交互式 create_subagent 叶子根。"""
+    """登记「主人格转述、执行体静默」的交互式叶子根。"""
     _INTERACTIVE_RELAY_ROOTS.add(root_id)
 
 
 def discard_interactive_relay_root(root_id: str) -> None:
-    """撤销登记（如主人格侧等待超时、决定不再转述 → 执行体恢复自动推群兜底）。"""
+    """撤销 interactive + deferred 登记。"""
     _INTERACTIVE_RELAY_ROOTS.discard(root_id)
+    _DEFERRED_MAIN_DELIVERY_ROOTS.discard(root_id)
+
+
+def mark_deferred_main_delivery(root_id: str) -> None:
+    """超时后保持静默，完成后改走 ``_wake_main_agent_for_delivery``。"""
+    _INTERACTIVE_RELAY_ROOTS.add(root_id)
+    _DEFERRED_MAIN_DELIVERY_ROOTS.add(root_id)
+
+
+def try_claim_deferred_for_inline_return(root_id: str) -> bool:
+    """超时边界：deferred 仍在则 claim 并 True（本轮 tool_return，避免与 wake 双份）。"""
+    if root_id in _DEFERRED_MAIN_DELIVERY_ROOTS:
+        _DEFERRED_MAIN_DELIVERY_ROOTS.discard(root_id)
+        return True
+    return False
 
 
 def _consume_interactive_relay(root_id: str) -> bool:
-    """读即弃：若该 root 登记为"主人格转述"，返回 True 并移除登记（本次消费掉）。"""
+    """读即弃：是否 interactive 静默。"""
     if root_id in _INTERACTIVE_RELAY_ROOTS:
         _INTERACTIVE_RELAY_ROOTS.discard(root_id)
         return True
     return False
+
+
+def _consume_deferred_main_delivery(root_id: str) -> bool:
+    """读即弃：是否需唤醒主人格。"""
+    if root_id in _DEFERRED_MAIN_DELIVERY_ROOTS:
+        _DEFERRED_MAIN_DELIVERY_ROOTS.discard(root_id)
+        return True
+    return False
+
+
+def _format_delivery_for_main_agent(task: AIAgentTask, raw_result: str, arts: List[AIAgentArtifact]) -> str:
+    """拼给主人格的交付包：与 PersistedHandleCard 同形，禁止全文塞 prompt。"""
+    _ = raw_result
+    from gsuid_core.ai_core.planning.tool_output_protocol import PersistedHandleCard
+
+    cards: List[str] = []
+    primary = ""
+    primary_is_image = False
+    for a in arts[:8]:
+        mime = a.mime or "text/plain"
+        is_img = bool(mime.startswith("image/"))
+        size = len((a.payload_inline or "").encode("utf-8")) if a.payload_inline else 0
+        card = PersistedHandleCard(
+            id=a.id,
+            kind="image" if is_img else "artifact",
+            mime=mime,
+            summary=(a.summary or "")[:200],
+            size_bytes=size,
+            read_tool="read_handle",
+            long_structured=not is_img,
+        )
+        cards.append(card.format())
+        if is_img and not primary:
+            primary = a.id
+            primary_is_image = True
+    if not primary and arts:
+        primary = arts[0].id
+        primary_is_image = bool((arts[0].mime or "").startswith("image/"))
+
+    parts = [
+        f"【子任务交付·需你亲自完成收尾】任务#{task.ordinal}「{task.display_name}」已完成。",
+        "你是主人格：角色短句给结论；有图则 send_message_by_ai(image_id=)；",
+        '长文尚未出图 → create_subagent(agent_profile="render_agent", task=句柄+版式)；',
+        "禁止把句柄写进对用户台词；续读用 read_handle(handle_id, offset, limit)。",
+    ]
+    if cards:
+        parts.append("产物句柄卡：")
+        parts.extend(cards)
+        if primary and primary_is_image:
+            parts.append(f"💡 主图：`{primary}` → send_message_by_ai(image_id=)。")
+    elif task.failure_reason:
+        parts.append(f"失败原因: {task.failure_reason[:500]}")
+    return "\n".join(parts)
+
+
+# 同 session+root 回灌合并：短窗内只保留最新一次，避免连刷
+_delivery_pending: dict[str, tuple[AIAgentTask, str]] = {}
+_delivery_flush_tasks: dict[str, asyncio.Task] = {}
+_DELIVERY_COALESCE_SEC = 0.45
+
+
+async def _wake_main_agent_for_delivery(task: AIAgentTask, raw_result: str) -> None:
+    """能力代理完成后回灌主 session；同 root 短窗合并为一次。"""
+    key = f"{(task.session_id or '').strip()}|{(task.root_task_id or task.id)}"
+    _delivery_pending[key] = (task, raw_result)
+    existing = _delivery_flush_tasks.get(key)
+    if existing is not None and not existing.done():
+        return
+
+    async def _flush() -> None:
+        try:
+            await asyncio.sleep(_DELIVERY_COALESCE_SEC)
+            item = _delivery_pending.pop(key, None)
+            _delivery_flush_tasks.pop(key, None)
+            if item is not None:
+                await _wake_main_agent_for_delivery_now(item[0], item[1])
+        except Exception as e:
+            logger.debug(t("log.ai.delivery_coalesce_flush_skip", e=e))
+            _delivery_flush_tasks.pop(key, None)
+
+    _delivery_flush_tasks[key] = asyncio.create_task(_flush())
+
+
+async def _wake_main_agent_for_delivery_now(task: AIAgentTask, raw_result: str) -> None:
+    """实际唤醒主人格（合并后单次）。"""
+    arts = await AIAgentArtifact.list_for_task(task.id)
+    delivery = _format_delivery_for_main_agent(task, raw_result, arts)
+    ev = _build_event(task)
+    bot = _get_bot(task, ev)
+
+    from gsuid_core.ai_core.session_registry import get_ai_session_registry
+
+    session_id = (task.session_id or "").strip()
+    session = get_ai_session_registry().get_ai_session(session_id) if session_id else None
+    if session is None and session_id and bot is not None:
+        from gsuid_core.ai_core.ai_router import get_ai_session
+
+        session = await get_ai_session(ev)
+
+    if session is None or bot is None:
+        logger.warning(
+            t(
+                "log.ai.kanban_deferred_wake_fallback_relay",
+                task=task.id[:8],
+                reason=f"session={session is not None},bot={bot is not None}",
+            )
+        )
+        if bot is not None:
+            short = _sanitize_relay_spoken(_sanitize_for_user(raw_result or ""))
+            if short:
+                await _notify(
+                    task,
+                    short,
+                    trigger_reason=f"delivery_no_session:{task.display_name}",
+                )
+        return
+
+    owner = (task.owner_user_id or "").strip()
+    at_hint = f"收尾时 @发起人 `@{owner}`。" if owner else ""
+    frame_text = (
+        "[框架·任务完成]\n"
+        f"{delivery}\n\n"
+        "（框架注入：子任务已完成，请你以主人格身份收尾——"
+        "角色短句 + 有图则用发送工具把图发出；"
+        f"{at_hint}"
+        "禁止把内部句柄/工具名念给用户；不要重做同一子任务。）"
+    )
+    await session.run(
+        user_message=frame_text,
+        bot=bot,
+        ev=ev,
+        return_mode="by_bot",
+        has_active_task=True,
+        is_framework_injection=True,
+    )
+    logger.info(t("log.ai.kanban_deferred_main_delivery_done", task=task.id[:8]))
+
+
+async def _finish_capability_delivery(
+    *,
+    root: AIAgentTask,
+    child: AIAgentTask,
+    raw_result: str,
+    bot: Optional[Bot],
+    no_broadcast: bool = False,
+    is_failure: bool = False,
+    is_approval: bool = False,
+) -> None:
+    """能力代理终态统一出口：交互/有主 session → 回灌主人格；否则极简推群。
+
+    **交互路径绝不 ``_persona_relay``**——完成后只 ``_wake_main_agent_for_delivery``。
+    """
+    interactive = _consume_interactive_relay(root.id)
+    deferred = _consume_deferred_main_delivery(root.id)
+
+    if no_broadcast and not deferred:
+        # 交互同步等待中：主人格会自己收 tool_return；非交互无播报则静默
+        return
+
+    # 交互：仅 deferred 时唤醒（同步已完成则主人格已在 create_subagent 内拿到结果）
+    if interactive:
+        if deferred and bot is not None:
+            await _wake_main_agent_for_delivery(child, raw_result)
+        elif deferred and bot is None:
+            logger.warning(t("log.ai.kanban_fail_send_msg_task_failed", p0=child.ordinal))
+        return
+
+    # 非交互但绑定了主 session：同样回灌主人格（像真人触发），不用 Relay
+    sid = (child.session_id or root.session_id or "").strip()
+    if sid and bot is not None and not no_broadcast:
+        await _wake_main_agent_for_delivery(child, raw_result)
+        return
+
+    # 无主 session 的纯后台：失败/审批/结论走 notify，不跑 Kanban_Relay LLM
+    if is_failure:
+        await _notify_failure(root, child, raw_result)
+        return
+    if is_approval or (raw_result and not no_broadcast):
+        short = _sanitize_relay_spoken(_sanitize_for_user(raw_result))
+        if short:
+            await _notify(
+                child,
+                short,
+                trigger_reason=(
+                    f"approval_request:{child.display_name}" if is_approval else f"subtask={child.display_name}"
+                ),
+            )
 
 
 async def _run_one_task_node(root: AIAgentTask, child: AIAgentTask) -> None:
@@ -446,11 +732,15 @@ async def _run_one_task_node(root: AIAgentTask, child: AIAgentTask) -> None:
                 session_id_suffix=f"kanban_{root.id[:6]}_{fresh.id[:6]}",
             )
         except Exception as e:
-            logger.exception(t("📋 [Kanban] 子任务执行抛出异常: {e}", e=e))
+            logger.exception(t("log.ai.kanban_subtask_raised_fail", e=e))
             await kanban.mark_subtask_failed(fresh, f"{type(e).__name__}: {e}")
-            # 交互式派发：失败也由主人格据回执转述，执行体不重复推群（消费须在 mark 之后，
-            if not _consume_interactive_relay(root.id):
-                await _notify_failure(root, fresh, str(e))
+            await _finish_capability_delivery(
+                root=root,
+                child=fresh,
+                raw_result=f"{type(e).__name__}: {e}",
+                bot=bot,
+                is_failure=True,
+            )
             return
         finally:
             reset_plan_context(token)
@@ -466,7 +756,7 @@ async def _run_one_task_node(root: AIAgentTask, child: AIAgentTask) -> None:
         output_id = latest.output_artifact_id if latest and latest.output_artifact_id else ""
         if not output_id and raw_result:
             art = await put_artifact(
-                payload=raw_result[:12000],
+                payload=raw_result[:120000],
                 summary=f"子任务自动留档：{fresh.display_name}"[:512],
                 mime="text/plain",
                 artifact_kind="output",
@@ -474,54 +764,62 @@ async def _run_one_task_node(root: AIAgentTask, child: AIAgentTask) -> None:
             )
             if art is not None:
                 output_id = art.id
+        # 子代理终态落盘（FileOS）；I/O 失败不阻断终态
+        from gsuid_core.ai_core.planning.tool_output_helper import persist_subagent_result
+
+        try:
+            await persist_subagent_result(
+                profile=fresh.agent_profile or "",
+                content=raw_result,
+                task=fresh,
+                res_handle=output_id or "",
+            )
+        except Exception as _pe:
+            logger.debug(t("log.ai.persist_subagent_result_skip", e=_pe))
 
         # 5) 落终态
         from gsuid_core.ai_core.capability_agents.runner import (
             CAPABILITY_AGENT_ERROR_PREFIX,
         )
 
-        # 交互式派发：主人格亲自转述、执行体静默。不丢不重的关键是**落终态后**消费（无 await 紧跟
-        # mark）——看到终态就转述→消费 True 静默；超时先 discard→消费 False 兜底推群。
-
-        # 5a) 安装审批：copy_to_plugin_dir 已把任务挂为 waiting_approval，转译审批请求且不落终态
+        # 交互 / 有主 session → 回灌主人格；绝不 Kanban_Relay
         if latest is not None and latest.status == "waiting_approval":
-            silent = _consume_interactive_relay(root.id) or no_broadcast
-            if bot and not silent:
-                spoken, relay_log_files = await _persona_relay(
-                    fresh, latest.failure_reason or raw_result, is_approval_request=True
-                )
-                if spoken:
-                    await _notify(
-                        fresh,
-                        spoken,
-                        trigger_reason=f"approval_request:{fresh.display_name}",
-                        generator_log_files=relay_log_files,
-                    )
+            body = latest.failure_reason or raw_result
+            await _finish_capability_delivery(
+                root=root,
+                child=fresh,
+                raw_result=body,
+                bot=bot,
+                no_broadcast=no_broadcast,
+                is_approval=True,
+            )
         elif (raw_result or "").startswith(CAPABILITY_AGENT_ERROR_PREFIX):
             await kanban.mark_subtask_failed(fresh, raw_result[:1000])
-            silent = _consume_interactive_relay(root.id) or no_broadcast
-            if not silent:
-                await _notify_failure(root, fresh, raw_result[:1000])
+            await _finish_capability_delivery(
+                root=root,
+                child=fresh,
+                raw_result=raw_result[:1000],
+                bot=bot,
+                no_broadcast=no_broadcast,
+                is_failure=True,
+            )
         else:
             await kanban.mark_subtask_completed(fresh, output_artifact_id=output_id)
-            silent = _consume_interactive_relay(root.id) or no_broadcast
-            if bot and raw_result and not silent:
-                spoken, relay_log_files = await _persona_relay(fresh, raw_result)
-                if spoken:
-                    await _notify(
-                        fresh,
-                        spoken,
-                        trigger_reason=f"subtask={fresh.display_name}",
-                        generator_log_files=relay_log_files,
-                    )
-            elif bot and no_broadcast:
+            if no_broadcast:
                 logger.debug(
                     t(
-                        "📋 [Kanban] 子任务 {p0} 声明静默（{KANBAN_NO_BROADCAST_MARK}），跳过推群",
+                        "log.ai.kanban_subtask_declared_silence",
                         p0=fresh.display_name,
                         KANBAN_NO_BROADCAST_MARK=KANBAN_NO_BROADCAST_MARK,
                     )
                 )
+            await _finish_capability_delivery(
+                root=root,
+                child=fresh,
+                raw_result=raw_result or "",
+                bot=bot,
+                no_broadcast=no_broadcast,
+            )
 
 
 async def _notify_failure(root: AIAgentTask, child: AIAgentTask, reason: str) -> None:
@@ -573,7 +871,7 @@ async def execute_ready_tasks(root_task_id: str) -> None:
     if root.recurring_trigger and root.recurring_status == "armed":
         logger.debug(
             t(
-                "📋 [Kanban] 跳过模板根的直接调度 root={root_task_id}（应由 _fire_template 克隆实例后再调度）",
+                "log.ai.kanban_skipping_direct_scheduling_skip",
                 root_task_id=root_task_id,
             )
         )
@@ -584,7 +882,7 @@ async def execute_ready_tasks(root_task_id: str) -> None:
         if root.status == "pending":
             logger.info(
                 t(
-                    "📋 [Kanban] 调度叶子根 root={root_task_id} profile={p0}",
+                    "log.ai.kanban_scheduling_leaf_root_task",
                     root_task_id=root_task_id,
                     p0=root.agent_profile,
                 )
@@ -601,9 +899,7 @@ async def execute_ready_tasks(root_task_id: str) -> None:
         await kanban.refresh_root_status(root_task_id)
         return
 
-    logger.info(
-        t("📋 [Kanban] 调度回合 root={root_task_id} 可跑子任务 {p0} 个", root_task_id=root_task_id, p0=len(ready))
-    )
+    logger.info(t("log.ai.kanban_scheduling_root_task_id", root_task_id=root_task_id, p0=len(ready)))
     runners = [_run_one_task_node(root, c) for c in ready]
     await asyncio.gather(*runners, return_exceptions=True)
     await kanban.refresh_root_status(root_task_id)
@@ -631,13 +927,9 @@ async def _maybe_arm_recurring_subtasks(
         try:
             ok, msg = await kanban.arm_recurring_subtask(tpl, tpl.recurring_trigger or "")
             if not ok:
-                logger.warning(
-                    t("📋 [Kanban] 周期子任务 arm 失败 subtask={p0} root={p1}: {msg}", p0=tpl.id, p1=root.id, msg=msg)
-                )
+                logger.warning(t("log.ai.kanban_arm_recurring_subtask_fail", p0=tpl.id, p1=root.id, msg=msg))
         except Exception as e:
-            logger.exception(
-                t("📋 [Kanban] 周期子任务 arm 抛出异常 subtask={p0} root={p1}: {e}", p0=tpl.id, p1=root.id, e=e)
-            )
+            logger.exception(t("log.ai.kanban_arming_recurring_subtask_fail", p0=tpl.id, p1=root.id, e=e))
 
 
 async def _schedule_continuation(root_task_id: str, depth: int) -> None:
@@ -662,5 +954,5 @@ async def kick_root(root_task_id: str) -> None:
     try:
         await execute_ready_tasks(root_task_id)
     except Exception as e:
-        logger.exception(t("📋 [Kanban] kick_root 异常: {e}", e=e))
+        logger.exception(t("log.ai.kanban_kick_root_fail", e=e))
         await AIAgentTaskLog.add_log(root_task_id, "decision", f"调度异常：{type(e).__name__}: {e}")

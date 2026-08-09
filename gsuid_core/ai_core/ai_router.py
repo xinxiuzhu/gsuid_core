@@ -64,15 +64,14 @@ async def _ensure_master_favorability(bot_id: str) -> None:
                 await UserFavorability.set_favorability(master_id, bot_id, MASTER_FAVORABILITY_TARGET)
                 logger.info(
                     t(
-                        "🧠 [AI Router] 主人 {master_id} 好感度 {current} 低于下限，"
-                        "已拉升至 {MASTER_FAVORABILITY_TARGET}",
+                        "log.ai.ai_router_master_id_favorability",
                         master_id=master_id,
                         current=current,
                         MASTER_FAVORABILITY_TARGET=MASTER_FAVORABILITY_TARGET,
                     )
                 )
         except Exception as e:
-            logger.debug(t("🧠 [AI Router] 主人好感度初始化失败 ({master_id}): {e}", master_id=master_id, e=e))
+            logger.debug(t("log.ai.ai_router_initialize_master_favorability_fail", master_id=master_id, e=e))
 
 
 def _get_persona_mtime(persona_name: str) -> float:
@@ -88,23 +87,24 @@ def _get_persona_mtime(persona_name: str) -> float:
     return newest_mtime
 
 
-# 稳定前缀刷新周期（秒）：活跃会话永不空闲回收（IDLE_THRESHOLD 只清不活跃的），
-# 群画像/self_model 会随对话持续演化——按 TTL 原地重建 system_prompt，无须销毁会话。
-_STABLE_PROMPT_TTL = 1800.0
+# system_prompt 会话期内永不 TTL 刷新：最大化 provider 前缀缓存命中率。
+# 群画像/self_model 等慢变上下文在会话销毁重建时自然刷新；persona 文件变更仍走热重载。
+_STABLE_PROMPT_TTL = float("inf")
 
 
 async def _maybe_refresh_stable_prompt(session: GsCoreAIAgent, event: Event, persona_name: str) -> None:
-    """活跃会话的稳定前缀 TTL 刷新：只换 ``session.system_prompt`` 字符串，历史/状态不动。
+    """会话期内保持 system_prompt 字节稳定（cache-first）。
 
-    每次 run 都会用最新 system_prompt 重建 pydantic-ai Agent，故原地换串即可生效；
-    代价是每 TTL 一次 provider 前缀缓存失效，与 provider 缓存 TTL 同量级、可接受。
+    仅当显式配置了有限 TTL 且到期时才刷新；默认 inf = 永不中途改串。
     """
+    if _STABLE_PROMPT_TTL == float("inf"):
+        return
     if time.time() - session.system_prompt_built_at < _STABLE_PROMPT_TTL:
         return
     session.system_prompt_built_at = time.time()
 
     session.system_prompt = await build_session_system_prompt(event, persona_name)
-    logger.debug(t("🧠 [AI Router] 稳定前缀 TTL 刷新完成: {p0}", p0=session.session_id))
+    logger.debug(t("log.ai.ai_router_stable_prefix_ttl_ok", p0=session.session_id))
 
 
 def _check_persona_changed(session: GsCoreAIAgent, persona_name: str) -> bool:
@@ -118,9 +118,7 @@ def _check_persona_changed(session: GsCoreAIAgent, persona_name: str) -> bool:
     if current_mtime > cached_mtime:
         # Persona 文件已修改，更新缓存
         _persona_mtime_cache[persona_name] = current_mtime
-        logger.info(
-            t("🧠 [AI Router] 检测到 Persona '{persona_name}' 已修改，标记需要热重载", persona_name=persona_name)
-        )
+        logger.info(t("log.ai.ai_router_persona_name_modified_load", persona_name=persona_name))
         return True
 
     return False
@@ -193,7 +191,7 @@ async def _get_or_create_ai_session(
         if persona_name and _check_persona_changed(session, persona_name):
             logger.info(
                 t(
-                    "🧠 [AI Router] 热重载 Session {session_id} 的 Persona '{persona_name}'",
+                    "log.ai.ai_router_hot_reloading_persona_load",
                     session_id=session_id,
                     persona_name=persona_name,
                 )
@@ -213,7 +211,7 @@ async def _get_or_create_ai_session(
     # 创建新 Session
     persona_name = persona_config_manager.get_persona_for_session(session_id)
     if persona_name is None:
-        raise ValueError(t("没有为 session {session_id} 配置 persona", session_id=session_id))
+        raise ValueError(t("log.ai.session_id_persona", session_id=session_id))
 
     # O-3：persona + 群简介 + 慢变稳定前缀（self_model/群画像）→ system_prompt，
     # 装配统一走 context_assembly（评测端点同源）；活跃会话由 _maybe_refresh_stable_prompt 按 TTL 刷新。
@@ -234,7 +232,7 @@ async def _get_or_create_ai_session(
 
     logger.debug(
         t(
-            "🧠 [AI Router] 创建新Session: {session_id}, 使用Persona: {persona_name}",
+            "log.ai.ai_router_created_session_id_create",
             session_id=session_id,
             persona_name=persona_name,
         )

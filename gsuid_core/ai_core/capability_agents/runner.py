@@ -45,6 +45,17 @@ from gsuid_core.ai_core.agent_node import (
 # "代理跑挂了"。任何修改都应同时检查所有引用点。
 CAPABILITY_AGENT_ERROR_PREFIX = "⚠️ 能力代理执行失败"
 
+# 非 render 能力代理：task 向量回填/族展开也不得再拿到出图与嵌套委派入口。
+# 出图主权：主人格 → create_subagent(render_agent)；业务节点只交事实包。
+_NON_RENDER_CAP_DENY_TOOLS = frozenset(
+    {
+        "create_subagent",
+        "render_html_to_image",
+        "render_card",
+        "render_markdown_to_image",
+    }
+)
+
 
 def _resolve_tools(node: AgentNode) -> ToolList:
     """按节点装配工具集：能力族（静态 packs）+ 显式白名单，按名从全局注册表取。"""
@@ -54,6 +65,23 @@ def _resolve_tools(node: AgentNode) -> ToolList:
     names: List[str] = list(dict.fromkeys(resolve_pack_tool_names(node.tool_packs) + node.tool_names))
     tools: ToolList = [all_tools[n].tool for n in names if n in all_tools]
     return tools
+
+
+def _strip_non_render_cap_deny(tools: ToolList, *, node_id: str) -> ToolList:
+    """render_agent 保留渲染白名单；其它能力代理剥离嵌套委派与 render_*。"""
+    if node_id == "render_agent":
+        return tools
+    kept = [t for t in tools if t.name not in _NON_RENDER_CAP_DENY_TOOLS]
+    if len(kept) != len(tools):
+        stripped = sorted({t.name for t in tools} - {t.name for t in kept})
+        logger.info(
+            i18n_t(
+                "log.ai.cap_stripped_non_render_deny",
+                node_id=node_id,
+                names=stripped,
+            )
+        )
+    return kept
 
 
 @asynccontextmanager
@@ -90,7 +118,7 @@ async def _ensure_adhoc_workspace(node_id: str, ev: Optional[Event]):
         # ensure_workspace 不再按 agent_profile 分子目录，传 node_id 仅作历史兼容
         workspace = ensure_workspace(adhoc_root_id, adhoc_task_id, agent_profile=node_id)
     except OSError as e:
-        logger.error(i18n_t("🤖 [CapabilityAgent] 创建 ad-hoc workspace 失败: {e}；放弃绑定（落 FILE_PATH 兜底）", e=e))
+        logger.error(i18n_t("log.ai.cap_create_ad_hoc_workspace", e=e))
         yield None
         return
 
@@ -105,7 +133,7 @@ async def _ensure_adhoc_workspace(node_id: str, ev: Optional[Event]):
     token = bind_plan_context(ctx)
     logger.info(
         i18n_t(
-            "🤖 [CapabilityAgent] 建立 ad-hoc workspace: {workspace} (adhoc_root={adhoc_root_id}, node={node_id})",
+            "log.ai.cap_ad_hoc_workspace_established",
             workspace=workspace,
             adhoc_root_id=adhoc_root_id,
             node_id=node_id,
@@ -142,48 +170,49 @@ async def run_capability_agent(
         return f"⚠️ 能力代理节点不存在: {profile_id}"
 
     tools = _resolve_tools(node)
-    # 始终按 task（+ 可选 tool_query）补一轮向量检索，再经能力族展开。
-    # 旧逻辑：仅当 tool_names 为空或声明了 tool_query 才检索——导致像 internal_reporter
-    # 这种"有静态白名单"的画像被锁死在 state/record，无法获取数据
-    # 新语义：packs + tool_names 是保底；task 相关专业工具作为增补，不因白名单关闭检索。
-    try:
-        from gsuid_core.ai_core.rag.tools import search_tools, expand_tools_to_families
+    # render_agent：只吃白名单渲染工具，禁止 task 向量回填把 web_search 捞进来。
+    # 其余节点：packs + tool_names 为保底，再按 task 检索增补专业工具。
+    if node.node_id != "render_agent":
+        try:
+            from gsuid_core.ai_core.rag.tools import search_tools, expand_tools_to_families
 
-        tq = (node.tool_query or "").strip()
-        task_text = (task or "").strip()
-        if tq and task_text:
-            search_query = f"{tq}\n{task_text}"
-        else:
-            search_query = tq or task_text
+            tq = (node.tool_query or "").strip()
+            task_text = (task or "").strip()
+            if tq and task_text:
+                search_query = f"{tq}\n{task_text}"
+            else:
+                search_query = tq or task_text
 
-        if search_query:
-            recall = int(ai_config.get_config("tool_search_recall").data or 8)
-            max_extra = int(ai_config.get_config("tool_extra_pool_max").data or 8)
-            seeds = await search_tools(
-                query=search_query,
-                limit=max(recall, 8),
-                non_category="self",
-            )
-            # 能力代理禁止再委派，避免递归爆炸
-            seeds = [t for t in seeds if t.name != "create_subagent"]
-            seen = {t.name for t in tools}
-            extra = expand_tools_to_families(
-                seeds,
-                exclude_names=seen,
-                max_tools=max_extra,
-            )
-            if extra:
-                tools = tools + extra
-                logger.info(
-                    i18n_t(
-                        "🤖 [CapabilityAgent] task 工具补检索: +{n} 个 (query={q!r} → {names})",
-                        n=len(extra),
-                        q=search_query[:60],
-                        names=[t.name for t in extra][:12],
-                    )
+            if search_query:
+                recall = int(ai_config.get_config("tool_search_recall").data or 8)
+                max_extra = int(ai_config.get_config("tool_extra_pool_max").data or 8)
+                seeds = await search_tools(
+                    query=search_query,
+                    limit=max(recall, 8),
+                    non_category="self",
                 )
-    except Exception as e:
-        logger.debug(i18n_t("🤖 [CapabilityAgent] 工具检索失败: {e}", e=e))
+                # 种子与族展开后都会再 strip：避免整族带回 create_subagent/render_*
+                seeds = [t for t in seeds if t.name not in _NON_RENDER_CAP_DENY_TOOLS]
+                seen = {t.name for t in tools}
+                extra = expand_tools_to_families(
+                    seeds,
+                    exclude_names=seen | set(_NON_RENDER_CAP_DENY_TOOLS),
+                    max_tools=max_extra,
+                )
+                if extra:
+                    tools = tools + extra
+                    logger.info(
+                        i18n_t(
+                            "log.ai.cap_task_backfill_query_names",
+                            n=len(extra),
+                            q=search_query[:60],
+                            names=[t.name for t in extra][:12],
+                        )
+                    )
+        except Exception as e:
+            logger.debug(i18n_t("log.ai.cap_retrieval", e=e))
+
+    tools = _strip_non_render_cap_deny(tools, node_id=node.node_id)
 
     session_id = f"capagent_{node.node_id}_{session_id_suffix or 'adhoc'}"
 
@@ -199,10 +228,12 @@ async def run_capability_agent(
             session_id=session_id,
             is_subagent=True,
             dynamic_tools=True if has_dynamic_pack(node.tool_packs) else None,
+            wall_clock_budget=420.0,  # 留 80s 余量给外层 500s 硬超时，420s 时注入收敛提示
+            capability_node_id=node.node_id,
         )
         logger.info(
             i18n_t(
-                "🤖 [CapabilityAgent] 启动「{p0}」({p1})，工具 {p2} 个，workspace={ws_label}，任务: {p3}...",
+                "log.ai.cap_tools_workspace_ws_label",
                 p0=node.display_name,
                 p1=node.node_id,
                 p2=len(tools),
@@ -220,7 +251,7 @@ async def run_capability_agent(
             )
             return str(result)
         except Exception as e:
-            logger.error(i18n_t("🤖 [CapabilityAgent] 「{p0}」执行失败: {e}", p0=node.node_id, e=e))
+            logger.error(i18n_t("log.ai.cap_agent_fail_execution_failed", p0=node.node_id, e=e))
             return f"{CAPABILITY_AGENT_ERROR_PREFIX}: {e}"
         finally:
             session_logger = agent._session_logger

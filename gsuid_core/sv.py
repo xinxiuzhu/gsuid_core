@@ -30,6 +30,10 @@ SL = SVList()
 config_sv = core_config.get_config("sv")
 config_plugins = plugin_config_store.get_all()
 
+# _check_file/_check_meta/_check_message 匹配时不读 prefix，
+# 前缀展开只会产生 N 份等价副本，导致一次事件执行 N 次
+_PREFIXLESS_TYPES = frozenset({"file", "meta", "message"})
+
 
 def modify_func(func):
     @wraps(func)
@@ -38,7 +42,7 @@ def modify_func(func):
             result = await func(bot, event)
             return result
         except Exception as e:
-            logger.error(t("[SV] {p0} 执行时出现错误!", p0=event.command))
+            logger.error(t("log.sv.error_occurred_executing", p0=event.command))
             logger.exception(e)
         finally:
             instancess = Bot.get_instances()
@@ -168,7 +172,7 @@ class SV:
         white_list: List = [],
     ):
         if not self.is_initialized:
-            logger.trace(t("【{name}】模块初始化中...", name=name))
+            logger.trace(t("log.sv.name_module_initializing", name=name))
             # sv名称，重复的sv名称将被并入一个sv里
             self.name: str = name
             # sv内包含的触发器
@@ -353,7 +357,7 @@ class SV:
                     if type not in self.TL:
                         self.TL[type] = {}
 
-                    if prefix and _pp:
+                    if prefix and _pp and type not in _PREFIXLESS_TYPES:
                         for _p in _pp:
                             _pk = _p + _k
                             self.TL[type][_pk] = Trigger(
@@ -364,7 +368,7 @@ class SV:
                                 block,
                                 to_me,
                             )
-                            logger.trace(t("载入{type}触发器【{_pk}】!", type=type, _pk=_pk))
+                            logger.trace(t("log.sv.type_trigger_pk_load", type=type, _pk=_pk))
                     else:
                         self.TL[type][_k] = Trigger(
                             type,
@@ -374,7 +378,7 @@ class SV:
                             block,
                             to_me,
                         )
-                        logger.trace(t("载入{type}触发器【{_k}】!", type=type, _k=_k))
+                        logger.trace(t("log.sv.type_trigger_k_load", type=type, _k=_k))
 
             # 声明 to_ai 时注册为 AI 工具；懒加载 + enable 网关，避免 sv 在 AI 关闭时拉入 pydantic_ai
             if to_ai.strip():

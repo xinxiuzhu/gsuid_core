@@ -35,25 +35,32 @@ async def update_user_favorability(
 > 一次；DB 层再按 `ai_config.favor_floor/ceil` 钳制总值，且每日 04:20 有向 0 的自然衰减 job。
 > **不要加回 `user_id` 参数**——对他人操作属管理动作，应走 master 专属工具。
 
-### `create_subagent` — 创建子Agent
+### `create_subagent` — 委派子 Agent / 能力代理
 
 ```python
-@ai_tools(category="self")
+@ai_tools(category="common", capability_domain="长期任务编排")  # 实际 category 以注册为准
 async def create_subagent(
     ctx: RunContext[ToolContext],
-    task: str,                      # 任务描述，请详细说明
-    max_tokens: int = 35000,        # 子Agent最大输出 token 数
-    max_iterations: int = 15,       # 子Agent最大迭代次数
-    agent_profile: str = "",        # 可选：派给指定的无人格能力代理
+    task: str,
+    max_tokens: int = 35000,
+    max_iterations: int = 15,
+    agent_profile: str = "",   # node_id 或可 resolve 的自然语言
+    transient: bool = False,   # True 仅 lookup；出图/落盘保持 False
 ) -> str
 ```
 
-**工作流程**：
-- `agent_profile` 留空（默认）：根据 `task` 向量检索工具，用内置 Plan-and-Solve
-  System Prompt 创建临时泛化子 Agent，执行并返回结果。
-- `agent_profile` 非空（自然语言描述，如"写代码""金融分析""调研"）：经
-  `resolve_node` 解析到对应的**无人格能力节点**执行（见 [§7.8](#78-能力代理agentnode-task-mode-节点)），执行/表达
-  分离，适合专业、易引发人格漂移的任务。
+**路由约定（主人格）**：
+
+| agent_profile | 用途 |
+|---------------|------|
+| （空） | 泛化 Plan-and-Solve 子 Agent |
+| `research_agent` | 外部检索 → 事实包（来源+时点） |
+| **`render_agent`** | **多项数据美观出图**（主路径；禁主人格自渲 HTML） |
+| `code_agent` | 写代码 / 脚本真文件图 |
+| 插件节点如 `stock_report_agent` | 业务专域（插件注册） |
+
+`task` 须自带完整事实包或实体；出图任务写明「禁止再检索」。详见
+[gscore-plugin-development §14](../../gscore-plugin-development/references/14-ai-capability-profile.md)。
 
 ### `send_message_by_ai` — 主动发送消息
 
@@ -68,10 +75,11 @@ async def send_message_by_ai(
 ) -> str
 ```
 
-> **出戏防火墙接入（2026-07-08，§D.4）**：`text` 发送前过
-> `output_firewall.gate_warn_once`——同轮首次命中返回重写警告（AI 据此重写重发）、同轮
-> 第二次仍命中则放行。改造此工具时**不要**破坏这个"提醒一次→重说→放行"语义，
-> 详见 [gscore-development §12.22](../../gscore-development/references/12-developer-pitfalls.md)。
+> **统一输出闸门（2026-08）**：`text` 发送前过 `output_gate.tool_gate_feedback`
+> （= `pre_send_gate(channel="tool")`；历史别名 `gate_warn_once`）——**尖括号**非法标签
+> （含 `<br>` / `<bubble/>`）打回直至熔断；**OOC** 同轮首次警告、再命中非 never-release 放行。
+> 通过后走 `send_chat_result(..., ooc_check=False)` 做呈现归一化。改造时不要绕过闸门，
+> 详见 [gscore-development §7.12 / §12.22](../../gscore-development/references/07-tool-registry-and-agent.md)。
 
 ### `add_once_task` — 添加一次性定时任务
 
@@ -179,6 +187,7 @@ async def resume_scheduled_task(
 ## 7.2 Buildin 工具（`category="buildin"`）—— 框架保底工具池
 
 `buildin` 分类下的工具属于**框架保底工具池**，主Agent 无条件全部加载，不受向量搜索影响。
+**多数据点出图已不在 buildin**：见 §7.4 `media` + 能力代理 `render_agent`。
 
 ### `search_knowledge` — 知识库检索
 
@@ -406,31 +415,34 @@ async def stop_agent_tool(
 
 ---
 
-## 7.4 Media 工具（`category="media"`）
+## 7.4 Media 工具（`category="media"`）—— 资料出图（归 `render_agent`）
 
-多媒体渲染工具，主Agent可调用。
+三者同属 `capability_domain="资料出图"`。主路径：
 
-### `render_html_to_image` — 将HTML渲染为图片
+```text
+create_subagent(agent_profile="render_agent", task=事实包)
+```
+
+交互主人格经 **exclusive 剥离**后不应直调 `render_*`。
+
+### `render_html_to_image` — 自由 HTML 出图（主渲染工具）
 
 ```python
-@ai_tools(category="media")
+@ai_tools(category="media", capability_domain="资料出图")
 async def render_html_to_image(
     ctx: RunContext[ToolContext],
-    html: str,                     # HTML 内容
-    width: int = 800,              # 渲染宽度
-) -> str
+    html_content: str,
+    image_format: Literal["png", "jpeg"] = "png",
+    max_width: int = 800,
+) -> str | bytes
 ```
 
-### `render_markdown_to_image` — 将Markdown渲染为图片
+- 默认自由 HTML；原生 `<table>` → `table_rewrite` flex 网格；自动嵌 `https`/`icon:`/`img_`/`res_`。
+- 约束见工具 docstring、[`TAKUMI_HTML_GUIDE.md`](../../../TAKUMI_HTML_GUIDE.md)。
 
-```python
-@ai_tools(category="media")
-async def render_markdown_to_image(
-    ctx: RunContext[ToolContext],
-    markdown: str,                 # Markdown 内容
-    width: int = 800,              # 渲染宽度
-) -> str
-```
+### `render_card` / `render_markdown_to_image`
+
+固定 JSON 卡片 / Markdown 出图；同属 media，通常由 `render_agent` 选用。
 
 ---
 
@@ -591,10 +603,13 @@ Persona 与能力代理**同构为一个 `AgentNode` 定义**（`gsuid_core.ai_c
 `agent_profile`（即 `node_id`）指定的节点推进，结果经 `_persona_relay` 用人格
 口吻回告。
 
-框架内置 6 个通用节点：`research_agent` / `code_agent` / `internal_reporter` /
-`memory_curator` / `scheduler_assistant` / `plugin_developer_agent`。
-`capability_evaluator` 是内部专用节点，只服务 `evaluate_agent_mesh_capability`，
-插件不要引用或覆盖它。业务节点（如 `stock_agent`、`weather_agent`）由插件自行注册。
+框架内置 **7** 个通用节点：`research_agent` / **`render_agent`** / `code_agent` /
+`internal_reporter` / `memory_curator` / `scheduler_assistant` / `plugin_developer_agent`。
+`capability_evaluator` 仅服务评估，插件勿覆盖。业务节点（如 `stock_agent` /
+`stock_report_agent`）由插件注册。
+
+**`render_agent`**：`tool_packs=[]` + 渲染白名单；runner **禁止** task 向量回填（防 web）。
+主人格多项数据出图委派它，勿自写 HTML。
 
 ### 7.8.1 插件创建并注册业务节点
 
@@ -666,10 +681,10 @@ register_finance_agent()
 | `prompt_style` | 能力节点保持默认 `"plain"`；`"roleplay"` 是 persona 投影节点专用 |
 | `when_to_use` | 一句话说明何时派给该节点，供评估代理和人工管理理解 |
 | `match_keywords` | 自然语言 hint 命中词，如主人格传 `agent_profile="操盘"` 时可解析到本节点 |
-| `tool_packs` | 工具能力族：`task_basics`（artifact/state/record/search/web 基础族，**建议必挂**）、`dynamic`（运行时五层自动装配）、或任意 `capability_domain` 族名 |
-| `tool_names` | 只写业务专业工具名；基础能力经 `task_basics` 族获得，不要重复写入 |
-| `tool_query` | 可选的工具向量检索查询；已有明确白名单时可留空（白名单为空 / 有 query 时按任务文本补一轮检索） |
-| `boundary_override` | 可选：覆写 task-mode 交付边界（空=框架默认"只向主人格交付、绝不直接发用户"） |
+| `tool_packs` | 多数挂 `task_basics`；纯渲染可 `[]`（避免 web） |
+| `tool_names` | 业务工具；日期工具注册名多为 `_get_current_date` |
+| `tool_query` | 可选；runner 默认再按 task 回填（`render_agent` 已跳过回填） |
+| `boundary_override` | 空=默认只向主人格交付；渲染节点可放宽「允许 render 工具发图」 |
 
 > **预算不在节点上**：单次执行的 `max_iterations` / `max_tokens` 统一走 AI 配置的
 > `task_max_iterations` / `task_max_tokens`（全局任务档）。Token 消耗经预算 scope
@@ -804,7 +819,7 @@ async def generate_video(ctx: RunContext[ToolContext], prompt: str) -> str:
 
 | API（`gsuid_core.ai_core.approval`） | 用途 |
 |-----|------|
-| `set_full_access(user_id, enabled)` / `is_full_access(user_id)` | 维护「完全访问」豁免（如画布前端的授权配置开关）；只作用于 user 级 |
+| `set_full_access(user_id, enabled)` / `is_full_access(user_id)` | 维护「完全访问」豁免（如宿主前端的授权配置开关）；只作用于 user 级 |
 | `submit(category, title, ev=..., audience=..., ref_key=..., payload=...)` | 提交一条审批 / 交互请求（返回落库行，含 `short_id`） |
 | `resolve(request_ref, approved, resolver_user_id, note, via)` | 裁决（含定位 + 裁决权校验 + 领域回调） |
 | `register_approval_category(name, on_resolve, ttl_seconds)` | 注册自定义审批领域：`on_resolve(row, approved, note) -> str` 承担"批准之后干什么" |

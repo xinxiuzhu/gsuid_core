@@ -192,9 +192,7 @@ class PersonaConfigManager(ConfigSetManager):
         # 设置配置
         success = config.set_config("scope", scope)
         if success:
-            logger.info(
-                t("[PersonaConfig] 已更新 '{persona_name}' 的启用范围: {scope}", persona_name=persona_name, scope=scope)
-            )
+            logger.info(t("log.persona.personaconfig_updated_name_enabled", persona_name=persona_name, scope=scope))
             return True, "ok"
         else:
             return False, "配置写入失败"
@@ -216,7 +214,7 @@ class PersonaConfigManager(ConfigSetManager):
         if success:
             logger.info(
                 t(
-                    "[PersonaConfig] 已更新 '{persona_name}' 的目标群聊: {target_groups}",
+                    "log.persona.personaconfig_updated_name_target",
                     persona_name=persona_name,
                     target_groups=target_groups,
                 )
@@ -248,7 +246,7 @@ class PersonaConfigManager(ConfigSetManager):
         if success:
             logger.info(
                 t(
-                    "[PersonaConfig] 已更新 '{persona_name}' 的 AI 模式: {ai_mode}",
+                    "log.persona.personaconfig_updated_name_ai",
                     persona_name=persona_name,
                     ai_mode=ai_mode,
                 )
@@ -292,7 +290,7 @@ class PersonaConfigManager(ConfigSetManager):
         if success:
             logger.info(
                 t(
-                    "[PersonaConfig] 已更新 '{persona_name}' 的巡检间隔: {inspect_interval} 分钟",
+                    "log.persona.personaconfig_updated_name_inspection",
                     persona_name=persona_name,
                     inspect_interval=inspect_interval,
                 )
@@ -318,7 +316,7 @@ class PersonaConfigManager(ConfigSetManager):
         if success:
             logger.info(
                 t(
-                    "[PersonaConfig] 已更新 '{persona_name}' 的唤醒关键词: {keywords}",
+                    "log.persona.personaconfig_updated_name_wake",
                     persona_name=persona_name,
                     keywords=keywords,
                 )
@@ -348,7 +346,7 @@ class PersonaConfigManager(ConfigSetManager):
         if success:
             logger.info(
                 t(
-                    "[PersonaConfig] 已更新 '{persona_name}' 的工具能力族: {cleaned}",
+                    "log.persona.personaconfig_updated_name_capability",
                     persona_name=persona_name,
                     cleaned=cleaned,
                 )
@@ -378,7 +376,7 @@ class PersonaConfigManager(ConfigSetManager):
         if success:
             logger.info(
                 t(
-                    "[PersonaConfig] 已更新 '{persona_name}' 的显式工具白名单: {cleaned}",
+                    "log.persona.personaconfig_updated_name_explicit",
                     persona_name=persona_name,
                     cleaned=cleaned,
                 )
@@ -503,12 +501,10 @@ class PersonaConfigManager(ConfigSetManager):
         if config_path.exists():
             try:
                 config_path.unlink()
-                logger.info(t("[PersonaConfig] 已删除 '{persona_name}' 的配置文件", persona_name=persona_name))
+                logger.info(t("log.persona.personaconfig_deleted_name_config", persona_name=persona_name))
                 return True
             except Exception as e:
-                logger.error(
-                    t("[PersonaConfig] 删除 '{persona_name}' 的配置文件失败: {e}", persona_name=persona_name, e=e)
-                )
+                logger.error(t("log.persona.personaconfig_delete_name_config", persona_name=persona_name, e=e))
                 return False
         return True
 

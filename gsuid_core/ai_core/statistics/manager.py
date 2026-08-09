@@ -170,6 +170,108 @@ class StatisticsManager:
             cache_write=cache_write_tokens,
         )
 
+    def record_agent_run(
+        self,
+        *,
+        owns_user_turn: bool,
+        under_user_turn: bool,
+        is_nested: bool,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+    ) -> None:
+        """记录一次 Agent Run 的效率计数，并按需归入 User Turn 树。
+
+        Args:
+            owns_user_turn: 本 run 是否为用户回合 root（主人格交互新建 user_turn_id）
+            under_user_turn: 是否挂在某用户回合树下（含 root 自身与同步嵌套）
+            is_nested: 是否为嵌套 run（subagent / capability 等）
+            input_tokens / output_tokens / cache_*: 本 run 自身 usage（不含子 run）
+        """
+        s = self._bot_state
+        s.agent_run_count += 1
+        if is_nested:
+            s.nested_agent_run_count += 1
+        else:
+            s.root_agent_run_count += 1
+        if owns_user_turn:
+            s.user_turn_count += 1
+        if under_user_turn:
+            s.user_turn_agent_run_count += 1
+            s.user_turn_tokens.add(input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
+
+    @staticmethod
+    def _safe_avg(numerator: float, denominator: int) -> float:
+        if denominator <= 0:
+            return 0.0
+        return round(float(numerator) / float(denominator), 2)
+
+    def _efficiency_from_state(self, s: BotState) -> Dict[str, Any]:
+        """从内存 BotState 组装 efficiency 块。"""
+        ut = int(s.user_turn_count or 0)
+        ar = int(s.agent_run_count or 0)
+        ut_ar = int(s.user_turn_agent_run_count or 0)
+        ut_in = int(s.user_turn_tokens.input_tokens or 0)
+        ut_out = int(s.user_turn_tokens.output_tokens or 0)
+        ut_cr = int(s.user_turn_tokens.cache_read_tokens or 0)
+        ut_cw = int(s.user_turn_tokens.cache_write_tokens or 0)
+        # 回合均耗：用户回合树内 input+output（缓存另计，避免与 input 双重叠加）
+        ut_io = ut_in + ut_out
+        total_in = int(s.total_tokens.get("input", 0) or 0)
+        total_out = int(s.total_tokens.get("output", 0) or 0)
+        total_io = total_in + total_out
+        return {
+            "user_turn_count": ut,
+            "agent_run_count": ar,
+            "root_agent_run_count": int(s.root_agent_run_count or 0),
+            "nested_agent_run_count": int(s.nested_agent_run_count or 0),
+            "user_turn_agent_run_count": ut_ar,
+            "user_turn_input_tokens": ut_in,
+            "user_turn_output_tokens": ut_out,
+            "user_turn_cache_read_tokens": ut_cr,
+            "user_turn_cache_write_tokens": ut_cw,
+            "avg_tokens_per_user_turn": self._safe_avg(ut_io, ut),
+            "avg_input_tokens_per_user_turn": self._safe_avg(ut_in, ut),
+            "avg_output_tokens_per_user_turn": self._safe_avg(ut_out, ut),
+            "avg_tokens_per_agent_run": self._safe_avg(total_io, ar),
+            "avg_input_tokens_per_agent_run": self._safe_avg(total_in, ar),
+            "avg_output_tokens_per_agent_run": self._safe_avg(total_out, ar),
+            "avg_agent_runs_per_user_turn": self._safe_avg(ut_ar, ut),
+        }
+
+    def _efficiency_from_daily_stats(self, stats: AIDailyStatistics) -> Dict[str, Any]:
+        """从日聚合行组装 efficiency 块。"""
+        ut = int(stats.user_turn_count or 0)
+        ar = int(stats.agent_run_count or 0)
+        ut_ar = int(stats.user_turn_agent_run_count or 0)
+        ut_in = int(stats.user_turn_input_tokens or 0)
+        ut_out = int(stats.user_turn_output_tokens or 0)
+        ut_cr = int(stats.user_turn_cache_read_tokens or 0)
+        ut_cw = int(stats.user_turn_cache_write_tokens or 0)
+        ut_io = ut_in + ut_out
+        total_in = int(stats.total_input_tokens or 0)
+        total_out = int(stats.total_output_tokens or 0)
+        total_io = total_in + total_out
+        return {
+            "user_turn_count": ut,
+            "agent_run_count": ar,
+            "root_agent_run_count": int(stats.root_agent_run_count or 0),
+            "nested_agent_run_count": int(stats.nested_agent_run_count or 0),
+            "user_turn_agent_run_count": ut_ar,
+            "user_turn_input_tokens": ut_in,
+            "user_turn_output_tokens": ut_out,
+            "user_turn_cache_read_tokens": ut_cr,
+            "user_turn_cache_write_tokens": ut_cw,
+            "avg_tokens_per_user_turn": self._safe_avg(ut_io, ut),
+            "avg_input_tokens_per_user_turn": self._safe_avg(ut_in, ut),
+            "avg_output_tokens_per_user_turn": self._safe_avg(ut_out, ut),
+            "avg_tokens_per_agent_run": self._safe_avg(total_io, ar),
+            "avg_input_tokens_per_agent_run": self._safe_avg(total_in, ar),
+            "avg_output_tokens_per_agent_run": self._safe_avg(total_out, ar),
+            "avg_agent_runs_per_user_turn": self._safe_avg(ut_ar, ut),
+        }
+
     def record_latency(self, latency: float):
         """记录响应延迟"""
         self._bot_state.latencies.add(latency)
@@ -351,6 +453,7 @@ class StatisticsManager:
                 "edges_created": b.memory_edges_created,
                 "episodes_created": b.memory_episodes_created,
             },
+            "efficiency": self._efficiency_from_state(b),
             "active_users": active_users,
         }
 
@@ -360,7 +463,7 @@ class StatisticsManager:
         """从数据库加载今日数据"""
         try:
             today = self._today
-            logger.info(i18n_t("📊 [StatisticsManager] 正在从数据库加载 {today} 的统计数据", today=today))
+            logger.info(i18n_t("log.ai.statisticsmanager_statistics_today_database_load", today=today))
 
             # 1. 加载 AIDailyStatistics
             stats = await AIDailyStatistics.get_daily_stats(today)
@@ -401,6 +504,19 @@ class StatisticsManager:
                 s.memory_entities_created = stats.memory_entities_created or 0
                 s.memory_edges_created = stats.memory_edges_created or 0
                 s.memory_episodes_created = stats.memory_episodes_created or 0
+
+                # 效率：User Turn / Agent Run
+                s.user_turn_count = stats.user_turn_count or 0
+                s.agent_run_count = stats.agent_run_count or 0
+                s.root_agent_run_count = stats.root_agent_run_count or 0
+                s.nested_agent_run_count = stats.nested_agent_run_count or 0
+                s.user_turn_agent_run_count = stats.user_turn_agent_run_count or 0
+                s.user_turn_tokens.add(
+                    stats.user_turn_input_tokens or 0,
+                    stats.user_turn_output_tokens or 0,
+                    stats.user_turn_cache_read_tokens or 0,
+                    stats.user_turn_cache_write_tokens or 0,
+                )
 
             # 2. 加载 AITokenUsageByModel
             all_token_use = await AITokenUsageByModel.get_daily_data(date=today)
@@ -449,9 +565,9 @@ class StatisticsManager:
             # 所有维度都加载完毕才开闸放行 persist; 任一步抛异常会跳过本行,
             # _loaded 保持 False, 让后续 _persist_loop 主动跳过以保护历史数据。
             self._loaded = True
-            logger.info(i18n_t("📊 [StatisticsManager] 成功加载今日统计数据"))
+            logger.info(i18n_t("log.ai.statisticsmanager_today_statistics"))
         except Exception as e:
-            logger.exception(i18n_t("📊 [StatisticsManager] 加载今日数据失败: {e}", e=e))
+            logger.exception(i18n_t("log.ai.statisticsmanager_load_today_data", e=e))
 
     async def _persist_all_stats_to_db(self):
         """将所有统计数据持久化到数据库。
@@ -460,7 +576,7 @@ class StatisticsManager:
         - 与日切 reset 共用 _persist_lock, 保证原子性。
         """
         if not self._loaded:
-            logger.warning(i18n_t("📊 [StatisticsManager] 尚未完成今日数据加载, 跳过本次持久化以防覆盖历史数据"))
+            logger.warning(i18n_t("log.ai.statisticsmanager_today_data_skipping_ok"))
             return
         async with self._persist_lock:
             await self._persist_stats()
@@ -478,7 +594,7 @@ class StatisticsManager:
                 await self._persist_stats()
                 await self._persist_rag_stats()
             else:
-                logger.warning(i18n_t("📊 [StatisticsManager] 日切时尚未完成加载, 跳过当日持久化"))
+                logger.warning(i18n_t("log.ai.statisticsmanager_day_rollover_skipping_ok"))
             self._reset_daily_counters()
             self._today = datetime.now().strftime("%Y-%m-%d")
 
@@ -498,7 +614,7 @@ class StatisticsManager:
             for doc_name, count in doc_counter.items():
                 await AIRAGDocumentStatistics.upsert_rag_hit_count(doc_name, count)
         except Exception as e:
-            logger.exception(i18n_t("📊 [StatisticsManager] 持久化 RAG 统计失败: {e}", e=e))
+            logger.exception(i18n_t("log.ai.statisticsmanager_persist_rag_statistics", e=e))
 
     def get_rag_document_stats(self) -> List[Dict[str, Any]]:
         """获取 RAG 文档命中统计"""
@@ -549,6 +665,15 @@ class StatisticsManager:
                 memory_entities_created=s.memory_entities_created,
                 memory_edges_created=s.memory_edges_created,
                 memory_episodes_created=s.memory_episodes_created,
+                user_turn_count=s.user_turn_count,
+                agent_run_count=s.agent_run_count,
+                root_agent_run_count=s.root_agent_run_count,
+                nested_agent_run_count=s.nested_agent_run_count,
+                user_turn_agent_run_count=s.user_turn_agent_run_count,
+                user_turn_input_tokens=s.user_turn_tokens.input_tokens,
+                user_turn_output_tokens=s.user_turn_tokens.output_tokens,
+                user_turn_cache_read_tokens=s.user_turn_tokens.cache_read_tokens,
+                user_turn_cache_write_tokens=s.user_turn_tokens.cache_write_tokens,
             )
 
             # Token 按模型统计 - 批量插入
@@ -628,7 +753,7 @@ class StatisticsManager:
             await self._persist_hourly_performance()
 
         except Exception as e:
-            logger.exception(i18n_t("📊 [StatisticsManager] 持久化统计数据失败: {e}", e=e))
+            logger.exception(i18n_t("log.ai.statisticsmanager_persist_statistics", e=e))
 
     async def _persist_hourly_performance(self):
         """持久化小时级性能统计到数据库
@@ -664,7 +789,7 @@ class StatisticsManager:
             )
             if not ok:
                 self._hourly_perf[key].merge(entry)
-                logger.warning(i18n_t("📊 [StatisticsManager] 小时性能统计落库失败, 增量已回滚至缓冲: {key}", key=key))
+                logger.warning(i18n_t("log.ai.statisticsmanager_write_hourly_performance_fail", key=key))
 
     async def get_hourly_performance_by_date(self, date: str) -> List[Dict[str, Any]]:
         """获取指定日期的小时级性能统计（DB 基线 + 内存未持久化增量合并）"""
@@ -692,13 +817,14 @@ class StatisticsManager:
                 item["providers"].sort(key=lambda p: (p["provider"], p["model"]))
             return sorted(result.values(), key=lambda x: x["hour"])
         except Exception as e:
-            logger.warning(i18n_t("📊 [StatisticsManager] 查询小时性能统计失败: {e}", e=e))
+            logger.warning(i18n_t("log.ai.statisticsmanager_query_hourly_performance_fail", e=e))
             return []
 
     async def get_daily_token_counts(self, days: int = 60) -> List[Dict[str, Any]]:
         """近 N 天每日 input/output token 汇总，供日历选择器展示。
 
-        返回按日期升序的 ``[{date, input_tokens, output_tokens, total_tokens}, ...]``，
+        返回按日期升序的
+        ``[{date, input_tokens, output_tokens, total_tokens, user_turn_count, agent_run_count, ...}, ...]``，
         无数据的日期补 0；今日优先读内存实时值。
         """
         days = max(1, min(int(days or 60), 366))
@@ -707,7 +833,7 @@ class StatisticsManager:
         start_s = start.strftime("%Y-%m-%d")
         end_s = today.strftime("%Y-%m-%d")
 
-        by_date: Dict[str, Dict[str, int]] = {}
+        by_date: Dict[str, Dict[str, Any]] = {}
         try:
             rows = await AIDailyStatistics.get_stats_between(start_s, end_s)
             for row in rows:
@@ -715,6 +841,11 @@ class StatisticsManager:
                 by_date[key] = {
                     "input_tokens": int(row.total_input_tokens or 0),
                     "output_tokens": int(row.total_output_tokens or 0),
+                    "user_turn_count": int(row.user_turn_count or 0),
+                    "agent_run_count": int(row.agent_run_count or 0),
+                    "user_turn_agent_run_count": int(row.user_turn_agent_run_count or 0),
+                    "user_turn_input_tokens": int(row.user_turn_input_tokens or 0),
+                    "user_turn_output_tokens": int(row.user_turn_output_tokens or 0),
                 }
         except Exception:
             # DB 不可用时仍返回连续 0 序列
@@ -727,21 +858,37 @@ class StatisticsManager:
             by_date[today_s] = {
                 "input_tokens": int(b.total_tokens.get("input", 0) or 0),
                 "output_tokens": int(b.total_tokens.get("output", 0) or 0),
+                "user_turn_count": int(b.user_turn_count or 0),
+                "agent_run_count": int(b.agent_run_count or 0),
+                "user_turn_agent_run_count": int(b.user_turn_agent_run_count or 0),
+                "user_turn_input_tokens": int(b.user_turn_tokens.input_tokens or 0),
+                "user_turn_output_tokens": int(b.user_turn_tokens.output_tokens or 0),
             }
 
         result: List[Dict[str, Any]] = []
         for offset in range(days - 1, -1, -1):
             d = today - timedelta(days=offset)
             key = d.strftime("%Y-%m-%d")
-            bucket = by_date.get(key) or {"input_tokens": 0, "output_tokens": 0}
+            bucket = by_date.get(key) or {}
             inp = int(bucket.get("input_tokens", 0) or 0)
             out = int(bucket.get("output_tokens", 0) or 0)
+            ut = int(bucket.get("user_turn_count", 0) or 0)
+            ar = int(bucket.get("agent_run_count", 0) or 0)
+            ut_ar = int(bucket.get("user_turn_agent_run_count", 0) or 0)
+            ut_in = int(bucket.get("user_turn_input_tokens", 0) or 0)
+            ut_out = int(bucket.get("user_turn_output_tokens", 0) or 0)
             result.append(
                 {
                     "date": key,
                     "input_tokens": inp,
                     "output_tokens": out,
                     "total_tokens": inp + out,
+                    "user_turn_count": ut,
+                    "agent_run_count": ar,
+                    "user_turn_agent_run_count": ut_ar,
+                    "avg_tokens_per_user_turn": self._safe_avg(ut_in + ut_out, ut),
+                    "avg_tokens_per_agent_run": self._safe_avg(inp + out, ar),
+                    "avg_agent_runs_per_user_turn": self._safe_avg(ut_ar, ut),
                 }
             )
         return result
@@ -820,7 +967,7 @@ class StatisticsManager:
                 heartbeat,
             )
         except Exception as e:
-            logger.warning(i18n_t("📊 [StatisticsManager] 查询历史统计失败: {e}", e=e))
+            logger.warning(i18n_t("log.ai.statisticsmanager_query_historical_statistics_fa", e=e))
             return None
 
     async def get_token_usage_by_range(
@@ -859,6 +1006,12 @@ class StatisticsManager:
         # 按模型聚合: model -> TokenUsage
         model_acc: Dict[str, TokenUsage] = defaultdict(TokenUsage)
         total = TokenUsage()
+        # 效率区间累加
+        sum_user_turns = 0
+        sum_agent_runs = 0
+        sum_ut_agent_runs = 0
+        sum_ut_in = 0
+        sum_ut_out = 0
 
         cur = start
         while cur <= end:
@@ -872,6 +1025,11 @@ class StatisticsManager:
                 d_out = b.total_tokens["output"]
                 d_cr = b.total_tokens["cache_read"]
                 d_cw = b.total_tokens["cache_write"]
+                d_ut = int(b.user_turn_count or 0)
+                d_ar = int(b.agent_run_count or 0)
+                d_ut_ar = int(b.user_turn_agent_run_count or 0)
+                d_ut_in = int(b.user_turn_tokens.input_tokens or 0)
+                d_ut_out = int(b.user_turn_tokens.output_tokens or 0)
                 model_rows = [
                     (m, u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens)
                     for m, u in b.token_by_model.items()
@@ -883,6 +1041,11 @@ class StatisticsManager:
                 d_out = (stats.total_output_tokens or 0) if stats else 0
                 d_cr = (stats.total_cache_read_tokens or 0) if stats else 0
                 d_cw = (stats.total_cache_write_tokens or 0) if stats else 0
+                d_ut = int(stats.user_turn_count or 0) if stats else 0
+                d_ar = int(stats.agent_run_count or 0) if stats else 0
+                d_ut_ar = int(stats.user_turn_agent_run_count or 0) if stats else 0
+                d_ut_in = int(stats.user_turn_input_tokens or 0) if stats else 0
+                d_ut_out = int(stats.user_turn_output_tokens or 0) if stats else 0
                 model_rows = [
                     (
                         t.model_name,
@@ -902,9 +1065,20 @@ class StatisticsManager:
                     "cache_read_tokens": d_cr,
                     "cache_write_tokens": d_cw,
                     "total_tokens": d_in + d_out + d_cr + d_cw,
+                    "user_turn_count": d_ut,
+                    "agent_run_count": d_ar,
+                    "user_turn_agent_run_count": d_ut_ar,
+                    "avg_tokens_per_user_turn": self._safe_avg(d_ut_in + d_ut_out, d_ut),
+                    "avg_tokens_per_agent_run": self._safe_avg(d_in + d_out, d_ar),
+                    "avg_agent_runs_per_user_turn": self._safe_avg(d_ut_ar, d_ut),
                 }
             )
             total.add(d_in, d_out, d_cr, d_cw)
+            sum_user_turns += d_ut
+            sum_agent_runs += d_ar
+            sum_ut_agent_runs += d_ut_ar
+            sum_ut_in += d_ut_in
+            sum_ut_out += d_ut_out
             for model_name, m_in, m_out, m_cr, m_cw in model_rows:
                 model_acc[model_name].add(m_in, m_out, m_cr, m_cw)
 
@@ -937,9 +1111,26 @@ class StatisticsManager:
                     total.input_tokens + total.output_tokens + total.cache_read_tokens + total.cache_write_tokens
                 ),
             },
+            "efficiency": {
+                "user_turn_count": sum_user_turns,
+                "agent_run_count": sum_agent_runs,
+                "user_turn_agent_run_count": sum_ut_agent_runs,
+                "avg_tokens_per_user_turn": self._safe_avg(sum_ut_in + sum_ut_out, sum_user_turns),
+                "avg_tokens_per_agent_run": self._safe_avg(total.input_tokens + total.output_tokens, sum_agent_runs),
+                "avg_agent_runs_per_user_turn": self._safe_avg(sum_ut_agent_runs, sum_user_turns),
+            },
             "daily": daily,
             "by_model": by_model,
         }
+
+    async def get_efficiency(self, date: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """获取指定日的效率指标；date 为空或今日走内存，历史走 DB。"""
+        if date is None or date == self._today:
+            return self._efficiency_from_state(self._bot_state)
+        stats = await AIDailyStatistics.get_daily_stats(date)
+        if not stats:
+            return None
+        return self._efficiency_from_daily_stats(stats)
 
     def _daily_stats_to_dict(
         self,
@@ -1025,6 +1216,7 @@ class StatisticsManager:
                 "edges_created": stats.memory_edges_created or 0,
                 "episodes_created": stats.memory_episodes_created or 0,
             },
+            "efficiency": self._efficiency_from_daily_stats(stats),
             "heartbeat": heartbeat or {"should_speak_true": 0, "should_speak_false": 0, "conversion_rate": 0},
             "active_users": active_users or [],
         }
@@ -1058,4 +1250,4 @@ async def _persist_loop():
     from gsuid_core.ai_core.budget import budget_manager
 
     await budget_manager.flush()
-    logger.info(i18n_t("📊 [StatisticsManager] 每30分钟定时持久化完成"))
+    logger.info(i18n_t("log.ai.statisticsmanager_scheduled_persistence_minutes"))

@@ -25,6 +25,7 @@ AI_DATABASE_MODEL_MODULES = (
     "gsuid_core.ai_core.statistics.models",
     "gsuid_core.ai_core.scheduled_task.models",
     "gsuid_core.ai_core.planning.models",
+    "gsuid_core.ai_core.planning.tool_output_store",
     "gsuid_core.ai_core.command_exec.models",
     "gsuid_core.ai_core.approval.models",
     "gsuid_core.ai_core.budget.models",
@@ -109,6 +110,16 @@ exec_list = [
     # 缓存Token统计：旧库补齐缓存读写Token列（向后兼容）
     "ALTER TABLE aidailystatistics ADD COLUMN total_cache_read_tokens INTEGER DEFAULT 0;",
     "ALTER TABLE aidailystatistics ADD COLUMN total_cache_write_tokens INTEGER DEFAULT 0;",
+    # 效率：User Turn / Agent Run（旧库幂等补列）
+    "ALTER TABLE aidailystatistics ADD COLUMN user_turn_count INTEGER DEFAULT 0;",
+    "ALTER TABLE aidailystatistics ADD COLUMN agent_run_count INTEGER DEFAULT 0;",
+    "ALTER TABLE aidailystatistics ADD COLUMN root_agent_run_count INTEGER DEFAULT 0;",
+    "ALTER TABLE aidailystatistics ADD COLUMN nested_agent_run_count INTEGER DEFAULT 0;",
+    "ALTER TABLE aidailystatistics ADD COLUMN user_turn_agent_run_count INTEGER DEFAULT 0;",
+    "ALTER TABLE aidailystatistics ADD COLUMN user_turn_input_tokens INTEGER DEFAULT 0;",
+    "ALTER TABLE aidailystatistics ADD COLUMN user_turn_output_tokens INTEGER DEFAULT 0;",
+    "ALTER TABLE aidailystatistics ADD COLUMN user_turn_cache_read_tokens INTEGER DEFAULT 0;",
+    "ALTER TABLE aidailystatistics ADD COLUMN user_turn_cache_write_tokens INTEGER DEFAULT 0;",
     "ALTER TABLE aitokenusagebytype ADD COLUMN cache_read_tokens INTEGER DEFAULT 0;",
     "ALTER TABLE aitokenusagebytype ADD COLUMN cache_write_tokens INTEGER DEFAULT 0;",
     "ALTER TABLE aitokenusagebymodel ADD COLUMN cache_read_tokens INTEGER DEFAULT 0;",
@@ -121,6 +132,9 @@ exec_list = [
     "ALTER TABLE aihourlyperformance ADD COLUMN tps_sample_count INTEGER DEFAULT 0;",
     # 安全表情删除 target 快照补文件大小（兼容运行过开发期中间版本的数据库）
     "ALTER TABLE aimemedeletetarget ADD COLUMN file_size INTEGER DEFAULT 0;",
+    # FileOS 去重列（旧库幂等补齐）
+    "ALTER TABLE aitooloutputrecord ADD COLUMN content_hash VARCHAR DEFAULT '';",
+    "CREATE INDEX IF NOT EXISTS ix_aitooloutputrecord_content_hash ON aitooloutputrecord (content_hash);",
 ]
 
 
@@ -137,15 +151,13 @@ def import_database_models() -> None:
         if ai_config.get_config("enable").data:
             modules.extend(AI_DATABASE_MODEL_MODULES)
     except Exception as e:
-        logger.warning(t("[数据库] 读取 AI 配置失败，将仅创建核心表: {e}", e=e))
+        logger.warning(t("log.database.ai_read_fail_create", e=e))
 
     for module_name in modules:
         try:
             importlib.import_module(module_name)
         except Exception as e:
-            logger.warning(
-                t("[数据库] 导入模型模块失败: {module_name}, 跳过对应表创建: {e}", module_name=module_name, e=e)
-            )
+            logger.warning(t("log.database.module_name_import_fail_skip", module_name=module_name, e=e))
 
 
 async def ensure_core_database_tables() -> None:
@@ -157,20 +169,20 @@ async def ensure_core_database_tables() -> None:
     import_database_models()
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
-    logger.info(t("[数据库] 核心数据库表创建成功!"))
+    logger.info(t("log.database.create_ok"))
 
 
 @on_core_start_before(priority=-100)
 async def move_database():
     old_path = get_res_path().parent / "GsData.db"
     if old_path.exists() and not DB_PATH.exists():
-        logger.warning(t("检测到主目录存在旧版数据库, 迁移中...该log只会看到一次..."))
+        logger.warning(t("log.database.log_migrate"))
         move(old_path, db_url)
-        logger.warning(t("迁移完成！"))
+        logger.warning(t("log.database.migrate_done"))
 
     for i in global_val_path.glob("*.json"):
         i.unlink()
-        logger.warning(t("删除历史统计记录..."))
+        logger.warning(t("log.database.deleting_historical_statistics_records_delete"))
 
 
 @on_core_start_before(priority=-90)

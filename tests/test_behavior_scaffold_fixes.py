@@ -67,11 +67,11 @@ def test_templates_carry_staleness_and_addressing() -> None:
 # ─────────────────────────────────────────────
 
 _PROD_AT_OTHER_MESSAGE = (
-    "【用户发言】\n居木(用户ID:994534742) 找你说话，见过几次面的那种。\n"
+    "[用户发言]\n居木(用户ID:994534742) 找你说话，见过几次面的那种。\n"
     "--- 消息 ---\n你怎么看\n"
     "--- 用户发送了图片(未展开, 需要查看内容时调用 read_image(图片ID)) ---\n图片ID: img_8193d73d\n"
     "--- @了用户: 84707179（@的是这位用户，不是你） ---\n"
-    "【当前时间】2026-07-16 13:03"
+    "[当前时间：2026-07-16 13:03]"
 )
 
 
@@ -82,7 +82,7 @@ def test_prod_at_other_message_gated() -> None:
 
 def test_direct_marker_passes_gate() -> None:
     text = (
-        "【用户发言】\n某人\n（直接找你说的）\n--- 消息 ---\n早柚你怎么看\n"
+        "[用户发言]\n某人\n（直接找你说的）\n--- 消息 ---\n早柚你怎么看\n"
         "--- @了用户: 84707179（@的是这位用户，不是你） ---"
     )
     assert addressed_to_someone_else(text, "早柚", is_tome=False) is False
@@ -139,6 +139,7 @@ def test_system_constraints_fund_redline() -> None:
     assert "真实金钱往来" in SYSTEM_CONSTRAINTS
     assert "绝不承诺转账" in SYSTEM_CONSTRAINTS
     assert "不替他人向第三方" in SYSTEM_CONSTRAINTS
+    # 压缩后仍须显式金钱红线（评测/生产共用）
 
 
 # ─────────────────────────────────────────────
@@ -155,11 +156,13 @@ def test_no_tool_reminder_exempts_chitchat() -> None:
 
     assert "闲聊" in _PROGRESSIVE_TOOLS_SKIP_INTENTS
 
-    src = inspect.getsource(GsCoreAIAgent._execute_run_once)
-    inject_idx = src.index("已注入连续无工具调用强制提醒")
-    inject_block = src[max(0, inject_idx - 800) : inject_idx]
+    # 注入在 prepare；计数在 settle（均由 _execute_run_once 编排）
+    inject_src = inspect.getsource(GsCoreAIAgent._run_once_prepare_user_message)
+    inject_idx = inject_src.index("forced_nudge_consecutive_turns")
+    inject_block = inject_src[max(0, inject_idx - 800) : inject_idx]
     assert "intent not in _PROGRESSIVE_TOOLS_SKIP_INTENTS" in inject_block
 
-    count_idx = src.index("更新连续无工具调用计数")
-    count_block = src[count_idx : count_idx + 400]
+    count_src = inspect.getsource(GsCoreAIAgent._run_once_settle_result)
+    count_idx = count_src.index("更新连续无工具调用计数")
+    count_block = count_src[count_idx : count_idx + 400]
     assert "intent not in _PROGRESSIVE_TOOLS_SKIP_INTENTS" in count_block

@@ -38,6 +38,8 @@ class AIDailyStatistics(BaseIDModel, table=True):
         date: 统计日期 (YYYY-MM-DD)
         total_input_tokens: 总输入 Token 数
         total_output_tokens: 总输出 Token 数
+        user_turn_count / agent_run_count: 用户回合数 / 代理运行数（效率分母）
+        user_turn_*_tokens: 挂在用户回合树内的 token（含同步嵌套）
         avg_latency: 平均响应延迟 (秒)
         p95_latency: P95 响应延迟 (秒)
         intent_chat_count: 闲聊意图次数
@@ -69,6 +71,16 @@ class AIDailyStatistics(BaseIDModel, table=True):
     total_output_tokens: int = Field(default=0, title="总输出Token")
     total_cache_read_tokens: int = Field(default=0, title="总缓存读取Token")
     total_cache_write_tokens: int = Field(default=0, title="总缓存写入Token")
+    # 效率：User Turn / Agent Run
+    user_turn_count: int = Field(default=0, title="用户回合数")
+    agent_run_count: int = Field(default=0, title="代理运行数")
+    root_agent_run_count: int = Field(default=0, title="Root代理运行数")
+    nested_agent_run_count: int = Field(default=0, title="嵌套代理运行数")
+    user_turn_agent_run_count: int = Field(default=0, title="用户回合内代理运行数")
+    user_turn_input_tokens: int = Field(default=0, title="用户回合输入Token")
+    user_turn_output_tokens: int = Field(default=0, title="用户回合输出Token")
+    user_turn_cache_read_tokens: int = Field(default=0, title="用户回合缓存读取Token")
+    user_turn_cache_write_tokens: int = Field(default=0, title="用户回合缓存写入Token")
     avg_latency: float = Field(default=0.0, title="平均延迟(秒)")
     p95_latency: float = Field(default=0.0, title="P95延迟(秒)")
     intent_chat_count: int = Field(default=0, title="闲聊次数")
@@ -153,7 +165,7 @@ class AIDailyStatistics(BaseIDModel, table=True):
                 )
             return True
         except Exception as e:
-            logger.exception(t("📊 [AIDailyStatistics] 更新统计数据失败: {e}", e=e))
+            logger.exception(t("log.ai.aidailystatistics_update_statistics", e=e))
             return False
 
 
@@ -240,7 +252,7 @@ class AITokenUsageByType(BaseIDModel, table=True):
                 )
             return True
         except Exception as e:
-            logger.exception(t("📊 [AITokenUsageByType] 更新Token消耗失败: {e}", e=e))
+            logger.exception(t("log.ai.aitokenusagebytype_update_token_usage", e=e))
             return False
 
 
@@ -327,7 +339,7 @@ class AITokenUsageByModel(BaseIDModel, table=True):
                 )
             return True
         except Exception as e:
-            logger.exception(t("📊 [AITokenUsageByModel] 更新Token消耗失败: {e}", e=e))
+            logger.exception(t("log.ai.aitokenusagebymodel_update_token_usage", e=e))
             return False
 
 
@@ -411,7 +423,7 @@ class AIGroupUserActivityStats(BaseIDModel, table=True):
                 )
             return True
         except Exception as e:
-            logger.exception(t("📊 [AIGroupUserActivityStats] 更新活跃统计失败: {e}", e=e))
+            logger.exception(t("log.ai.aigroupuseractivitys_update_activity_statistics", e=e))
             return False
 
 
@@ -491,7 +503,7 @@ class AIHeartbeatMetrics(BaseIDModel, table=True):
                 )
             return True
         except Exception as e:
-            logger.exception(t("📊 [AIHeartbeatMetrics] 更新Heartbeat决策失败: {e}", e=e))
+            logger.exception(t("log.ai.aiheartbeatmetrics_update_heartbeat_decision_fai", e=e))
             return False
 
 
@@ -529,7 +541,7 @@ class AIRAGMissStatistics(BaseIDModel, table=True):
                 await cls.full_insert_data(date=date, miss_count=1)
             return True
         except Exception as e:
-            logger.exception(t("📊 [AIRAGMissStatistics] 更新RAG未命中统计失败: {e}", e=e))
+            logger.exception(t("log.ai.airagmissstatistics_update_rag_miss_fail", e=e))
             return False
 
     @classmethod
@@ -547,7 +559,7 @@ class AIRAGMissStatistics(BaseIDModel, table=True):
                 await cls.full_insert_data(date=date, hit_count=hit_count, miss_count=miss_count)
             return True
         except Exception as e:
-            logger.exception(t("📊 [AIRAGMissStatistics] 更新RAG统计失败: {e}", e=e))
+            logger.exception(t("log.ai.airagmissstatistics_update_rag_statistics", e=e))
             return False
 
 
@@ -592,7 +604,7 @@ class AIRAGDocumentStatistics(BaseIDModel, table=True):
                 await cls.full_insert_data(document_name=document_name, hit_count=1)
             return True
         except Exception as e:
-            logger.exception(t("📊 [AIRAGDocumentStatistics] 更新RAG命中统计失败: {e}", e=e))
+            logger.exception(t("log.ai.airagdocumentstatist_update_rag_hit_fail", e=e))
             return False
 
     @classmethod
@@ -610,7 +622,7 @@ class AIRAGDocumentStatistics(BaseIDModel, table=True):
                 await cls.full_insert_data(document_name=document_name, hit_count=hit_count)
             return True
         except Exception as e:
-            logger.exception(t("📊 [AIRAGDocumentStatistics] 更新RAG命中统计失败: {e}", e=e))
+            logger.exception(t("log.ai.airagdocumentstatist_update_rag_hit_fail", e=e))
             return False
 
 
@@ -804,5 +816,5 @@ class AIHourlyPerformance(BaseIDModel, table=True):
                 )
             return True
         except Exception as e:
-            logger.exception(t("📊 [AIHourlyPerformance] 更新小时性能统计失败: {e}", e=e))
+            logger.exception(t("log.ai.aihourlyperformance_update_hourly_performance_fa", e=e))
             return False

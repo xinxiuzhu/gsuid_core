@@ -116,7 +116,7 @@ async def test_clean_report_block_still_rendered(monkeypatch: pytest.MonkeyPatch
 
     rendered: list = []
 
-    async def fake_render(md: str, max_width: int = 0, image_format: str = "jpeg") -> bytes:
+    async def fake_render(md: str = "", **_kwargs: Any) -> bytes:
         rendered.append(md)
         return b"img"
 
@@ -127,8 +127,8 @@ async def test_clean_report_block_still_rendered(monkeypatch: pytest.MonkeyPatch
     await send_chat_result(bot, text, ev=None)
 
     assert any("方案对比" in md for md in rendered)
-    # §3 合规垫层：制品图片带免责脚注
-    assert any("不构成投资" in md for md in rendered)
+    # 制品图片脚注：来源 + 渲染函数溯源
+    assert any("Agent" in md and "render_md_to_bytes" in md for md in rendered)
 
 
 # ─────────────────────────────────────────────
@@ -181,8 +181,9 @@ def test_compact_runs_after_history_surgery() -> None:
 
     from gsuid_core.ai_core.gs_agent import GsCoreAIAgent
 
-    src = inspect.getsource(GsCoreAIAgent._execute_run_once)
-    assert src.index("_ooc_rewrite_and_send") < src.index("_compact_report_blocks_in_history")
+    # 收尾在 _run_once_settle_result：闸门收尾（内含 OOC 重说）先于 report 占位压缩
+    src = inspect.getsource(GsCoreAIAgent._run_once_settle_result)
+    assert src.index("_resolve_output_gate_after_run") < src.index("_compact_report_blocks_in_history")
 
 
 # ─────────────────────────────────────────────
@@ -369,14 +370,15 @@ def test_fund_claim_positives_still_hit() -> None:
 
 
 def test_fund_claim_never_released_by_warn_once_gate() -> None:
-    from gsuid_core.ai_core.output_firewall import NEVER_RELEASE_CATEGORIES, gate_warn_once
+    from gsuid_core.ai_core.output_gate import tool_gate_feedback
+    from gsuid_core.ai_core.output_firewall import NEVER_RELEASE_CATEGORIES
 
     assert "fund_claim" in NEVER_RELEASE_CATEGORIES
     extra: dict = {"turn_id": "turn_review_f10"}
     text = "钱已经转过去了"
-    assert gate_warn_once(extra, text) is not None
+    assert tool_gate_feedback(text, extra) is not None
     # 同轮第二次命中：身份类会放行，资金欺骗类必须继续拦
-    assert gate_warn_once(extra, text) is not None
+    assert tool_gate_feedback(text, extra) is not None
 
 
 def test_fund_rewrite_warning_is_category_specific() -> None:

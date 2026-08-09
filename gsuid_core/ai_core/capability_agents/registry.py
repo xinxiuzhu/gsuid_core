@@ -36,6 +36,7 @@ class CapabilityAgentProfile:
 
 
 def _profile_to_node(profile: CapabilityAgentProfile) -> AgentNode:
+    # plugin 名由 register_agent_node 按调用栈推断（plugins/<name>）
     return AgentNode(
         node_id=profile.profile_id,
         display_name=profile.display_name,
@@ -47,6 +48,7 @@ def _profile_to_node(profile: CapabilityAgentProfile) -> AgentNode:
         tool_names=list(profile.tool_names),
         tool_query=profile.tool_query,
         source="plugin",
+        plugin="",
     )
 
 
@@ -57,8 +59,7 @@ def register_capability_agent(profile: Union[CapabilityAgentProfile, AgentNode])
         return
     logger.warning(
         t(
-            "🤖 [CapabilityAgent] CapabilityAgentProfile 已废弃（{p0}），请迁移到"
-            " agent_node.AgentNode + register_agent_node（预算字段已被忽略）",
+            "log.ai.cap_capabilityagentprofile_agent_node_skip",
             p0=profile.profile_id,
         )
     )

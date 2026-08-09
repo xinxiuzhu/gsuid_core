@@ -44,11 +44,11 @@ _CATEGORIES: Dict[str, ApprovalCategory] = {}
 _PENDING_OPERATORS: set[str] = set()
 
 # 「完全访问」豁免名单：user 级 approval 直接放行（master 级永不豁免）。
-# 运行时状态，由前端 / 插件（如画布授权配置）经 set_full_access 维护。
+# 运行时状态，由前端 / 插件经 set_full_access 维护。
 _FULL_ACCESS_USERS: set[str] = set()
 
 # 「完全访问」可插拔解析器：插件可按会话上下文提供更细粒度的判定
-# （如画布按 user × canvas 存储授权模式）。返回 None = 不表态，回落默认名单。
+# （如按 user × 会话键存储授权模式）。返回 None = 不表态，回落默认名单。
 _FULL_ACCESS_RESOLVER: Optional[Callable[[str, Optional[Event]], Optional[bool]]] = None
 
 # tool_call 策略门的一次性放行 grant：(user_id, tool_name) -> 过期时间戳
@@ -59,7 +59,7 @@ _TOOL_GRANT_TTL = 600.0
 def register_approval_category(name: str, on_resolve: ResolveHandler, ttl_seconds: int = 1800) -> None:
     """注册一个审批领域（同名后写覆盖）。"""
     _CATEGORIES[name] = ApprovalCategory(name=name, on_resolve=on_resolve, ttl_seconds=ttl_seconds)
-    logger.debug(t("✅ [Approval] 注册审批领域: {name} (ttl={ttl_seconds}s)", name=name, ttl_seconds=ttl_seconds))
+    logger.debug(t("log.ai.approval_registered_domain_name", name=name, ttl_seconds=ttl_seconds))
 
 
 def is_master(user_id: str) -> bool:
@@ -80,8 +80,8 @@ def set_full_access(user_id: str, enabled: bool) -> None:
 def set_full_access_resolver(fn: Optional[Callable[[str, Optional[Event]], Optional[bool]]]) -> None:
     """注册「完全访问」解析器（同步、廉价内存判定；返回 None 回落默认名单）。
 
-    供需要比"全局按用户"更细粒度的调用方使用——如画布插件按
-    user × canvas(=ev.group_id) 存储授权模式。传 None 可注销。
+    供需要比"全局按用户"更细粒度的调用方使用——例如插件按
+    user × 会话键（ev.group_id）存储授权模式。传 None 可注销。
     """
     global _FULL_ACCESS_RESOLVER
     _FULL_ACCESS_RESOLVER = fn
@@ -92,7 +92,7 @@ def is_full_access(user_id: str, ev: Optional[Event] = None) -> bool:
         try:
             verdict = _FULL_ACCESS_RESOLVER(str(user_id), ev)
         except Exception as e:  # noqa: BLE001
-            logger.debug(t("✅ [Approval] 完全访问解析器异常，回落默认名单: {e}", e=e))
+            logger.debug(t("log.ai.approval_full_access_resolver_fail", e=e))
             verdict = None
         if verdict is not None:
             return verdict
@@ -153,7 +153,7 @@ async def submit(
         _PENDING_OPERATORS.add(operator)
     logger.info(
         t(
-            "✅ [Approval] 提交请求 #{p0} category={category} audience={audience} status={status}",
+            "log.ai.approval_submitted_request_category",
             p0=row.short_id,
             category=category,
             audience=audience,
@@ -210,7 +210,7 @@ async def expire_stale() -> None:
     for cat in _CATEGORIES.values():
         n = await AIApprovalRequest.expire_stale(cat.name, cat.ttl_seconds)
         if n:
-            logger.info(t("✅ [Approval] category={p0} 过期清理 {n} 条", p0=cat.name, n=n))
+            logger.info(t("log.ai.approval_category_expired_entries_cleanup", p0=cat.name, n=n))
 
 
 # webconsole 裁决身份：已过控制台登录认证，等同主人权限
@@ -294,12 +294,12 @@ async def resolve_row(
     await _refresh_pending(row.operator_user_id)
     cat = _CATEGORIES.get(row.category)
     if cat is None:
-        logger.warning(t("✅ [Approval] 请求 #{p0} 的领域 {p1} 未注册回调，仅落状态", p0=row.short_id, p1=row.category))
+        logger.warning(t("log.ai.approval_request_domain_registered_register", p0=row.short_id, p1=row.category))
         return f"{'✅ 已批准' if approved else '🚫 已拒绝'} #{row.short_id}（该领域无后续动作）。"
     try:
         return await cat.on_resolve(row, approved, note)
     except Exception as e:
-        logger.exception(t("✅ [Approval] 领域回调 {p0} 执行异常: {e}", p0=row.category, e=e))
+        logger.exception(t("log.ai.approval_domain_callback_fail", p0=row.category, e=e))
         return f"⚠️ 裁决已记录（#{row.short_id} {'批准' if approved else '拒绝'}），但后续动作执行失败：{e}"
 
 
@@ -343,7 +343,7 @@ async def tool_call_gate(ev: Optional[Event], tool_name: str, tier: str, args_re
     后台链路的权限由各自 check_func 承担。
     """
     if ev is None:
-        logger.debug(t("✅ [Approval] 工具 {tool_name} 无 ev 上下文，策略门放行（后台链路）", tool_name=tool_name))
+        logger.debug(t("log.ai.approval_name_ev_context_policy", tool_name=tool_name))
         return None
     operator = str(ev.user_id)
     if tier == "user" and is_full_access(operator, ev):

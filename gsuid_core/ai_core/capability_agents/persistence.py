@@ -47,6 +47,7 @@ class AgentNodeDTO(TypedDict, total=False):
     tool_query: str
     boundary_override: str
     source: ProfileSource
+    plugin: str
     version: int
 
 
@@ -64,6 +65,7 @@ def _node_to_dto(node: AgentNode) -> AgentNodeDTO:
         tool_query=node.tool_query,
         boundary_override=node.boundary_override,
         source=node.source,
+        plugin=node.plugin or "",
         version=node.version,
     )
 
@@ -93,6 +95,7 @@ def _dto_to_node(dto: Dict[str, Any]) -> Optional[AgentNode]:
         tool_query=str(dto["tool_query"]) if "tool_query" in dto and dto["tool_query"] else "",
         boundary_override=str(dto["boundary_override"]) if "boundary_override" in dto else "",
         source="user",
+        plugin=str(dto["plugin"]) if "plugin" in dto and dto["plugin"] else "",
     )
 
 
@@ -130,7 +133,7 @@ def save_user_profile(node: AgentNode) -> Path:
     import os
 
     os.replace(tmp_path, path)
-    logger.info(t("🤖 [CapabilityAgent] 已落盘用户节点: {p0} → {p1}", p0=node.node_id, p1=path.name))
+    logger.info(t("log.ai.cap_agent_node_user_persisted", p0=node.node_id, p1=path.name))
     return path
 
 
@@ -142,7 +145,7 @@ def delete_user_profile(node_id: str) -> bool:
     if path.exists():
         path.unlink()
     unregister_agent_node(node_id)
-    logger.info(t("🤖 [CapabilityAgent] 已删除用户节点: {node_id}", node_id=node_id))
+    logger.info(t("log.ai.cap_user_node_deleted_id", node_id=node_id))
     return True
 
 
@@ -159,18 +162,18 @@ def load_user_profiles() -> int:
             with path.open("r", encoding="utf-8") as f:
                 dto = json.load(f)
             if not isinstance(dto, dict):
-                logger.warning(t("🤖 [CapabilityAgent] 跳过不合法节点文件: {p0}", p0=path.name))
+                logger.warning(t("log.ai.cap_skip_invalid_node_file", p0=path.name))
                 continue
             node = _dto_to_node(dto)
             if node is None:
-                logger.warning(t("🤖 [CapabilityAgent] 跳过缺 id 的节点文件: {p0}", p0=path.name))
+                logger.warning(t("log.ai.cap_skip_node_file_missing", p0=path.name))
                 continue
             register_agent_node(node)
             count += 1
         except (OSError, json.JSONDecodeError, KeyError) as e:
-            logger.warning(t("🤖 [CapabilityAgent] 加载用户节点失败: {p0}: {e}", p0=path.name, e=e))
+            logger.warning(t("log.ai.cap_load_user_node", p0=path.name, e=e))
     if count:
-        logger.info(t("🤖 [CapabilityAgent] 启动加载用户节点: {count} 个", count=count))
+        logger.info(t("log.ai.cap_user_nodes_startup", count=count))
     return count
 
 

@@ -23,10 +23,9 @@ from gsuid_core.ai_core.memory.ingestion.hiergraph import AIMemHierarchicalGraph
 # 放 user_message。原实现把整段 `{persona_text}+history+指令` 同时作为 create_agent
 DECISION_USER_TEMPLATE = """现在你独自看着群里的聊天记录，思考自己要不要说点什么。
 
-【当前时间】
-{current_time}
+[当前时间：{current_time}]
 
-【群里最近发生的事】
+[群里最近发生的事]
 {history_context}
 {group_summary_section}{proactive_merge_section}{masters_section}{recent_speak_section}{staleness_section}
 
@@ -56,10 +55,10 @@ DECISION_USER_TEMPLATE = """现在你独自看着群里的聊天记录，思考�
 """  # noqa: E501
 
 
-PROACTIVE_MESSAGE_USER_TEMPLATE = """【群里最近发生的事】
+PROACTIVE_MESSAGE_USER_TEMPLATE = """[群里最近发生的事]
 {history_context}
 {proactive_merge_section}{masters_section}{staleness_section}
-【此刻你的状态】
+[此刻你的状态]
 {mood}
 
 ---
@@ -69,7 +68,7 @@ PROACTIVE_MESSAGE_USER_TEMPLATE = """【群里最近发生的事】
 不是主人发的就绝不称"主人"，认不准发言人就不用任何称呼。
 直接输出你想说的话，不要任何前缀、引号或解释。
 
-【主动发言角色约束（OOC 修复 5.8）】
+[主动发言角色约束（OOC 修复 5.8）]
 - 主动发言必须简短：≤50字，最好≤30字。你是群友随口说一句，不是写分析报告。
 - 必须保持角色口吻：用你自己的语气词和说话方式。
 - 禁止主动发表专业分析/市场评论/数据罗列（除非主人委派）。
@@ -108,7 +107,7 @@ def build_staleness_section(history: List[Any], now_ts: float) -> str:
 
 REACTIVE_GATE_TEMPLATE = """这是群聊。{speaker_desc} 最近刚和你说过话，现在 TA 又发了一条消息，但**没有**直接 @ 你。
 
-【群里最近发生的事（最后一条就是要你判断的这条）】
+[群里最近发生的事（最后一条就是要你判断的这条）]
 {history_context}
 
 ---
@@ -160,9 +159,9 @@ async def _get_group_summary_for_heartbeat(group_id: str) -> str:
             )
             row = result.scalar_one_or_none()
             if row:
-                return f"\n\n【群组历史摘要】\n{row}"
+                return f"\n\n[群组历史摘要]\n{row}"
     except Exception as e:
-        logger.debug(t("🫀 [Heartbeat] 获取群组摘要失败: {e}", e=e))
+        logger.debug(t("log.ai.heartbeat_get_group_summary", e=e))
 
     return ""
 
@@ -187,14 +186,14 @@ def _build_masters_section(history: List[Any]) -> str:
             continue
         seen.add(uid)
         name = record.user_name
-        present.append(f"{uid}({name})" if name else uid)
+        present.append(f"{name}(用户ID:{uid})" if name else f"用户ID:{uid}")
 
     if not present:
         return ""
 
     listed = "、".join(present)
     return (
-        f"\n\n【你的主人（最高权限）】{listed} 是你的主人。"
+        f"\n\n[你的主人（最高权限）] {listed} 是你的主人。"
         "对主人保持最高信任、亲昵相待、认真回应；但只有在回应**主人本人发的那条消息**时"
         "才称「主人」——先核对那条消息的发言人 ID 是否在上述名单里，别人说的话绝不冠给主人；"
         "其余人仍是普通群友，用昵称称呼即可。"
@@ -226,17 +225,17 @@ async def run_heartbeat(
         交给 ``emit_proactive_message`` 挂到主 session 的 ``linked_agents`` 上。
     """
     if not history:
-        logger.debug(t("🫀 [Heartbeat] 无历史记录，跳过"))
+        logger.debug(t("log.ai.heartbeat_history_skipping"))
         return None
 
     if not persona_name:
-        logger.warning(t("🫀 [Heartbeat] 无法获取角色名称，跳过"))
+        logger.warning(t("log.ai.heartbeat_unable_get_name_skip"))
         return None
 
     # 决策阶段只使用纯人设（角色扮演开始 + 角色资料），
     persona_content = await load_persona(persona_name)
     if not persona_content:
-        logger.warning(t("🫀 [Heartbeat] 无法加载角色资料，跳过"))
+        logger.warning(t("log.ai.heartbeat_unable_load_profile_skip"))
         return None
 
     # 决策阶段用压缩版人格（仅 Identity / Style / Tone / Presence 四要素）， 节省每次心跳 ~70% 的 persona token；
@@ -259,7 +258,7 @@ async def run_heartbeat(
     # C8：统一主动网关合并进来的语境（刚完成的定时任务结果等）
     proactive_merge_section = ""
     if extra_context:
-        proactive_merge_section = f"\n\n【你刚完成的事（可自然提及，不必生硬播报）】\n{extra_context}"
+        proactive_merge_section = f"\n\n[你刚完成的事（可自然提及，不必生硬播报）]\n{extra_context}"
 
     # C-5：把"近 1 小时我已主动发言 N 次"喂给决策 LLM，促其自我克制（与 C-3 硬上限互补）
     from gsuid_core.ai_core.heartbeat.dispatcher import get_dispatcher, make_target_key
@@ -309,7 +308,7 @@ async def run_heartbeat(
     try:
         result: str = await decision_agent.run(user_message=decision_user, budget_gate=True)
     except Exception as e:
-        logger.exception(t("🫀 [Heartbeat] 决策阶段出错: {e}", e=e))
+        logger.exception(t("log.ai.heartbeat_fail_decision_stage", e=e))
         if decision_logger is not None:
             generator_log_files.append(str(decision_logger._file_path))
             decision_logger.close()
@@ -320,35 +319,37 @@ async def run_heartbeat(
         decision_logger.close()
 
     if not result:
-        logger.debug(t("🫀 [Heartbeat] 决策阶段无返回，跳过"))
+        logger.debug(t("log.ai.heartbeat_decision_stage_nothing_skip"))
         return None
 
     # 模型输出 <SILENCE> 或 <end_turn> 表示选择不发言，直接跳过
     if result.strip() in SILENCE_MARKERS:
-        logger.debug(t("🫀 [Heartbeat] 模型输出沉默标记，保持沉默"))
+        logger.debug(t("log.ai.heartbeat_output_silence_remaining"))
         return None
 
     try:
         decision = extract_json_from_text(result)
     except (json.JSONDecodeError, ValueError) as e:
-        logger.warning(t("🫀 [Heartbeat] 决策结果 JSON 解析失败: {e}, raw={result}", e=e, result=repr(result)))
+        logger.warning(t("log.ai.heartbeat_parse_decision_result_fail", e=e, result=repr(result)))
         return None
 
     # 模型可能把决策对象包进数组（如 [{...}]），取首个 dict 归一化，非 dict 判为解析失败
     if isinstance(decision, list):
         decision = next((item for item in decision if isinstance(item, dict)), None)
     if not isinstance(decision, dict):
-        logger.warning(t("🫀 [Heartbeat] 决策结果不是预期的对象结构，跳过: raw={result}", result=repr(result)))
+        logger.warning(t("log.ai.heartbeat_decision_result_expected_skip", result=repr(result)))
         return None
     if "mood" not in decision or "should_speak" not in decision:
-        logger.warning(t("🫀 [Heartbeat] 决策对象缺少必要字段，跳过: raw={result}", result=repr(result)))
+        logger.warning(t("log.ai.heartbeat_decision_object_missing_skip", result=repr(result)))
         return None
 
     mood: str = decision["mood"]
     should_speak: bool = bool(decision["should_speak"])
     context_hook = decision["context_hook"] if "context_hook" in decision else ""
 
-    logger.debug(t("log.heartbeat.decision", should_speak=should_speak, mood=mood, context_hook=context_hook))
+    logger.debug(
+        t("log.heartbeat.speak_mood_context_hook_ok", should_speak=should_speak, mood=mood, context_hook=context_hook)
+    )
 
     try:
         statistics_manager.record_trigger(trigger_type="heartbeat")
@@ -357,13 +358,13 @@ async def run_heartbeat(
             should_speak=should_speak,
         )
     except Exception as e:
-        logger.warning(t("📊 [Heartbeat] 记录决策统计失败: {e}", e=e))
+        logger.warning(t("log.ai.heartbeat_record_decision_statistics", e=e))
 
     if not should_speak:
-        logger.debug(t("🫀 [Heartbeat] 🤫 保持沉默: {mood} ({event})", mood=mood, event=event))
+        logger.debug(t("log.ai.heartbeat_remaining_silent_mood", mood=mood, event=event))
         return None
 
-    logger.info(t("🫀 [Heartbeat] 💡 决定插话: {mood} ({event})", mood=mood, event=event))
+    logger.info(t("log.ai.heartbeat_decided_interject_mood", mood=mood, event=event))
 
     # 阶段二：生成发言 B-1：发言阶段同样把人格放 system_prompt（用完整原文 persona_text）
     message_user = PROACTIVE_MESSAGE_USER_TEMPLATE.format(
@@ -387,7 +388,7 @@ async def run_heartbeat(
     try:
         result = await output_agent.run(user_message=message_user, budget_gate=True)
     except Exception as e:
-        logger.exception(t("🫀 [Heartbeat] 生成阶段出错: {e}", e=e))
+        logger.exception(t("log.ai.heartbeat_fail_generation_stage", e=e))
         if output_logger is not None:
             generator_log_files.append(str(output_logger._file_path))
             output_logger.close()
@@ -398,11 +399,11 @@ async def run_heartbeat(
         output_logger.close()
 
     if not result or not result.strip():
-        logger.debug(t("🫀 [Heartbeat] 生成阶段无返回"))
+        logger.debug(t("log.ai.heartbeat_generation_stage_nothing"))
         return None
 
     message: str = _strip_message_quotes(result)
-    logger.info(t("🫀 [Heartbeat] 主动发言: {message}", message=repr(message)))
+    logger.info(t("log.ai.heartbeat_message_proactive", message=repr(message)))
     return mood, message, generator_log_files
 
 
@@ -433,7 +434,11 @@ def _reactive_gate_rule_prefilter(raw_text: str) -> Optional[bool]:
     body = text
     if "--- 消息 ---" in text:
         body = text.split("--- 消息 ---", 1)[-1].strip()
-    body = body.split("【当前时间】")[0].strip()
+    for _time_sep in ("[当前时间：", "[当前时间:", "【当前时间】"):
+        if _time_sep in body:
+            body = body.split(_time_sep, 1)[0]
+            break
+    body = body.strip()
     if len(body) <= 1 or _REACTIVE_SILENCE_RE.match(body):
         return False
     if len(body) <= 24 and _REACTIVE_PASS_RE.search(body):
@@ -466,7 +471,7 @@ async def run_reactive_gate(
     raw = event.raw_text if event.raw_text else (event.text or "")
     pre = _reactive_gate_rule_prefilter(raw)
     if pre is not None:
-        logger.debug(t("🫧 [ReactiveGate] 规则预筛: {pre}", pre=pre))
+        logger.debug(t("log.ai.reactivegate_pre_rule_filter", pre=pre))
         return pre
     try:
         persona_content = await load_persona(persona_name)
@@ -509,7 +514,7 @@ async def run_reactive_gate(
         # agent.run 默认返回 str，但签名是 Union[str, Any]（output_type 时返模型实例）；
         # 本门未指定 output_type，用 isinstance 守卫而非依赖隐式 AttributeError 兜底。
         if not isinstance(result, str):
-            logger.debug(t("🫧 [ReactiveGate] 返回非 str（{p0}），默认沉默", p0=type(result).__name__))
+            logger.debug(t("log.ai.reactivegate_non_str_defaulting", p0=type(result).__name__))
             return False
         if not result or result.strip() in SILENCE_MARKERS:
             return False
@@ -517,7 +522,7 @@ async def run_reactive_gate(
         try:
             decision = extract_json_from_text(result)
         except (json.JSONDecodeError, ValueError) as e:
-            logger.debug(t("🫧 [ReactiveGate] 决策 JSON 解析失败，默认沉默: {e}, raw={p0}", e=e, p0=repr(result[:80])))
+            logger.debug(t("log.ai.reactivegate_parse_decision_json_fail", e=e, p0=repr(result[:80])))
             return False
         if isinstance(decision, list):
             decision = next((item for item in decision if isinstance(item, dict)), None)

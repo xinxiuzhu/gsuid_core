@@ -17,6 +17,55 @@ from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.rag.tools import search_tools, search_tools_by_domain
 
 
+def _match_capability_agents_for_need(need: str, *, limit: int = 5) -> list[str]:
+    """按 need 文本匹配已注册能力代理，返回展示行（通用，无业务特判）。"""
+    from gsuid_core.ai_core.agent_node import list_nodes
+    from gsuid_core.ai_core.agent_node.registry import match_capability_node
+
+    need_s = (need or "").strip()
+    if not need_s:
+        return []
+    lines: list[str] = []
+    seen: set[str] = set()
+    # 整句最长关键词匹配
+    primary = match_capability_node(need_s)
+    if primary:
+        from gsuid_core.ai_core.agent_node import get_node
+
+        node = get_node(primary)
+        if node is not None:
+            when = (node.when_to_use or "").strip() or node.display_name
+            lines.append(f"- `{node.node_id}`（{node.display_name}）：{when}")
+            seen.add(node.node_id)
+    # 再扫注册表弱匹配补全
+    blob = need_s.lower()
+    for node in list_nodes():
+        if node.node_id in seen:
+            continue
+        if node.source == "persona" or node.node_id == "capability_evaluator":
+            continue
+        hay = f"{node.node_id} {node.display_name} {node.when_to_use} {' '.join(node.match_keywords)}".lower()
+        hit = False
+        for kw in node.match_keywords:
+            k = (kw or "").strip().lower()
+            if k and k in blob:
+                hit = True
+                break
+        if not hit:
+            for token in blob.replace("，", " ").split():
+                if len(token) >= 2 and token in hay:
+                    hit = True
+                    break
+        if not hit:
+            continue
+        when = (node.when_to_use or "").strip() or node.display_name
+        lines.append(f"- `{node.node_id}`（{node.display_name}）：{when}")
+        seen.add(node.node_id)
+        if len(lines) >= limit:
+            break
+    return lines
+
+
 # 不声明 capability_domain（会被 L3 按族驻留带进闲聊轮）；category 必须为 meta：
 # 落入 buildin 等保底分类会让渐进式暴露门控失效、加载的工具无人暴露（实测踩坑）。
 @ai_tools(category="meta")
@@ -62,14 +111,14 @@ async def find_tools(
             try:
                 tool_def = await tool.prepare_tool_def(run_ctx)
             except Exception as e:
-                logger.debug(t("🧠 [find_tools] 工具 {p0} prepare 失败，按不可用处理: {e}", p0=tool.name, e=e))
+                logger.debug(t("log.ai.find_tools_prepare_treated_unavailable_fail", p0=tool.name, e=e))
                 tool_def = None
             (loaded_names if tool_def else hidden_names).append(tool.name)
 
         if hidden_names:
             logger.info(
                 t(
-                    "🧠 [find_tools] {p0} 个命中工具因 visible_when 不满足被剔除: {hidden_names}",
+                    "log.ai.find_tools_matched_excluded",
                     p0=len(hidden_names),
                     hidden_names=hidden_names,
                 )
@@ -87,20 +136,28 @@ async def find_tools(
 
         logger.info(
             t(
-                "🧠 [find_tools] 为需求「{p0}」动态加载 {p1} 个工具: {loaded_names}",
+                "log.ai.find_tools_dynamically_requirement_load",
                 p0=need[:40],
                 p1=len(loaded_names),
                 loaded_names=loaded_names,
             )
         )
         listing = "\n".join(f"- {name}" for name in loaded_names)
-        return f"✅ 已加载以下工具，下一步即可直接调用：\n{listing}"
+        parts = [f"✅ 已加载以下工具，下一步即可直接调用：\n{listing}"]
+        # 通用：同步提示可委派的能力代理（插件注册的 node_id），不特判业务域
+        agent_lines = _match_capability_agents_for_need(need)
+        if agent_lines:
+            parts.append(
+                '若任务适合专职代理，请用 create_subagent(agent_profile="<node_id>", task=...) 委派：\n'
+                + "\n".join(agent_lines)
+            )
+        return "\n".join(parts)
 
     except RuntimeError as e:
-        logger.warning(t("🧠 [find_tools] AI功能未启用: {e}", e=e))
+        logger.warning(t("log.ai.find_tools_feature_enabled", e=e))
         return "⚠️ 工具检索功能未启用，无法动态加载工具。"
     except Exception as e:
-        logger.error(t("🧠 [find_tools] 工具加载失败: {e}", e=e))
+        logger.error(t("log.ai.find_tools_event", e=e))
         return f"⚠️ 工具加载失败: {str(e)}"
 
 
@@ -156,17 +213,15 @@ async def discover_tools(
 
         result_parts.append("\n提示: 如果需要使用上述工具，请调整回答，说明该任务需要调用特定工具才能完成。")
 
-        logger.info(
-            t("🧠 [DynamicToolDiscovery] 发现 {p0} 个工具用于任务: {p1}", p0=len(discovered_tools), p1=task[:50])
-        )
+        logger.info(t("log.ai.tooldisc_found_tools_task", p0=len(discovered_tools), p1=task[:50]))
         return "\n".join(result_parts)
 
     except RuntimeError as e:
         # AI功能未启用
-        logger.warning(t("🧠 [DynamicToolDiscovery] AI功能未启用: {e}", e=e))
+        logger.warning(t("log.ai.tooldisc_feature_enabled", e=e))
         return "⚠️ AI工具搜索功能未启用，无法发现新工具。"
     except Exception as e:
-        logger.error(t("🧠 [DynamicToolDiscovery] 工具发现失败: {e}", e=e))
+        logger.error(t("log.ai.tooldisc_discovery", e=e))
         return f"⚠️ 工具发现失败: {str(e)}"
 
 
@@ -226,5 +281,5 @@ async def list_available_tools(
         return "\n".join(result_parts)
 
     except Exception as e:
-        logger.error(t("🧠 [ListAvailableTools] 获取工具列表失败: {e}", e=e))
+        logger.error(t("log.ai.listavailabletools_get_list", e=e))
         return f"⚠️ 获取工具列表失败: {str(e)}"

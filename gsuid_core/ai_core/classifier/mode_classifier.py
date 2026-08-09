@@ -4,7 +4,7 @@ import random
 import asyncio
 import logging
 import threading
-from typing import Any, Dict, Optional, Protocol, Sequence
+from typing import Any, Dict, Literal, Optional, Protocol, Sequence
 from concurrent.futures import ThreadPoolExecutor
 
 from joblib import dump, load
@@ -42,7 +42,8 @@ def _is_ellipsis_followup(text: str) -> bool:
 
 
 class _UserTurnRecord(Protocol):
-    role: str
+    # 与 MessageRecord.role 的 Literal 对齐，避免 Protocol 可变属性不变性冲突
+    role: Literal["user", "assistant", "system"]
     user_id: str
     content: str
 
@@ -67,7 +68,12 @@ def collect_prior_user_turns(
         body = content
         if "--- 消息 ---" in body:
             body = body.split("--- 消息 ---", 1)[-1]
-        body = body.split("【当前时间】")[0].strip()
+        # 兼容新旧时间行：【当前时间】xxx / [当前时间：xxx]
+        for _time_sep in ("[当前时间：", "[当前时间:", "【当前时间】"):
+            if _time_sep in body:
+                body = body.split(_time_sep, 1)[0]
+                break
+        body = body.strip()
         if body:
             out.append(body)
     return out[-max_turns:]
@@ -428,7 +434,7 @@ def sync_entities_to_jieba():
             jieba.add_word(category, tag="n_know")
 
     if entity_count > 0:
-        logger.info(t("[AI] 已同步 {entity_count} 个实体到Jieba词典", entity_count=entity_count))
+        logger.info(t("log.ai.synced_entity_entities_jieba", entity_count=entity_count))
 
 
 init_jieba()
@@ -544,13 +550,13 @@ class IntentService:
                 self.model = load(self.model_path)
                 # 检查是否包含所有需要的分类
                 if len(self.model.classes_) < 3:
-                    logger.warning(t("[AI] 模型类别不足，重新训练..."))
+                    logger.warning(t("log.ai.insufficient_categories_retraining"))
                     need_train = True
                 else:
-                    logger.info(t("[AI] 意图识别模型已加载: {p0}", p0=self.model_path))
+                    logger.info(t("log.ai.intent_recognition", p0=self.model_path))
                     need_train = False
             except Exception as e:
-                logger.error(t("[AI] 模型加载失败: {e}", e=e))
+                logger.error(t("log.ai.fail_event", e=e))
                 need_train = True
 
         if need_train:
@@ -717,7 +723,7 @@ class IntentService:
         return X_raw, y
 
     def train(self):
-        logger.info(t("[AI] 开始训练新版意图模型 (v5 - 优化闲聊误判)..."))
+        logger.info(t("log.ai.train_intent_v5_optimizing"))
         X_raw, y = self._generate_enhanced_data()
         X_abstract = [smart_abstraction(text) for text in X_raw]
         X_train_dict = {"raw": X_raw, "abs": X_abstract}
@@ -762,7 +768,7 @@ class IntentService:
         pipeline.fit(X_train_dict, y)
         dump(pipeline, self.model_path)
         self.model = pipeline
-        logger.info(t("[AI] 模型训练完成。保存至: {p0}", p0=self.model_path))
+        logger.info(t("log.ai.training_saved", p0=self.model_path))
 
     def _rule_based_check(self, text: str) -> Optional[Dict[str, Any]]:
         text = text.strip()
@@ -854,7 +860,7 @@ class IntentService:
                 sync_entities_to_jieba()
                 self._entities_synced = True
             except Exception as e:
-                logger.warning(t("[AI] 实体同步失败: {e}", e=e))
+                logger.warning(t("log.ai.ai_sync_fail_entity_failed", e=e))
 
         rule_result = self._rule_based_check(text)
         if rule_result:
@@ -902,8 +908,8 @@ class IntentService:
         2. 单句先判为闲聊时，再用拼接兜底一次（ContextJoin）；
         3. 省略式跟进 +（上轮真用过工具 **或** 上文用户句本身是工具/问答）→ 结构升级为工具。
 
-        闲聊意图本身仍允许轻量工具（装配侧 LITE + 保底/驻留），本函数只负责别把
-        「然后呢」这类跟进误判成纯寒暄而砍掉工具/规程。
+        装配侧已不再因 intent=闲聊 砍向量预装；本函数仍尽量减少「然后呢」类跟进
+        被标成纯寒暄，以免输出风格被压成极短句、或连续无工具计数被豁免。
         """
         loop = asyncio.get_running_loop()
         text_s = (text or "").strip()
@@ -947,17 +953,24 @@ class IntentService:
             if result2.get("intent") in ("工具", "问答") and float(result2.get("conf") or 0) >= 0.45:
                 result = _keep_current_text(result2, "ContextJoin")
 
-        # ③ 结构：省略跟进不得当纯寒暄
-        if result.get("intent") == "闲聊" and is_ellipsis:
-            if prev_turn_used_tools:
+        # ③ 结构：省略跟进 / 上轮刚用过工具时，不得当纯寒暄砍工具链
+        if result.get("intent") == "闲聊":
+            if is_ellipsis and prev_turn_used_tools:
                 result = {
                     "text": text,
                     "intent": "工具",
                     "conf": 0.92,
                     "reason": "Structural: ellipsis follow-up after tools",
                 }
-            elif priors:
-                # 上轮 Agent 可能最终只吐了文本（ToolCall 不在最后一条 ModelResponse），
+            elif prev_turn_used_tools and (is_short or is_ellipsis) and float(result.get("conf") or 0) < 0.9:
+                # 上轮真调了工具 + 本轮短句/低置信闲聊：多半是追问，升为工具
+                result = {
+                    "text": text,
+                    "intent": "工具",
+                    "conf": 0.88,
+                    "reason": "Structural: short/ambiguous after tools",
+                }
+            elif is_ellipsis and priors:
                 prior_toolish = False
                 for p in reversed(priors[-3:]):
                     pr = await loop.run_in_executor(self.executor, self._sync_predict, p)
@@ -1011,14 +1024,14 @@ class IntentService:
 
                         logger.info(
                             t(
-                                "[AI] 向量兜底命中: {text} -> {p0}",
+                                "log.ai.vector_fallback_hit_text",
                                 text=text,
                                 p0=hits[0].payload.get("title", "Unknown"),
                             )
                         )
                         return {"text": text, "intent": "问答", "conf": round(hits[0].score, 4), "reason": "VectorHit"}
                 except Exception as e:
-                    logger.trace(t("[AI] 向量兜底检索失败: {e}", e=e))
+                    logger.trace(t("log.ai.vector_fallback_retrieval", e=e))
 
         return result
 
