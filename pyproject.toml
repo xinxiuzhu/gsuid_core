@@ -53,6 +53,7 @@ dependencies = [
     "markdownify>=1.2.2",
     "onnxruntime>=1.24.1",
     "pytakumi>=0.1.0",
+    "bilibili-api>=4.1.0",
 ]
 name = "gsuid-core"
 version = "0.10.7"

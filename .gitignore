@@ -674,6 +674,7 @@ data
 core_help.jpg
 gs_restart.sh
 gsuid_core/plugins/*
+!gsuid_core/plugins/BOTCTL/
 !gsuid_core/utils/backup
 logs
 .pdm-python
