@@ -4,7 +4,7 @@
 >
 > 目标：让 agent 生成的 HTML 能被本项目稳定渲染成适合 IM 发送的图片。
 >
-> 最后验证：2026-07-28，`pytakumi==0.1.0`，Windows + 项目内置 `MiSans-Bold.ttf`。
+> 最后验证：2026-08-15，`pytakumi==0.1.0`，Windows + 项目内置 `MiSansVF.ttf`（可变字体，wght 150–700）。
 
 ---
 
@@ -28,7 +28,7 @@ Takumi / pytakumi 是一个「HTML/CSS → 位图」的离线渲染引擎，适�
 
 项目中已有共享渲染器，会注册：
 
-- `MiSans`：中文主字体，来自 `gsuid_core/utils/fonts/MiSans-Bold.ttf`。
+- `MiSans`：中文主字体，来自 `gsuid_core/utils/fonts/MiSansVF.ttf`（可变字体；**不要**再注册静态 Bold 同名抢档）。
 - `Mono`：等宽字体，自动查找 Consolas / Cascadia Mono / Menlo / DejaVu Sans Mono 等；找不到时回退 MiSans。
 
 所以中文内容必须走项目封装，否则可能出现中文豆腐块、缺字或代码不等宽。
@@ -131,7 +131,7 @@ img = await render_summary_card(
     /* 暗底标题必须显式浅色，勿只写字号靠继承 */
     h1, h2, .title, .headline, .section-title {
       color: #edf4ff;
-      font-weight: 800;
+      font-weight: 630;
     }
     .card {
       width: 100%;
@@ -223,7 +223,8 @@ safe = html.escape(user_text, quote=True)
 |---|---:|
 | `font-family` | ✅，但只能使用已注册字体 |
 | `font-size` | ✅ |
-| `font-weight` | ✅ |
+| `font-weight` | ✅，驱动 VF `wght` 轴（本项目 MiSans 轴 150–700，800/900 不会更粗） |
+| `font-variation-settings` | ✅，如 `"wght" 330` |
 | `line-height` | ✅ |
 | `letter-spacing` | ✅ |
 | `text-transform:uppercase` | ✅ |
@@ -360,7 +361,27 @@ font-family: "MiSans", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-se
 
 项目封装会自动把 `MiSans` 加入 `font_families`，但 CSS 里也建议显式写上。
 
-### 7.2 等宽字体
+共享 Renderer **只**注册这一张 VF，且 **不传** `weight=`（否则整张钉死）。
+不要同时注册 `MiSans-Bold.ttf` 为 `"MiSans"`，否则 700 档会被静态面短路。
+
+### 7.2 字重表（MiSans VF）
+
+轴范围 **150–700**（不是 CSS 标准 100–900）。官方实例：Regular=330，Semibold=520，Bold=630，Heavy=700。
+
+| 角色 | `font-weight` | 说明 |
+|---|---|---|
+| 正文 | 330 或 400 | 400 介于 Medium 与 Demibold，比官方 Regular 略粗 |
+| 小节 / badge | 520 | Semibold |
+| 标题 h1/h2 | 630 | 官方 Bold |
+| 超大数字 / 强调 | 700 | 轴顶 Heavy |
+
+`font-weight: 800` / `900` 会被夹到 700，**不会更黑**。精确打官方实例可用：
+
+```css
+font-variation-settings: "wght" 330;
+```
+
+### 7.3 等宽字体
 
 代码块使用项目注册的 `Mono`：
 
@@ -385,7 +406,7 @@ white-space: pre-wrap;
 ">print("hello")</pre>
 ```
 
-### 7.3 安全符号
+### 7.4 安全符号
 
 MiSans 对部分符号覆盖不完整。优先使用以下符号：
 
@@ -443,15 +464,45 @@ from gsuid_core.utils.html_render import render_html_to_bytes
 
 ### 8.4 IM 场景不要写太小的字
 
-聊天窗口里图片会被压缩。建议：
+聊天窗口（QQ）会按气泡宽度缩小整图。2x 栅格已经够清，糊通常是字相对画布太小。
 
-- 正文 ≥ 14px。
-- 标题 ≥ 24px。
-- 辅助文字 ≥ 12px。
-- 卡片宽度 640~800px。
-- 需要高清可传 `dpi=192`。
+- 逻辑宽 **800～1000**（`render_html_to_image` 硬上限 1000）。不要开 1240。
+- 正文 ≥ 16px。
+- 标题 ≥ 22px。
+- 辅助文字 / badge ≥ 13px。
+- 需要高清保持 `dpi=192`（dpr=2）即可，不要靠再加宽。
+- badge 不要写 `box-sizing:border-box` + 极窄 padding（Takumi 会把字画出色块）。
 
-### 8.5 修饰色被基类盖掉（class 优先级）
+### 8.5 真图表用 `render_chart_spec`，不要 CSS 色条冒充
+
+渲染引擎无 JS。要画对比/走势/占比，先调 `render_chart_spec` 拿 `<svg>` 再嵌进 HTML。
+
+```python
+# 多实体对比：每个实体一个 series.name，不要把身份写进单柱 label
+svg = await render_chart_spec(
+    ctx,
+    type="bar",
+    signed=True,          # 仅当值有正负含义
+    legend=True,
+    title="阶段对比",
+    series=[
+        {"name": "对象甲", "data": [{"label": "近30日", "value": 2.9}, {"label": "近3月", "value": -4.2}]},
+        {"name": "对象乙", "data": [{"label": "近30日", "value": 1.7}, {"label": "近3月", "value": -1.5}]},
+    ],
+)
+```
+
+硬规则：
+
+- 系列身份色 ≠ 升/降色。`signed` 打开时红/绿只表示符号，图例画 `+/−`。
+- 缺测点断线，禁止补 0 造成假下跌。
+- 禁止把两个来源的分歧画成两根未标注的柱；源数据是点值就画点值。
+- 禁止用 `.track` 扁条 / 纯 CSS 色条冒充折线或柱图。
+- 类目名由工具保留（约 18 字），不要在 HTML 里再截成 8 字。
+
+回归：`tests/test_chart_encoding_and_inflight.py`。
+
+### 8.6 修饰色被基类盖掉（class 优先级）
 
 ```css
 /* 错：.item .value 特异性更高，.up/.down 永不生效 */
@@ -462,7 +513,7 @@ from gsuid_core.utils.html_render import render_html_to_bytes
 .item .value.down { color:#fca5a5; }
 ```
 
-### 8.6 语义色不要一页多套
+### 8.7 语义色不要一页多套
 
 同一页先定 3～4 个语义角色色并贯彻；暗底强调用浅 tint（`#fca5a5` `#6ee7b7` `#fde68a`）。
 正文 / 底栏 / pill 不要各用一套互不相关的红绿金。
@@ -506,7 +557,7 @@ body {{
 }}
 .title {{
   font-size:28px;
-  font-weight:800;
+  font-weight:630;
   line-height:1.3;
   margin-bottom:18px;
 }}
@@ -549,6 +600,7 @@ async def render_card(title: str, lines: list[str]) -> bytes:
 - [ ] 是否优先使用了 `im_templates`？
 - [ ] 是否通过 `render_html_to_bytes` 渲染，而不是裸调 pytakumi？
 - [ ] 中文字体栈是否包含 `MiSans`？
+- [ ] 字重是否落在 330–700（标题 630 / 正文 330–400；勿写 800/900）？
 - [ ] 代码块是否使用 `"Mono", Consolas, Menlo, monospace`？
 - [ ] 布局是否主要使用 flexbox？
 - [ ] 是否避免了 `display:table`、`float`、原生 `<ul>` marker？
@@ -556,7 +608,8 @@ async def render_card(title: str, lines: list[str]) -> bytes:
 - [ ] 用户内容是否 HTML 转义？
 - [ ] 是否避免使用 `✗`、`✘`、`▸` 等可能缺字的符号？
 - [ ] 空内容是否有兜底，避免高度为 0？
-- [ ] 字号是否适合 IM 小图阅读？
+- [ ] ≥3 个可比数值是否先 `render_chart_spec` 再嵌 SVG（禁止 CSS 色条冒充图）？
+- [ ] 多实体对比是否用 `series`+图例，而不是把身份拍扁进 label？
 
 ---
 
@@ -566,6 +619,7 @@ async def render_card(title: str, lines: list[str]) -> bytes:
 - IM 模板：`gsuid_core/utils/html_render/im_templates.py`
 - 迁移回归测试：`tests/test_pytakumi_migration.py`
 - 模板测试：`tests/test_im_templates.py`
+- 图表编码：`tests/test_chart_encoding_and_inflight.py` / `gsuid_core/ai_core/buildin_tools/chart_svg.py`
 
 运行验证：
 

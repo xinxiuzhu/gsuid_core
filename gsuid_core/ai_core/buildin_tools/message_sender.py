@@ -222,10 +222,13 @@ async def send_message_by_ai(
                     except ValueError as e:
                         logger.warning(t("log.ai.buildintools_rm_get_image_id", image_id=image_id, e=e))
                         if "找不到资源" in str(e):
+                            # 交付校验（方案九）：句柄失效给出可执行出路——重委派渲染，
+                            # 而不是死胡同文案让模型卡在原地或谎报已发。
                             return (
-                                f"❌ 找不到资源ID: {image_id}（既不在 Kanban artifact 表，"
-                                f"也不在 RM 临时资源池）。可能 ID 错了 / artifact 已过期 / "
-                                f"代理执行未实际登记 artifact——请确认。"
+                                f"❌ 资源ID: {image_id} 无法解析（artifact 不存在或已过期，"
+                                f"可能是渲染子任务未真正出图）。请重新 "
+                                f'create_subagent(agent_profile="render_agent", task=原事实包) '
+                                f"再委派一次出图；勿再发送该 ID，勿向用户声称已发图。"
                             )
                         return f"❌ 资源ID: {image_id} 数据转换失败: {e}"
                 elif isinstance(kanban_payload, bytes):
@@ -314,6 +317,12 @@ async def send_message_by_ai(
         if throttle_key is not None:
             _PER_TURN_SEND_MESSAGE_COUNT[throttle_key] = _PER_TURN_SEND_MESSAGE_COUNT.get(throttle_key, 0) + 1
 
+        # 交付终局信号：**台词**已随工具发出（media-only 不算，留一句收尾额度）。
+        # loop 据此把本 run 置为 delivered 终局态——交付后对用户只许 <SILENCE>，
+        # 杜绝「任务已完成…」状态汇报 OOC（结构信号，非文本关键词判定）。
+        if text:
+            tool_ctx.extra["delivered_with_speech"] = True
+
         content_desc = []
         if text:
             content_desc.append("文本")
@@ -344,53 +353,3 @@ async def send_message_by_ai(
     except Exception as e:
         logger.exception(t("log.ai.buildintools_event", e=e))
         return f"发送失败：{str(e)}"
-
-
-@ai_tools(category="self")
-async def set_session_reply_mute(
-    ctx: RunContext[ToolContext],
-    duration_minutes: int = 60,
-    reason: str = "",
-) -> str:
-    """暂停本会话自动应答一段时间（框架静默，非角色扮演）。
-
-    静默期内非主人消息不会进入主 Agent；主人硬触发会自动解除静默。
-    用于用户明确要求「别回消息 / 休息 N 小时」等场景。
-
-    Args:
-        ctx: 工具上下文
-        duration_minutes: 静默分钟数，1～240
-        reason: 可选备注（仅日志）
-    """
-    tool_ctx: ToolContext = ctx.deps
-    ev = tool_ctx.ev
-    if ev is None or not ev.session_id:
-        return "设置失败：无会话信息"
-    mins = max(1, min(int(duration_minutes), 240))
-    from gsuid_core.ai_core.session_mute import set_session_mute
-
-    until = set_session_mute(ev.session_id, float(mins * 60))
-    logger.info(
-        t(
-            "log.ai.session_mute_set_session",
-            session=ev.session_id,
-            minutes=mins,
-            reason=(reason or "")[:80],
-            until=until,
-        )
-    )
-    return f"✅ 已设置本会话静默 {mins} 分钟（框架层，到期自动恢复）。"
-
-
-@ai_tools(category="self")
-async def clear_session_reply_mute(ctx: RunContext[ToolContext]) -> str:
-    """立即解除本会话的框架静默窗口。"""
-    tool_ctx: ToolContext = ctx.deps
-    ev = tool_ctx.ev
-    if ev is None or not ev.session_id:
-        return "解除失败：无会话信息"
-    from gsuid_core.ai_core.session_mute import clear_session_mute
-
-    if clear_session_mute(ev.session_id):
-        return "✅ 已解除本会话静默。"
-    return "ℹ️ 当前本会话未处于静默。"

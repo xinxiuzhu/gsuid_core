@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Any, Sequence
+from typing import Sequence
 
 from sqlalchemy.exc import SQLAlchemyError
 from pydantic_ai.usage import UsageLimits
@@ -33,11 +33,14 @@ from gsuid_core.ai_core.agent_run.support import (
     _STATUS_INQUIRY_HINT,
     _INTERACTIVE_CREATE_BY,
     _append_user_text,
+    _ensure_inner_os_on_first_user,
     _capability_exclusive_tool_names,
 )
 from gsuid_core.ai_core.configs.ai_config import ai_config
+from gsuid_core.ai_core.control.directive import DISPUTE_EXTRA_KEY, is_control_envelope
 from gsuid_core.ai_core.agent_run.budget_ctx import _current_budget_scope
 from gsuid_core.ai_core.agent_run.speech_policy import (
+    spoken_user_body_len,
     resolve_speech_policy,
     looks_like_status_inquiry,
 )
@@ -45,7 +48,7 @@ from gsuid_core.ai_core.agent_run.user_turn_ctx import get_user_turn_id, set_use
 
 
 class PreparePhase(RunOnceHost):
-    async def _run_once_budget_gate(self, st: RunOnceState) -> Any:
+    async def _run_once_budget_gate(self, st: RunOnceState) -> object:
         """预算闸门：超额返回早退值；放行返回 ``BUDGET_GATE_PASS``。"""
         # ============ 预算闸门 + scope 解析（统一入口）============
         # 仅 st.budget_gate=True 的自主入口在此早退；放行/未启用/豁免均零额外开销。
@@ -97,6 +100,10 @@ class PreparePhase(RunOnceHost):
         st.tool_call_list = []  # 用于记录本次运行中被调用的工具列表，供后续统计使用
         # 同引用暴露给 _execute_run 的干净重试分支：判断失败前是否已有工具副作用（F14）
         self._last_attempt_tool_calls = st.tool_call_list
+        self._last_attempt_delegated_render = False
+        self._last_attempt_image_sent = False
+        self._last_attempt_pending_async = False
+        self._last_attempt_has_status_tool = False
         st.wall_nudged = False  # C-4 墙钟软预算：每 run 至多注入一次收敛提示
         # 出戏防火墙拦下的文本段（§D.4）：iter 结束后走"提醒→重说→放行"闭环
         st.ooc_blocked = []
@@ -122,8 +129,12 @@ class PreparePhase(RunOnceHost):
         st.pending_async_delivery = False
         st.image_sent_this_run = False
         st.has_status_tool_call = False
-        st.report_speech_blocked = False
+        st.presentation_mismatch = False
+        st.presentation_withheld = []
+        st.presentation_withheld_reasons = []
         st.wait_comfort_sent = False
+        st.in_flight_short = False
+        st.render_ack_seen = False
 
         # 使用自定义迭代次数限制（如果有），否则使用配置默认值
         if self.max_iterations is not None:
@@ -157,19 +168,30 @@ class PreparePhase(RunOnceHost):
         st.blocked_exclusive = _capability_exclusive_tool_names() if self.create_by in _INTERACTIVE_CREATE_BY else set()
         # 出站：主人格交互会话；Kanban_Relay 是人格播报专用（非能力代理）。
         # 能力代理 / 通用 subagent 一律 False——产物只回上游，由主人格或 Relay 发。
+        #
+        # ``TEST``（本地评测端点）与 Chat/Agent 同为**交互主人格**——它已在
+        # ``_INTERACTIVE_CREATE_BY`` 里。此处漏掉它会让评测里的主人格拿到
+        # 「当前为能力代理/子 Agent，禁止直发」的回执：模型据此认为自己没有出站权，
+        # 委派出图后交付不出去，直接吐 ``<SILENCE>``（实测把 data_rendering 整域打成 0/4）。
+        # 评测路径与生产路径的行为必须一致，否则基准测的不是生产。
         st.allow_outbound = self.create_by == "Kanban_Relay" or (
-            self.create_by in ("Chat", "Agent") and not self.is_subagent
+            self.create_by in ("Chat", "Agent", "TEST") and not self.is_subagent
         )
         st.run_extra = {
             "turn_id": st.turn_id,
             "agent_run_id": st.turn_id,
             "run_sent_texts": self._run_sent_texts,
+            # 同引用透传：纠正轮里 dispute_directive 的申辩要能被外层 settle 读到
+            DISPUTE_EXTRA_KEY: self._run_disputes,
         }
         if st.user_turn_id:
             st.run_extra["user_turn_id"] = st.user_turn_id
-        # 框架回灌：强制 @ 任务 owner（st.ev.user_id 已由 Kanban 填为 owner）
+        # 框架身份由**类型**判定（is_framework_injection / <control> 信封），
+        # 前缀嗅探只作遗留兼容：靠前缀曾漏掉 `（系统校验·内部轮）` 导致控制面穿数据面。
         st.fw_msg = isinstance(st.user_message, str) and (
-            st.is_framework_injection or st.user_message.lstrip().startswith("[框架·")
+            st.is_framework_injection
+            or is_control_envelope(st.user_message)
+            or st.user_message.lstrip().startswith("[框架·")
         )
         if st.fw_msg and st.ev is not None and st.ev.user_id:
             st.run_extra["at_user_id"] = str(st.ev.user_id)
@@ -188,6 +210,7 @@ class PreparePhase(RunOnceHost):
             has_active_task=st.has_active_task,
             user_text=_probe_for_policy,
         )
+        st.in_flight_short = (not st.fw_msg) and st.has_active_task and spoken_user_body_len(_probe_for_policy) <= 48
         st.context = ToolContext(
             bot=st.bot,
             ev=st.ev,
@@ -230,20 +253,12 @@ class PreparePhase(RunOnceHost):
             st.final_user_message = _append_user_text(st.final_user_message, f"\n\n{st.rag_context}")
             logger.info(i18n_t("log.agent.added_rag_context"))
 
-        # DS 专属角色扮演模式（inner_os）：仅在 Chat 模式首轮 st.user_message 末尾追加
-        if (
-            self.create_by == "Chat"
-            and not self.history
-            and ai_config.get_config("enable_deepseek_rp").data
-            and isinstance(st.final_user_message, str)
-        ):
-            st.final_user_message = f"{st.final_user_message}{INNER_OS_MARKER}"
-            logger.info(i18n_t("log.agent.ds_inject"))
-
         # 连续无工具调用检测：连续两轮只推脱不调工具时注入强制提醒。闲聊类意图豁免（§15）
         # 豁免口径唯一定义在 _PROGRESSIVE_TOOLS_SKIP_INTENTS（评审修复 E12）。
+        # 框架纠正轮不要再粘这条：settle 在启动纠正前已 +1，会污染 <control> 信封。
         if (
-            self.create_by in ["Chat", "Agent"]
+            not st.fw_msg
+            and self.create_by in ["Chat", "Agent"]
             and self._consecutive_no_tool_rounds >= 2
             and st.intent not in _PROGRESSIVE_TOOLS_SKIP_INTENTS
         ):
@@ -264,7 +279,7 @@ class PreparePhase(RunOnceHost):
         st.followup_detected = False
         st.tg = st.turn_graph
         st.cheap = st.cheap_gate
-        if self.create_by in _INTERACTIVE_CREATE_BY:
+        if self.create_by in _INTERACTIVE_CREATE_BY and not st.fw_msg:
             _cur_text = st.last_user_question
             _probe = st.ev.raw_text if st.ev is not None and st.ev.raw_text else st.last_user_question
             _is_tome = bool(st.ev.is_tome) if st.ev is not None else False
@@ -325,6 +340,11 @@ class PreparePhase(RunOnceHost):
         if st.status_inquiry and st.has_active_task and self.create_by in ("Chat", "Agent"):
             st.final_user_message = _append_user_text(st.final_user_message, _STATUS_INQUIRY_HINT)
             logger.debug(i18n_t("log.agent.scaffold_ellipsis_style_follow_inject"))
+        if not st.fw_msg and st.has_active_task:
+            st.in_flight_short = spoken_user_body_len(st.last_user_question) <= 48
+
+        # 先钉一次：本轮 lean 必须带 marker，否则 _relean 会从持久 history 剥掉。
+        self._inject_deepseek_rp_marker(st)
 
         # 截断日志输出中的 base64 数据，避免日志过长
         truncated_msg = _truncate_message_for_log(st.final_user_message)
@@ -339,3 +359,16 @@ class PreparePhase(RunOnceHost):
 
         if st.tools is None:
             st.tools = []
+
+    def _inject_deepseek_rp_marker(self, st: RunOnceState) -> None:
+        if self.create_by != "Chat" or not ai_config.get_config("enable_deepseek_rp").data:
+            return
+        st.final_user_message, st.lean_user_message, where = _ensure_inner_os_on_first_user(
+            self.history,
+            st.final_user_message,
+            st.lean_user_message,
+            INNER_OS_MARKER,
+            is_framework=st.fw_msg,
+        )
+        if where in ("history", "current"):
+            logger.info(i18n_t("log.agent.ds_inject"))

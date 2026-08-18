@@ -181,7 +181,7 @@ def test_code_block_is_kept_as_text_not_rendered(_md_image_cfg) -> None:
 def test_bold_headers_and_numbered_list_render_as_image(_md_image_cfg) -> None:
     """agent 研报常用「整行粗体小标题 / 编号建议」而非表格或 # 标题——也必须命中出图。
 
-    还原 session ...644256 里药明康德那条被拆成 ~8 段的回复（有粗体小标题 + 编号列表，无表格）。
+    还原某研报会话里药明康德那条被拆成 ~8 段的回复（有粗体小标题 + 编号列表，无表格）。
     """
     _md_image_cfg(min_chars=80)
     report = (
@@ -221,15 +221,14 @@ def test_leaked_res_handle_is_stripped() -> None:
 
 
 def test_all_real_prefixes_are_stripped() -> None:
-    """前缀须与 RM/artifact 实际生成对齐：img_/aud_/vid_（RM）、res_（artifact）。
-
-    锁死回归：曾误写成 rec_/video_（并漏掉 vid_），导致视频句柄漏给用户。
-    """
+    """前缀须与 RM/artifact/委派对齐：img_/aud_/vid_、res_、dlg_（含带连字符 UUID）。"""
     for prefix, raw in (
         ("res_", "看这个 `res_abc123def456` 好吧"),
         ("img_", "图在 img_00ff8821 里"),
         ("aud_", "音频 aud_deadbeef 听"),
         ("vid_", "视频 vid_0a1b2c3d 看"),
+        ("dlg_", "后台任务 dlg_0123456789ab 查一下"),
+        ("dlg_", "后台任务 dlg_550e8400-e29b-41d4-a716-446655440000 查一下"),
     ):
         out = _strip_resource_handles(raw)
         assert prefix not in out, f"漏了前缀 {prefix}: {raw!r} -> {out!r}"
@@ -343,8 +342,18 @@ def test_preference_injection_is_not_gated_off_by_chitchat_intent() -> None:
 
 
 def test_chitchat_turn_still_passes_empty_contexts_not_none() -> None:
-    """闲聊轮必须传**空 list**（只留 general/纠错），而不是 None（= 不过滤，全量注入）。"""
-    src = _src("gsuid_core/ai_core/handle_ai.py")
+    """闲聊轮必须传**空 list**（只留 general/纠错），而不是 None（= 不过滤，全量注入）。
 
-    assert "_pref_contexts: list[str] = []" in src, "闲聊轮的 preference_contexts 不是空 list"
-    assert "_pref_inject = True" in src, "偏好注入没有恒开"
+    锁点变更（§9.3 锁跟着代码搬）：
+    - 「恒开」在 ``cognition.facade.inject_memory_slice``（⑧ 与工具路径同一入口）；
+    - 「闲聊传空 list」在 ``kits/memory/kit.py``（H05 的能力域过滤在套件内部）。
+    """
+    kit = _src("gsuid_core/ai_core/kits/memory/kit.py")
+    facade = _src("gsuid_core/ai_core/cognition/facade.py")
+
+    assert "pref_contexts: List[str] = []" in kit, "闲聊轮的 preference_contexts 不是空 list"
+    assert 'if ctx.intent != "闲聊":' in kit, "能力域过滤的意图分支没了"
+    assert "inject_preferences=True" in facade, "偏好注入没有恒开"
+    # 不许再出现「按意图整轮关掉偏好」的写法
+    for src in (kit, facade, _src("gsuid_core/ai_core/handle_ai.py")):
+        assert "inject_preferences=intent" not in src.replace(" ", "")

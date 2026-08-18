@@ -12,13 +12,24 @@ from __future__ import annotations
 import re
 from typing import Literal, Sequence
 
+from gsuid_core.ai_core.utils import is_silence_marker
+from gsuid_core.ai_core.content_guard import is_observation_untrusted
+from gsuid_core.ai_core.capability_agents.delegation_contracts import (
+    is_timeless_aggregate as _is_timeless_aggregate,
+    fact_pack_is_multi_point as _fact_lines_multi_point,
+)
+
 SpeechPolicy = Literal[
     "free",
     "silence_only",
     "status_ok",
     "framework_nudge",
     "framework_deliver",
+    "delivered",
 ]
+
+# 单轮主通道可见台词上限（兜底；DELIVERED 终局态落地后主要是防多 TextPart 刷屏）
+MAIN_CHANNEL_VISIBLE_LIMIT = 3
 
 # 用户追问进度：疑问/催促闭类（非业务域）
 _STATUS_INQUIRY_RE = re.compile(
@@ -53,10 +64,39 @@ _PROCESS_META_RE = re.compile(
     r"(时效存疑|自己再验|数据没刷|没刷出来|没法.{0,8}编数字|"
     r"回炉了?你再|回炉|系统校验|框架[·・.]任务|产物句柄|"
     r"long_structured|tool_return|inline_head|"
-    r"how_to_read|persisted\s+id|"
-    r"专域(报价|API)|当前市价|最新读数)",
+    r"how_to_read|persisted\s+id)",
     re.IGNORECASE,
 )
+
+# 交付状态汇报：模型以系统日志口吻向用户播报「任务/发送已完成、无需再说话」。
+# 双信号共现才命中（精度优先）：
+#   A 交付/完成播报 —— (任务|图|消息|产物|结果) × 完成态发送动词；
+#   B 行政化收束 —— 「无需/不必 + 追加/补充/发言/回复」的自我静默判定。
+# 只说「已经发给你啦」（面向用户的自然交付）不命中 B，放行。
+_DELIVERY_REPORT_RE = re.compile(
+    r"(任务|图(片)?|消息|产物|结果|数据)[^。！？\n]{0,8}(已完成|完成|已发送|已发给|已交付|已发出|发送完毕|已经发送|已经完成)"
+    r"|(已|已经)?(发送给|发给|发到)\s*[^\s，。！？]{1,12}",
+    re.IGNORECASE,
+)
+_DELIVERY_META_CLOSE_RE = re.compile(
+    r"(无需|不必|不用|无须)[^。！？\n]{0,6}(追加|补充|再?发言|再?回复|多说|多言|赘述)",
+    re.IGNORECASE,
+)
+
+
+def looks_like_delivery_status_narration(text: str) -> bool:
+    """是否交付状态汇报（系统日志腔对用户播报，OOC）。
+
+    判据 = 交付/完成播报 × 行政化自我静默 同段共现；单一信号不命中，
+    保护「已经发给你啦」这类面向用户的自然交付句。
+    """
+    body = (text or "").strip()
+    if not body or is_silence_marker(body):
+        return False
+    if _DELIVERY_META_CLOSE_RE.search(body) is None:
+        return False
+    return _DELIVERY_REPORT_RE.search(body) is not None
+
 
 # 等待安慰 / 委派前「会比较久」声明（步骤 3）
 _WAIT_COMFORT_RE = re.compile(
@@ -136,17 +176,40 @@ _STATUS_ZERO_TOOL_NUDGE = (
 )
 
 
-def looks_like_status_inquiry(text: str, *, has_active_task: bool) -> bool:
-    """用户是否在追问进行中任务进度（结构/催促闭类）。"""
+def spoken_user_body(text: str) -> str:
+    """剥装配外壳后的真人句。通道粘连的 ASCII 唤醒词不是话题。"""
     body = (text or "").strip()
     if not body:
-        return False
-    # 剥掉装配外壳，只看真人句
-    if "--- 消息 ---" in body:
+        return ""
+    had_envelope = "--- 消息 ---" in body
+    if had_envelope:
         body = body.split("--- 消息 ---", 1)[-1]
     if "[当前时间" in body:
         body = body.split("[当前时间", 1)[0]
     body = body.strip()
+    i = 0
+    while i < len(body) and body[i] in "@＠":
+        i += 1
+    j = i
+    while j < len(body) and body[j].isascii() and (body[j].isalnum() or body[j] in "_-"):
+        j += 1
+    # 仅「@/装配壳 + ASCII 直接贴非 ASCII」才剥前缀，避免误切英文句首词。
+    glued = j > i and j < len(body) and not body[j].isascii() and not body[j].isspace()
+    if glued and (had_envelope or i > 0):
+        body = body[j:].lstrip()
+    return body.strip()
+
+
+def spoken_user_body_len(text: str) -> int:
+    """真人句长度（用于在途短轮瘦工具池，不靠话题词）。"""
+    return len(spoken_user_body(text))
+
+
+def looks_like_status_inquiry(text: str, *, has_active_task: bool) -> bool:
+    """用户是否在追问进行中任务进度（结构/催促闭类）。"""
+    body = spoken_user_body(text)
+    if not body:
+        return False
     if _STATUS_INQUIRY_RE.search(body):
         return True
     if has_active_task and len(body) <= 12 and _STATUS_SHORT_NUDGE_RE.match(body):
@@ -154,10 +217,26 @@ def looks_like_status_inquiry(text: str, *, has_active_task: bool) -> bool:
     return False
 
 
+def looks_like_numeric_recitation(text: str) -> bool:
+    """台词是否在念多点读数（应上图，不是群聊气泡）。
+
+    判据是读数密度：小数、百分号、或 ≥4 位有效数字。日期片段与两位数不计。
+    """
+    body = (text or "").strip()
+    if len(body) < 80:
+        return False
+    if is_silence_marker(body):
+        return False
+    nums = re.findall(r"(?<![\d.])(?:\d+\.\d+%?|\d{1,3}%|\d{4,})(?![\d.])", body)
+    if len(nums) >= 6:
+        return True
+    return len(nums) >= 4 and len(body) >= 140
+
+
 def claims_premature_delivery(text: str) -> bool:
     """是否在宣称交付物已就绪（完成态口吻）。"""
     body = (text or "").strip()
-    if not body or body in ("<SILENCE>", "SILENCE"):
+    if not body or is_silence_marker(body):
         return False
     return bool(_PREMATURE_DELIVERY_RE.search(body))
 
@@ -165,7 +244,7 @@ def claims_premature_delivery(text: str) -> bool:
 def looks_like_empty_handoff(text: str) -> bool:
     """是否空交付/摆烂：声称有料却推诿、不出图也不给要点。"""
     body = (text or "").strip()
-    if not body or body in ("<SILENCE>", "SILENCE"):
+    if not body or is_silence_marker(body):
         return False
     if looks_like_wait_comfort(body):
         return False
@@ -180,7 +259,7 @@ def looks_like_empty_handoff(text: str) -> bool:
 def looks_like_process_meta(text: str) -> bool:
     """是否框架/过程元话语（对用户即 OOC）。"""
     body = (text or "").strip()
-    if not body or body in ("<SILENCE>", "SILENCE"):
+    if not body or is_silence_marker(body):
         return False
     return bool(_PROCESS_META_RE.search(body))
 
@@ -198,6 +277,26 @@ def looks_like_wait_comfort(text: str) -> bool:
     return bool(_WAIT_COMFORT_RE.search(body))
 
 
+def looks_like_inflight_quota_speech(text: str) -> bool:
+    """在途台词额度：一句短等待或短应，不含清单/念白。"""
+    body = (text or "").strip()
+    if not body or len(body) > 96:
+        return False
+    if looks_like_report_speech(body) or looks_like_numeric_recitation(body):
+        return False
+    if looks_like_empty_handoff(body):
+        return False
+    if body.count("\n") >= 3:
+        return False
+    if claims_premature_delivery(body) and not looks_like_wait_comfort(body):
+        return False
+    if looks_like_wait_comfort(body):
+        return True
+    if len(_MD_HEADING_RE.findall(body)) >= 1:
+        return False
+    return True
+
+
 def has_orchestration_narration(text: str) -> bool:
     """是否在向用户叙述内部编排（worker/节点名）。"""
     body = (text or "").strip()
@@ -211,7 +310,7 @@ def looks_like_report_speech(text: str) -> bool:
     body = (text or "").strip()
     if len(body) < 80:
         return False
-    if body in ("<SILENCE>", "SILENCE"):
+    if is_silence_marker(body):
         return False
     heads = len(_MD_HEADING_RE.findall(body))
     # 行首加粗小标题（**命名规则** 单独成行）
@@ -230,6 +329,8 @@ def looks_like_report_speech(text: str) -> bool:
         return True
     # 单段超长「小作文」
     if len(paras) <= 2 and len(body) >= 500 and (heads >= 1 or body.count("…") + body.count("...") >= 4):
+        return True
+    if looks_like_numeric_recitation(body):
         return True
     return False
 
@@ -312,12 +413,14 @@ def should_block_user_visible_text(
     tool_calls_so_far: Sequence[str],
     wait_comfort_sent: bool = False,
     fact_pack_pending: bool = False,
+    has_active_task: bool = False,
+    render_inflight: bool = False,
 ) -> tuple[bool, str]:
     """是否拦截本段对用户可见文本。返回 (block, reason)。"""
     body = (text or "").strip()
     if not body:
         return True, "empty"
-    if body in ("<SILENCE>", "SILENCE", "</SILENCE>"):
+    if is_silence_marker(body):
         return False, "silence"
 
     pol: SpeechPolicy = (
@@ -329,14 +432,22 @@ def should_block_user_visible_text(
             "status_ok",
             "framework_nudge",
             "framework_deliver",
+            "delivered",
         )
         else "free"
     )
+    inflight = bool(pending_async or render_inflight)
+
+    # 交付终局：本 run 已经由发送工具交付完毕，对用户只许 <SILENCE>。
+    if pol == "delivered":
+        return True, "delivered_terminal"
 
     # 图已发出：放行极短角色收尾；仍拦长结构 / 编排词 / 引导追问
     if image_sent:
         if has_orchestration_narration(body):
             return True, "orchestration_leak"
+        if looks_like_delivery_status_narration(body):
+            return True, "delivery_narration"
         if looks_like_report_speech(body):
             return True, "report_speech"
         if has_open_solicitation(body) and len(body) > 40:
@@ -345,9 +456,9 @@ def should_block_user_visible_text(
             return True, "post_image_too_long"
         return False, "post_image_ok"
 
-    # 异步出图/子任务在途：只放行「尚未发过的一句等待」；其余沉默
-    if pending_async or pol == "silence_only":
-        if looks_like_wait_comfort(body) and not wait_comfort_sent:
+    # 异步在途：一句短额度（等待或短应）；清单/念白/完成腔不占额度、直接静默
+    if inflight or pol == "silence_only":
+        if looks_like_inflight_quota_speech(body) and not wait_comfort_sent:
             return False, "wait_comfort"
         return True, "silence_only_or_async"
 
@@ -360,18 +471,28 @@ def should_block_user_visible_text(
     if has_orchestration_narration(body):
         return True, "orchestration_leak"
 
+    if looks_like_delivery_status_narration(body):
+        return True, "delivery_narration"
+
     if looks_like_process_meta(body):
         return True, "process_meta"
 
     if claims_premature_delivery(body) and not image_sent:
         return True, "premature_delivery"
 
+    # 在途长任务：把多点读数念进气泡 = 把图上的信息误解成群聊正文
+    if has_active_task and not image_sent and looks_like_numeric_recitation(body):
+        # 进度追问且已查状态工具：放行短进度，不把时间戳/编号当念白
+        if not (pol == "status_ok" and has_status_tool):
+            return True, "numeric_recitation"
+
     # 仅当真有待出图材料时：空交付/摆烂才拦截并武装纠正
     if fact_pack_pending and looks_like_empty_handoff(body) and not image_sent:
         return True, "empty_handoff"
 
-    # 长结构台词：主人格不得用多段标题/列表刷屏（应 render）
-    if pol in ("free", "status_ok", "framework_deliver") and looks_like_report_speech(body):
+    # 长结构台词：仅当**真有待出图事实包**时才拦（该走 render）。
+    # 无事实包的长文本是用户点名要的正文（作文/代码/翻译），交呈现层，不拦不改。
+    if pol in ("free", "status_ok", "framework_deliver") and fact_pack_pending and looks_like_report_speech(body):
         return True, "report_speech"
 
     if pol == "framework_deliver":
@@ -388,11 +509,6 @@ def should_block_user_visible_text(
                 return True, "status_without_tool"
         return False, "ok"
 
-    # free：事实包待出图时，优先短等待；长完成腔已在上面拦
-    if fact_pack_pending and not image_sent and len(body) > 80 and not looks_like_wait_comfort(body):
-        # 未出图却长篇收束 → 当空交付处理
-        return True, "pre_render_long_speech"
-
     return False, "ok"
 
 
@@ -405,6 +521,8 @@ def content_is_render_candidate(
     """是否可作为「待出图事实包」候选（体积折叠 ≠ 可出图）。"""
     body = (content or "").strip()
     if not body:
+        return False
+    if is_observation_untrusted(body):
         return False
     # 失败/空/加载清单
     if body.startswith("⚠️") or body.startswith("❌"):
@@ -428,12 +546,18 @@ def content_is_render_candidate(
     if re.search(r"\bres_[0-9a-fA-F]{6,}\b", body) and len(body) >= 40:
         return True
 
-    # 真表 / 多段列表
+    # 无时点聚合（气候/月均/历史均值）：不武装出图——把「常年均值」渲成图当答案
+    # 正是 P2 编造陷阱，应口头带不确定口径，而非出图坐实（create_subagent 事实包除外）。
+    if _is_timeless_aggregate(body):
+        return False
+
+    # 检索/抓取类：单点问答可短回，只有**多点**结构才值得出图（4.2）
+    _searchish = any(h in tn for h in ("search", "web_", "fetch", "knowledge"))
+    if _searchish and not _fact_lines_multi_point(body):
+        return False
+
+    # 真表。长散文不得单独武装（观测说明文误报）。
     if "|" in body and body.count("\n") >= 3:
-        return True
-    if body.count("\n\n") >= 2 and len(body) >= 400:
-        return True
-    if body.count("\n") >= 10 and len(body) >= 1200:
         return True
 
     # FileOS 折叠：用原文形态判定；仅「多段/表/事实包」才可出图（检索噪声默认否）
@@ -445,15 +569,18 @@ def content_is_render_candidate(
         if body.count("\n\n") >= 3 and len(body) >= 600:
             return True
         # 纯检索列表默认不武装 render（单点问答可短回）
-        if any(h in tn for h in ("search", "web_", "fetch", "knowledge")):
+        if _searchish:
             return False
         return False
 
     # 搜索类：与旧口径类似但更严；单点检索默认不武装出图
-    if any(h in tn for h in ("search", "web_", "fetch", "knowledge")):
+    if _searchish:
         if "|" in body and body.count("\n") >= 4 and len(body) >= 600:
             return True
         if body.count("\n\n") >= 3 and len(body) >= 1200:
+            return True
+        # 多点逐行观测：形态达标即武装，不卡绝对长度
+        if len(body) >= 80:
             return True
         return False
     return False
@@ -470,8 +597,7 @@ def is_status_tool_name(name: str) -> bool:
             "artifact_get",
             "list_persisted_outputs",
             "grep_persisted_outputs",
-            "read_persisted_output",
-            "search_knowledge",
+            "search_cognition",
             "read_handle",
             "list_my_tasks",
         }

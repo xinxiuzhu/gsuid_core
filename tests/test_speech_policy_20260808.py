@@ -25,7 +25,7 @@ def test_status_inquiry_detects_progress_questions() -> None:
 
 def test_status_inquiry_strips_assembled_shell() -> None:
     blob = (
-        "[用户发言]\n[⚡主人] 我找你说话了。\n--- 消息 ---\n图呢\n"
+        "[用户发言]\n[⚡主人] 我\n--- 消息 ---\n图呢\n"
         "[当前时间：2026-08-08 22:00:00]\n"
         "【你正在为对方推进的事项】事项#1｜运行中"
     )
@@ -60,7 +60,17 @@ def test_speech_block_policies() -> None:
         has_status_tool=False,
         tool_calls_so_far=[],
     )
-    assert blk2 and why2 == "silence_only_or_async"
+    assert not blk2, why2
+    blk2b, why2b = should_block_user_visible_text(
+        "silence_only",
+        "唔…还在画…",
+        pending_async=False,
+        image_sent=False,
+        has_status_tool=False,
+        tool_calls_so_far=[],
+        wait_comfort_sent=True,
+    )
+    assert blk2b and why2b == "silence_only_or_async"
 
     blk3, _ = should_block_user_visible_text(
         "framework_nudge",
@@ -262,6 +272,8 @@ def test_report_speech_and_solicitation() -> None:
     assert "要不要" not in cleaned
     assert "命名" in cleaned or "140" in cleaned or "白海豚" in cleaned
 
+    # 报告体只在**真有待出图事实包**时才拦（出处凭据）；
+    # 无事实包的长正文是用户点名要的（作文/代码/翻译），见控制面 INV-1。
     blk, why = should_block_user_visible_text(
         "free",
         typhoon,
@@ -269,8 +281,20 @@ def test_report_speech_and_solicitation() -> None:
         image_sent=False,
         has_status_tool=False,
         tool_calls_so_far=["web_search_tool"],
+        fact_pack_pending=True,
     )
     assert blk and why == "report_speech"
+
+    blk_no_pack, _ = should_block_user_visible_text(
+        "free",
+        typhoon,
+        pending_async=False,
+        image_sent=False,
+        has_status_tool=False,
+        tool_calls_so_far=[],
+        fact_pack_pending=False,
+    )
+    assert not blk_no_pack
 
 
 def test_empty_handoff_and_wait_comfort() -> None:
@@ -291,7 +315,7 @@ def test_empty_handoff_and_wait_comfort() -> None:
         tool_calls_so_far=["create_subagent"],
         fact_pack_pending=True,
     )
-    assert blk and why in ("empty_handoff", "premature_delivery", "pre_render_long_speech")
+    assert blk and why in ("empty_handoff", "premature_delivery")
 
     wait = "唔…等一下…画张图…"
     assert looks_like_wait_comfort(wait)

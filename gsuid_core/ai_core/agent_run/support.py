@@ -6,11 +6,20 @@
 from __future__ import annotations
 
 import re
-from typing import List, Union, Literal, Sequence
+from typing import List, Tuple, Union, Literal, Optional, Sequence
 
-from pydantic_ai.messages import UserContent, ToolCallPart, ToolReturnPart
+from pydantic_ai.messages import (
+    UserContent,
+    ModelMessage,
+    ModelRequest,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 
+from gsuid_core.ai_core.utils import _is_framework_prompt_content
 from gsuid_core.ai_core.rag.tools import NON_SEARCHABLE_TOOL_CATEGORIES
+from gsuid_core.ai_core.control.directive import CONTROL_ENVELOPE_TAG
 
 # re-export：settle / prepare / gs_agent 与测试共用
 from gsuid_core.ai_core.agent_run.speech_policy import (  # noqa: F401
@@ -71,6 +80,72 @@ def _append_user_text(message: Union[str, List["UserContent"]], text: str) -> Un
     return out
 
 
+InnerOsInjectWhere = Literal["history", "current", "already", "skipped"]
+_INNER_OS_NEEDLE = "【角色沉浸要求】"
+UserPromptContent = Union[str, Sequence[UserContent]]
+UserTurnText = Union[str, List[UserContent]]
+
+
+def _user_content_contains(content: UserPromptContent, needle: str) -> bool:
+    if isinstance(content, str):
+        return needle in content
+    return any(isinstance(item, str) and needle in item for item in content)
+
+
+def _user_prompt_is_framework(content: UserPromptContent) -> bool:
+    if isinstance(content, str):
+        return _is_framework_prompt_content(content)
+    texts = [item for item in content if isinstance(item, str)]
+    return bool(texts) and all(_is_framework_prompt_content(item) for item in texts)
+
+
+def _as_user_turn_text(content: UserPromptContent) -> UserTurnText:
+    if isinstance(content, str):
+        return content
+    return list(content)
+
+
+def _first_real_user_prompt_part(history: Sequence[ModelMessage]) -> Optional[UserPromptPart]:
+    for msg in history:
+        if not isinstance(msg, ModelRequest):
+            continue
+        for part in msg.parts:
+            if not isinstance(part, UserPromptPart):
+                continue
+            if _user_prompt_is_framework(part.content):
+                continue
+            return part
+    return None
+
+
+def _ensure_inner_os_on_first_user(
+    history: Sequence[ModelMessage],
+    current: UserTurnText,
+    lean: UserTurnText,
+    marker: str,
+    *,
+    is_framework: bool,
+) -> Tuple[UserTurnText, UserTurnText, InnerOsInjectWhere]:
+    """把 inner_os marker 永久钉在会话第一条真人 user message 末尾。"""
+    if not marker:
+        return current, lean, "skipped"
+
+    first = _first_real_user_prompt_part(history)
+    if first is not None:
+        if _user_content_contains(first.content, _INNER_OS_NEEDLE):
+            return current, lean, "already"
+        first.content = _append_user_text(_as_user_turn_text(first.content), marker)
+        return current, lean, "history"
+
+    if is_framework:
+        return current, lean, "skipped"
+    if _user_content_contains(current, _INNER_OS_NEEDLE):
+        return current, lean, "already"
+    new_current = _append_user_text(current, marker)
+    new_lean = _append_user_text(lean, marker) if lean else lean
+    return new_current, new_lean, "current"
+
+
 # 交互式主 Agent 的 create_by 集合（交互脚手架/墙钟软预算适用范围；TEST=本地评测端点）
 _INTERACTIVE_CREATE_BY = ("Chat", "Agent", "TEST", "CapabilityAgent")
 # 主会话才折叠 JSON；CapabilityAgent 必须看完整工具返回
@@ -89,16 +164,45 @@ _FAKE_DONE_NUDGE = (
 # 结构假完成：被呼叫 + 池内有工具 + 零调用 + 非沉默/非极短寒暄（不解析用户话题词）
 _STRUCTURAL_ZERO_TOOL_NUDGE = (
     "（系统校验：本轮你被直接呼叫（或同人省略续聊），且工具池非空，但你没有调用任何工具就结束了。"
-    "若用户在让你办事/查询/看图/出图/设安排——现在立即调对应工具；"
+    "先判断你刚才的回答是否已经**完整**解决用户：若是纯概念/常识解释且你有把握、"
+    "或纯寒暄——只输出 <SILENCE>，不要重复或补充。"
+    "若用户在让你办事/查询/看图/出图/设安排而尚未办到——现在立即调对应工具；"
     "缺具体参数时也先用上文实体或记忆/查询/搜索工具尝试一次，禁止只用澄清收束；"
-    "若只是纯寒暄，用一句角色短回即可，不要假装已经查过或记过。）"
+    "禁止假装已经查过或记过。）"
 )
 
+
+def _correction_nudge_markers() -> tuple[str, ...]:
+    """纠正指令在 history 里的识别锚点。
+
+    纠正轮结束后统一从持久 history 剥掉这些 user turn：它们是框架内部指令，
+    累积会污染上下文并破坏 provider 前缀缓存（方案四/五）。
+    现役纠正统一走 ``<control>`` 信封；其余常量保留仅为兼容尚未迁移的历史条目。
+    """
+
+    return (
+        f"<{CONTROL_ENVELOPE_TAG}",
+        _FAKE_DONE_NUDGE,
+        _STRUCTURAL_ZERO_TOOL_NUDGE,
+        _RENDER_DELEGATE_NUDGE,
+        _REPORT_SPEECH_NUDGE,
+        _STATUS_ZERO_TOOL_NUDGE,
+    )
+
+
 _RENDER_TOOL_NAMES = frozenset({"render_html_to_image", "render_card", "render_markdown_to_image"})
-# find_tools 空转阈值更严（同工具连打）
+# 只读检索类工具的空转阈值更严：它们**没有副作用也没有新信息源**，连打 2 轮就已经是空转。
+# find_tools 与认知检索都属此列（后者收成单一动词后，「换个说法再搜」的成本全压在它身上）。
 _FIND_TOOLS_THRASH_LIMIT = 2
+_READONLY_RETRIEVAL_TOOLS = frozenset({"find_tools", "search_cognition"})
 # 搜索/拉取类返回「够长+多行」即视为可出图材料（不靠业务词）
 _SEARCHISH_TOOL_HINTS = ("search", "web_", "fetch", "knowledge")
+
+
+def thrash_limit_for(tool_name: str) -> int:
+    """该工具的同名连打熔断阈值。只读检索类更严（2 轮），其余 4 轮。"""
+    return _FIND_TOOLS_THRASH_LIMIT if tool_name in _READONLY_RETRIEVAL_TOOLS else _THRASH_SAME_TOOL_LIMIT
+
 
 # 同工具空转熔断（形状信号，非业务词）：
 # - **跨轮**计数：同一 ModelResponse 内并行多次同名工具（多 query 检索）只计 1 轮

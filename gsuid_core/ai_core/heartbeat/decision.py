@@ -1,14 +1,14 @@
 import re
 import json
 import time
-from typing import Any, List, Optional
+from typing import List, Optional
 from datetime import datetime
 
 from gsuid_core.bot import Bot
 from gsuid_core.i18n import t
 from gsuid_core.config import core_config
 from gsuid_core.logger import logger
-from gsuid_core.ai_core.utils import SILENCE_MARKERS, extract_json_from_text
+from gsuid_core.ai_core.utils import is_silence_marker, extract_json_from_text
 from gsuid_core.ai_core.models import Event
 from gsuid_core.ai_core.gs_agent import GsCoreAIAgent, create_agent
 from gsuid_core.ai_core.statistics import statistics_manager
@@ -16,6 +16,7 @@ from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
 from gsuid_core.ai_core.memory.config import memory_config
 from gsuid_core.ai_core.history_format import format_history_for_agent
 from gsuid_core.ai_core.persona.prompts import ROLE_PLAYING_START
+from gsuid_core.message_history.manager import MessageRecord
 from gsuid_core.ai_core.persona.resource import load_persona, extract_compact_persona
 from gsuid_core.utils.database.base_models import async_maker
 from gsuid_core.ai_core.memory.ingestion.hiergraph import AIMemHierarchicalGraphMeta
@@ -92,7 +93,7 @@ STALENESS_NOTE_TEMPLATE = (
 )
 
 
-def build_staleness_section(history: List[Any], now_ts: float) -> str:
+def build_staleness_section(history: List[MessageRecord], now_ts: float) -> str:
     """群内最后一条消息距今超阈值时返回"话题已冷"提示，否则空串（§10）。
 
     看所有角色而非只看 user：bot 刚心跳发过新话头时再注入"最后消息是 X 分钟前"
@@ -172,7 +173,7 @@ async def _get_group_summary_for_heartbeat(group_id: str) -> str:
     return ""
 
 
-def _build_masters_section(history: List[Any]) -> str:
+def _build_masters_section(history: List[MessageRecord]) -> str:
     """列出出现在本群历史里的主人，供巡检以「主人」相称。
 
     巡检 system_prompt 是裸人格（不含 SYSTEM_CONSTRAINTS 的主人名单），主人身份
@@ -206,9 +207,57 @@ def _build_masters_section(history: List[Any]) -> str:
     )
 
 
+async def _build_zone_section(history: List[MessageRecord], bot_id: str) -> str:
+    """在场发言者的关系温度摘要（决策上下文，不进 system）。
+
+    压缩人格刻意丢掉了整段 Favorability Logic（决策阶段不需要执行细则），但**档位本身**
+    要给：``close``/``familiar`` 可提高「点名关心」权重，``hostile``/``cold`` 禁止点名。
+    只列在场的人，且只给档位不给分数——分数是内部量。
+    """
+    if not history:
+        return ""
+    from gsuid_core.ai_core.relationship import Zone, zone_of, zone_level_name
+    from gsuid_core.ai_core.database.models import UserFavorability
+
+    names: dict[str, str] = {}
+    for record in history:
+        if record.role != "user":
+            continue
+        uid = str(record.user_id)
+        if uid and uid not in names:
+            names[uid] = str(record.user_name) if record.user_name else uid
+        if len(names) >= 8:
+            break
+    if not names:
+        return ""
+    try:
+        scores = await UserFavorability.get_scores_for(list(names), bot_id)
+    except Exception as e:
+        logger.debug(t("log.ai.heartbeat_zone_summary_degraded", e=e))
+        return ""
+
+    warm: List[str] = []
+    cold: List[str] = []
+    for uid, score in scores.items():
+        zone = zone_of(score)
+        label = f"{names[uid] if uid in names else uid}（{zone_level_name(zone)}）"
+        if zone in (Zone.CLOSE, Zone.FAMILIAR):
+            warm.append(label)
+        elif zone in (Zone.HOSTILE, Zone.COLD):
+            cold.append(label)
+    if not warm and not cold:
+        return ""
+    lines = ["\n\n[在场的人你有多熟]"]
+    if warm:
+        lines.append(f"- 熟：{'、'.join(warm)}。可以点名关心、可以主动接话。")
+    if cold:
+        lines.append(f"- 不熟/有点烦：{'、'.join(cold)}。**不要点名**，也别主动搭话。")
+    return "\n".join(lines)
+
+
 async def run_heartbeat(
     event: Event,
-    history: List[Any],
+    history: List[MessageRecord],
     persona_name: str,
     extra_context: str = "",
 ) -> Optional[tuple[str, str, List[str]]]:
@@ -259,7 +308,8 @@ async def run_heartbeat(
     group_summary = await _get_group_summary_for_heartbeat(event.group_id or "")
 
     # 在场主人名单：裸人格 system_prompt 不含主人信息，靠这段让巡检认出主人并以「主人」相称
-    masters_section = _build_masters_section(history)
+    # 关系温度摘要紧随其后：主人是权限、档位是温度，两者正交
+    masters_section = _build_masters_section(history) + await _build_zone_section(history, event.bot_id or "")
 
     # C8：统一主动网关合并进来的语境（刚完成的定时任务结果等）
     proactive_merge_section = ""
@@ -329,7 +379,7 @@ async def run_heartbeat(
         return None
 
     # 模型输出 <SILENCE> 或 <end_turn> 表示选择不发言，直接跳过
-    if result.strip() in SILENCE_MARKERS:
+    if is_silence_marker(result.strip()):
         logger.debug(t("log.ai.heartbeat_output_silence_remaining"))
         return None
 
@@ -368,6 +418,13 @@ async def run_heartbeat(
 
     if not should_speak:
         logger.debug(t("log.ai.heartbeat_remaining_silent_mood", mood=mood, event=event))
+        return None
+
+    # 可回应钩子门（4.11）：决定开口却给不出具体话头/由头 → 视为无的放矢的梦呓，
+    # 降级沉默（结构判定：context_hook 是决策 JSON 的必填项，空即无钩子）。
+    _hook = context_hook if isinstance(context_hook, str) else ""
+    if not _hook.strip():
+        logger.debug(t("log.ai.heartbeat_no_hook_silent", mood=mood))
         return None
 
     logger.info(t("log.ai.heartbeat_decided_interject_mood", mood=mood, event=event))
@@ -472,7 +529,7 @@ def _reactive_gate_rule_prefilter(raw_text: str) -> Optional[bool]:
 
 async def run_reactive_gate(
     event: Event,
-    history: List[Any],
+    history: List[MessageRecord],
     persona_name: Optional[str],
 ) -> bool:
     """免唤醒续聊·软触发沉默门。
@@ -540,7 +597,7 @@ async def run_reactive_gate(
         if not isinstance(result, str):
             logger.debug(t("log.ai.reactivegate_non_str_defaulting", p0=type(result).__name__))
             return False
-        if not result or result.strip() in SILENCE_MARKERS:
+        if not result or is_silence_marker(result.strip()):
             return False
         # 捕获具体异常而非宽 except：模型吐了内容但不是合法 JSON（常因角色扮演"出戏"成台词），
         try:

@@ -147,6 +147,36 @@ OPENAI_CONFIG_TEMPLATE: Dict[str, GSC] = {
         data="chat_completions",
         options=["chat_completions", "responses"],
     ),
+    "remote_web_search": GsStrConfig(
+        title="远端 Web Search",
+        desc=(
+            "默认开启。请求方式为 responses 时用上游内置 web_search，"
+            "不再把本地 web_search_tool 发给模型；"
+            "chat_completions 无论本开关开或关都走本地 Tavily/Jina/Exa。"
+            "中转的 responses 若不支持 hosted 工具会 400，那时再关掉即可"
+        ),
+        data="on",
+        options=["off", "on"],
+    ),
+    "forward_end_user_id": GsStrConfig(
+        title="透传终端用户标识",
+        desc=(
+            "是否在请求中携带 OpenAI 标准的 user 字段(终端用户标识), 供上游网关按调用方聚合用量、"
+            "日志与滥用监控: off=不携带(默认); hashed=携带加盐摘要, 不泄露原始标识; "
+            "raw=携带原始标识(仅建议对自建网关开启)"
+        ),
+        data="off",
+        options=["off", "hashed", "raw"],
+    ),
+    "end_user_id_salt": GsStrConfig(
+        title="终端用户标识盐值",
+        desc=(
+            "hashed 模式计算摘要用的盐值。留空则为无密钥摘要, 标识空间小(纯数字账号)时可被枚举"
+            "反查, 只起混淆作用; 需要抗反查请填一段随机字符串"
+        ),
+        data="",
+        secret=True,
+    ),
     "send_back_thinking": GsStrConfig(
         title="思考回传",
         desc=(

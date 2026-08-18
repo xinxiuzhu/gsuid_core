@@ -34,9 +34,9 @@ def test_tool_orchestration_has_delegation_first() -> None:
     assert "DELEGATION_FIRST" in TOOL_ORCHESTRATION_CONSTRAINTS
     assert "重任务" in SYSTEM_CONSTRAINTS or "委派" in SYSTEM_CONSTRAINTS
     assert "禁止" in SYSTEM_CONSTRAINTS and "工具名" in SYSTEM_CONSTRAINTS
-    # 七步时序：委派前等待句
-    assert "得等一会儿" in SYSTEM_CONSTRAINTS or "七步" in SYSTEM_CONSTRAINTS
-    assert "等待" in TOOL_ORCHESTRATION_CONSTRAINTS or "得等一会儿" in TOOL_ORCHESTRATION_CONSTRAINTS
+    # 长任务仍建议先等一句再委派，但不再写成硬七步
+    assert "等待" in SYSTEM_CONSTRAINTS
+    assert "等待" in TOOL_ORCHESTRATION_CONSTRAINTS
 
 
 def test_sayu_persona_analysis_must_delegate() -> None:
@@ -80,10 +80,14 @@ def test_research_match_keywords_domain_free() -> None:
 def test_web_search_results_frame_stale_prices() -> None:
     from gsuid_core.ai_core.buildin_tools.web_search import _format_results_for_model
 
-    text = _format_results_for_model([{"title": "gold", "url": "https://example.com", "content": "XAU 3000"}])
+    text = _format_results_for_model(
+        [{"title": "gold", "url": "https://example.com", "content": "XAU 3000"}],
+        query="gold",
+    )
     assert "过时" in text or "滞后" in text
     assert "结构化数据" in text or "实时读数" in text
     assert "<search_results>" in text
+    assert "query: gold" in text
     assert "市价" not in text
     assert "股票" not in text
     assert "时效存疑" not in text

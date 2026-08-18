@@ -5,7 +5,7 @@
 当AI发现自己缺乏某个能力时，可以调用此工具来发现可用的工具。
 """
 
-from typing import Optional
+from typing import Any, Optional
 from dataclasses import replace
 
 from pydantic_ai import RunContext
@@ -15,31 +15,83 @@ from gsuid_core.logger import logger
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.rag.tools import search_tools, search_tools_by_domain
+from gsuid_core.ai_core.output_firewall import EXPOSED_TOOLS_EXTRA_KEY
+
+FIND_TOOLS_LOADED_KEY = "find_tools_last_loaded"
+FIND_TOOLS_GAP_NOTE = (
+    "（系统：连续检索未暴露新工具。用角色短句说明做不到；禁止再 find_tools；禁止念工具名或叙述装载过程。）"
+)
 
 
-def _match_capability_agents_for_need(need: str, *, limit: int = 5) -> list[str]:
-    """按 need 文本匹配已注册能力代理，返回展示行（通用，无业务特判）。"""
+def _record_find_tools_round(extra: dict[str, Any], loaded: list[str]) -> bool:
+    """记下本轮暴露名。返回 True 表示相对上一轮没有新名字。"""
+    had_prev = FIND_TOOLS_LOADED_KEY in extra
+    prev_raw = extra[FIND_TOOLS_LOADED_KEY] if had_prev else None
+    prev: set[str] = set(prev_raw) if isinstance(prev_raw, list) else set()
+    extra[FIND_TOOLS_LOADED_KEY] = list(loaded)
+    exposed_raw = extra[EXPOSED_TOOLS_EXTRA_KEY] if EXPOSED_TOOLS_EXTRA_KEY in extra else None
+    if isinstance(exposed_raw, list):
+        for n in loaded:
+            if n not in exposed_raw:
+                exposed_raw.append(n)
+    else:
+        extra[EXPOSED_TOOLS_EXTRA_KEY] = list(loaded)
+    if not had_prev:
+        return False
+    return set(loaded) <= prev
+
+
+def _format_node_line(node_id: str) -> Optional[str]:
+    """节点展示行：`node_id`（显示名）：when_to_use；节点不存在返回 None。"""
+    from gsuid_core.ai_core.agent_node import get_node
+
+    node = get_node(node_id)
+    if node is None:
+        return None
+    when = (node.when_to_use or "").strip() or node.display_name
+    return f"- `{node.node_id}`（{node.display_name}）：{when}"
+
+
+async def _capability_agent_lines(need: str, *, limit: int = 5) -> list[str]:
+    """按 need 匹配可委派能力代理，返回展示行（关键词快路径 + 语义兜底）。
+
+    关键词表是枚举式的、必有洞；语义匹配（节点检索空间）兜住枚举之外的表述。
+    两路合并去重，关键词命中排前。
+    """
     from gsuid_core.ai_core.agent_node import list_nodes
     from gsuid_core.ai_core.agent_node.registry import match_capability_node
+    from gsuid_core.ai_core.agent_node.semantic_routing import semantic_match_nodes
 
     need_s = (need or "").strip()
     if not need_s:
         return []
     lines: list[str] = []
     seen: set[str] = set()
-    # 整句最长关键词匹配
+
+    def _push(node_id: str) -> None:
+        if node_id in seen or len(lines) >= limit:
+            return
+        line = _format_node_line(node_id)
+        if line is None:
+            return
+        seen.add(node_id)
+        lines.append(line)
+
+    # 1) 关键词快路径：整句最长关键词命中的主节点
     primary = match_capability_node(need_s)
     if primary:
-        from gsuid_core.ai_core.agent_node import get_node
-
-        node = get_node(primary)
-        if node is not None:
-            when = (node.when_to_use or "").strip() or node.display_name
-            lines.append(f"- `{node.node_id}`（{node.display_name}）：{when}")
-            seen.add(node.node_id)
-    # 再扫注册表弱匹配补全
+        _push(primary)
+    # 2) 语义兜底：关键词没覆盖的说法（跨领域新词）由向量空间接住
+    try:
+        for node_id, _score in await semantic_match_nodes(need_s, limit=limit):
+            _push(node_id)
+    except Exception as e:
+        logger.debug(t("log.ai.find_tools_semantic_route_fail", e=e))
+    # 3) 注册表弱匹配补全（保留原有 token 子串逻辑，覆盖节点自述里的词）
     blob = need_s.lower()
     for node in list_nodes():
+        if len(lines) >= limit:
+            break
         if node.node_id in seen:
             continue
         if node.source == "persona" or node.node_id == "capability_evaluator":
@@ -56,14 +108,31 @@ def _match_capability_agents_for_need(need: str, *, limit: int = 5) -> list[str]
                 if len(token) >= 2 and token in hay:
                     hit = True
                     break
-        if not hit:
-            continue
-        when = (node.when_to_use or "").strip() or node.display_name
-        lines.append(f"- `{node.node_id}`（{node.display_name}）：{when}")
-        seen.add(node.node_id)
-        if len(lines) >= limit:
-            break
+        if hit:
+            _push(node.node_id)
     return lines
+
+
+def _delegation_directive(lines: list[str]) -> str:
+    """把候选节点行组装成委派指引文本。"""
+    return '请用 create_subagent(agent_profile="<node_id>", task=...) 委派给下列能力代理：\n' + "\n".join(lines)
+
+
+# 能力缺口登记（4.5）：find_tools 未命中时计数，供运维按「高频被求而缺失」
+# 决定安装哪些插件/工具。纯进程内计数，不进用户可见通道、不做业务特判。
+_CAPABILITY_GAP_COUNTS: dict[str, int] = {}
+
+
+def _record_capability_gap(need: str) -> None:
+    key = (need or "").strip()[:80]
+    if not key:
+        return
+    _CAPABILITY_GAP_COUNTS[key] = _CAPABILITY_GAP_COUNTS.get(key, 0) + 1
+
+
+def get_capability_gaps(limit: int = 20) -> list[tuple[str, int]]:
+    """按次数降序返回 top-N 能力缺口（need, count），供 webconsole 展示。"""
+    return sorted(_CAPABILITY_GAP_COUNTS.items(), key=lambda kv: kv[1], reverse=True)[:limit]
 
 
 # 不声明 capability_domain（会被 L3 按族驻留带进闲聊轮）；category 必须为 meta：
@@ -81,7 +150,7 @@ async def find_tools(
 
     适用场景示例：
     - 用户的追问语义太短、当前工具列表里找不到合适工具时（如澄清后回了个地名/时间）；
-    - 需要某类专门能力（查询某游戏数据、渲染图片、读写文件、查数据库等）但工具不在列。
+    - 需要某类专门能力（查询外部数据、渲染图片、读写文件、查数据库等）但工具不在列。
 
     Args:
         ctx: 工具执行上下文。
@@ -95,7 +164,19 @@ async def find_tools(
         # capability_domain 整族纳入，保证"能创建就能改/删"，加载到的工具语义连贯而非零散单点。
         family_tools = await search_tools_by_domain(query=need, domain_limit=3, per_domain_limit=6)
         if not family_tools:
-            return f"⚠️ 没有找到与「{need}」相关的工具，请换个更具体的描述，或直接据现有能力作答。"
+            _record_capability_gap(need)
+            stale = _record_find_tools_round(ctx.deps.extra, [])
+            # 真无命中：不给"据现有能力作答"的编造许可证；语义层找委派出路。
+            agent_lines = await _capability_agent_lines(need)
+            if agent_lines:
+                msg = "🔎 未检索到可直接加载的工具，但该能力可能由能力代理持有。\n" + _delegation_directive(agent_lines)
+                return f"{msg}\n{FIND_TOOLS_GAP_NOTE}" if stale else msg
+            miss = (
+                f"⚠️ 未检索到与「{need}」相关的工具。可换更具体的能力描述重试一次；"
+                "若确实没有该能力，涉及实时数据/外部事实时如实角色化说明查不到，"
+                "禁止编造数值、禁止用网页摘要冒充实时读数。"
+            )
+            return f"{miss}\n{FIND_TOOLS_GAP_NOTE}" if stale else miss
 
         # 检索层不感知 visible_when，须与暴露层同用 prepare_tool_def 预判：隐藏工具若照报
         # "已加载"，模型按名调用必 Unknown tool 并反复重试（实测踩坑）。静默剔除，仅落日志。
@@ -125,14 +206,50 @@ async def find_tools(
             )
         # 主人格交互轮：能力代理专属工具不得经 find_tools 回灌（与静态池剥离同口径）
         blocked = ctx.deps.blocked_tool_names
+        blocked_hit_names = [n for n in loaded_names if n in blocked] if blocked else []
         if blocked:
             loaded_names = [n for n in loaded_names if n not in blocked]
 
         if not loaded_names:
-            # 与"检索无命中"同文案：不向模型泄露被隐藏工具的存在，避免诱导换措辞反复检索。
-            return f"⚠️ 没有找到与「{need}」相关的工具，请换个更具体的描述，或直接据现有能力作答。"
+            _record_capability_gap(need)
+            stale_empty = _record_find_tools_round(ctx.deps.extra, [])
+            # 命中但全被 exclusive 剥离：工具真实存在、归能力代理专属——明确指路委派，
+            # 不再谎称"没有找到"（旧同文案把模型推向 web_search 顶替，见 2026-08-11 归因）。
+            if blocked_hit_names:
+                from gsuid_core.ai_core.agent_node.registry import owning_nodes_of_tools
+
+                owners = owning_nodes_of_tools(blocked_hit_names)
+                owner_ids: list[str] = []
+                for ids in owners.values():
+                    for node_id in ids:
+                        if node_id not in owner_ids:
+                            owner_ids.append(node_id)
+                lines = [line for line in map(_format_node_line, owner_ids) if line]
+                if not lines:
+                    lines = await _capability_agent_lines(need)
+                if lines:
+                    locked = (
+                        "🔒 该类工具为能力代理专属，不在主人格手里直接装配（这是设计，不是缺失）。\n"
+                        + _delegation_directive(lines)
+                        + "\n对不上需求时可以换描述再找，或改搜网页。"
+                    )
+                    return f"{locked}\n{FIND_TOOLS_GAP_NOTE}" if stale_empty else locked
+            # 全被 visible_when 隐藏：维持不泄露隐藏工具存在，但给出语义委派兜底。
+            agent_lines = await _capability_agent_lines(need)
+            if agent_lines:
+                hidden = "🔎 未检索到当前场景可直接加载的工具，但该能力可能由能力代理持有。\n" + _delegation_directive(
+                    agent_lines
+                )
+                return f"{hidden}\n{FIND_TOOLS_GAP_NOTE}" if stale_empty else hidden
+            miss2 = (
+                f"⚠️ 未检索到与「{need}」相关的工具。可换更具体的能力描述重试一次；"
+                "若确实没有该能力，涉及实时数据/外部事实时如实角色化说明查不到，"
+                "禁止编造数值、禁止用网页摘要冒充实时读数。"
+            )
+            return f"{miss2}\n{FIND_TOOLS_GAP_NOTE}" if stale_empty else miss2
 
         ctx.deps.dynamic_tool_names.update(loaded_names)
+        stale = _record_find_tools_round(ctx.deps.extra, loaded_names)
 
         logger.info(
             t(
@@ -144,13 +261,13 @@ async def find_tools(
         )
         listing = "\n".join(f"- {name}" for name in loaded_names)
         parts = [f"✅ 已加载以下工具，下一步即可直接调用：\n{listing}"]
+        parts.append("若对不上需求，可换一句描述再 find_tools，或改用网页检索。")
         # 通用：同步提示可委派的能力代理（插件注册的 node_id），不特判业务域
-        agent_lines = _match_capability_agents_for_need(need)
+        agent_lines = await _capability_agent_lines(need)
         if agent_lines:
-            parts.append(
-                '若任务适合专职代理，请用 create_subagent(agent_profile="<node_id>", task=...) 委派：\n'
-                + "\n".join(agent_lines)
-            )
+            parts.append("若任务适合专职代理，" + _delegation_directive(agent_lines))
+        if stale:
+            parts.append(FIND_TOOLS_GAP_NOTE)
         return "\n".join(parts)
 
     except RuntimeError as e:

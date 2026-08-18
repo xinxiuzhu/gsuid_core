@@ -7,7 +7,7 @@ from gsuid_core.sv import SL
 from gsuid_core.gss import gss
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
-from gsuid_core.server import _module_cache
+from gsuid_core.server import GsServer, _module_cache
 
 # 第五步后台启动 Hook 的任务句柄表：① 保留引用防止任务被 GC ② 快速重载时取消上一轮未跑完的
 _plugin_start_tasks: Dict[str, asyncio.Task] = {}
@@ -157,6 +157,46 @@ def _clean_plugin_global_state(plugin_name: str) -> None:
             app.router.routes[:] = kept  # 原地替换, 保留列表引用; 无 .endpoint/.app 归属的条目自动保留
     except Exception as e:
         logger.warning(i18n_t("log.plugin.gscore_fail_web_routes", plugin_name=plugin_name, e=e))
+
+    # ④ Agent 环 hook + 套件槽 + AI 工具注册表
+    _clean_plugin_agent_state(plugin_name)
+
+
+def _clean_plugin_agent_state(plugin_name: str) -> None:
+    """摘掉插件的 Agent 环 hook、让它占用的槽位回落默认套件、卸掉它注册的 AI 工具。
+
+    ``_TOOL_REGISTRY`` 历来不被热重载清理（靠 re-import 覆盖同名符号侥幸没炸），
+    这是先于套件化存在的缺陷；套件槽引入后不清就会留下旧占用者的空壳工具。
+    """
+    try:
+        from gsuid_core.ai_core.kits import KIT_SLOTS, get_kit, enable_kit, disable_kit, occupants_of
+        from gsuid_core.ai_core.hooks import drop_hooks_for_module
+        from gsuid_core.ai_core.register import unregister_tools_of_plugin, unregister_entities_of_plugin
+
+        # 槽位回落：插件套件被卸掉后按配置重新装默认占用者，否则该槽静默变 off
+        for slot in KIT_SLOTS:
+            for kit_id in occupants_of(slot.name):
+                kit = get_kit(kit_id)
+                if kit is None or not kit_id.startswith(f"{plugin_name}."):
+                    continue
+                disable_kit(kit_id)
+                if get_kit(slot.default_kit_id) is not None:
+                    enable_kit(slot.default_kit_id)
+
+        dropped = drop_hooks_for_module(plugin_name)
+        tools = unregister_tools_of_plugin(plugin_name)
+        unregister_entities_of_plugin(plugin_name)
+        if dropped or tools:
+            logger.info(
+                i18n_t(
+                    "log.plugin.gscore_cleanup_agent_hooks_tools",
+                    plugin_name=plugin_name,
+                    hooks=dropped,
+                    tools=tools,
+                )
+            )
+    except Exception as e:
+        logger.warning(i18n_t("log.plugin.gscore_fail_agent_hooks", plugin_name=plugin_name, e=e))
 
 
 def _snapshot_plugin_route_anchor(plugin_name: str) -> Optional[int]:
@@ -311,6 +351,24 @@ def reload_plugin(plugin_name: str) -> str:
     logger.info(i18n_t("log.plugin.plugin_name_3", plugin_name=plugin_name))
 
     # ──────────────────────────────────────────
+    # 第 0 步：先解析磁盘路径（plugins/ 与 buildin_plugins/）
+    # 必须在任何清理之前完成 —— 否则路径解析失败会留下「已卸载、无法恢复」的空壳，
+    # 直到进程重启（core_command 等内置插件此前正中此坑）。
+    # ──────────────────────────────────────────
+    plugin_path = GsServer.resolve_plugin_path(plugin_name)
+    if plugin_path is None:
+        return f"❌ 插件{plugin_name}不存在!"
+
+    # 预检可加载模块列表（不 import）；空列表或错误信息直接返回，不触碰运行时状态
+    module_list = gss.load_plugin(plugin_path)
+    if module_list is None:
+        return f"❌ 未知的插件类型 {plugin_name}"
+    if isinstance(module_list, str):
+        return module_list  # load_plugin 已经返回了错误信息
+    if not module_list:
+        return f"❌ 插件{plugin_name}无可加载模块!"
+
+    # ──────────────────────────────────────────
     # 第一步：收集该插件下所有 SV 和 Plugins 对象
     # ──────────────────────────────────────────
     sv_names_to_del = [sv_name for sv_name, sv in SL.lst.items() if sv.self_plugin_name == plugin_name]
@@ -358,15 +416,8 @@ def reload_plugin(plugin_name: str) -> str:
     _clean_plugin_global_state(plugin_name)
 
     # ──────────────────────────────────────────
-    # 第四步：重新加载
+    # 第四步：重新加载（使用第 0 步已解析的 Path，避免仅查 plugins/ 漏掉内置插件）
     # ──────────────────────────────────────────
-    module_list = gss.load_plugin(plugin_name)
-
-    if module_list is None:
-        return f"❌ 未知的插件类型 {plugin_name}"
-    if isinstance(module_list, str):
-        return module_list  # load_plugin 已经返回了错误信息
-
     for module_name, filepath, _type in module_list:
         try:
             gss.cached_import(module_name, filepath, _type)

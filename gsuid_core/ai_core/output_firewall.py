@@ -14,7 +14,7 @@
 """
 
 import re
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Sequence
 from dataclasses import dataclass
 
 from gsuid_core.ai_core.content_guard import normalize_for_match
@@ -77,19 +77,21 @@ _FRAMEWORK_LEAK_RE = re.compile(
     r"|\bsearch_persisted_outputs\b"
     r"|\blist_persisted_outputs\b"
     r"|\bgrep_persisted_outputs\b"
-    r"|\bread_persisted_output\b"
     r"|\bweb_search_tool\b"
+    r"|\bweb_search\b"
     r"|\bfind_tools\b"
     r"|\brender_html_to_image\b"
     r"|\brender_agent\b"
     r"|\bresearch_agent\b"
-    r"|\bstock_report_agent\b"
     r"|\bagent_profile\s*="
     r"|\bimage_id\s*="
     r"|\bres_[0-9a-fA-F]{6,}\b"
     r"|\bimg_[0-9a-fA-F]{6,}\b"
     r"|\bto_[0-9a-fA-F]{6,}\b"
     r"|\bsa_[0-9a-fA-F]{6,}\b"
+    r"|\bdlg_[0-9a-fA-F-]{8,}\b"
+    r"|\bcheck_delegation\b"
+    r"|\bdispute_directive\b"
     r"|persisted\s+id\s*="
     r"|\[persisted\s+id="
     r"|交给主人格"
@@ -111,7 +113,6 @@ _FRAMEWORK_LEAK_RE = re.compile(
 _SYSTEM_COPY_LEAK_RE = re.compile(
     r"(时效存疑|自己再验|数据没刷|没刷出来|没法.{0,8}编数字|"
     r"回炉了?你再|回炉|"
-    r"专域(报价|API)|当前市价|最新读数|"
     r"（系统提示|（系统校验|\[框架[·・.]|"
     r"禁止再检索|禁止把句柄|禁止念|"
     r"create_subagent\(|agent_profile=)",
@@ -293,7 +294,34 @@ def _extra_terms() -> Tuple[str, ...]:
     return ()
 
 
-def check_ooc(text: str, tier: str = "roleplay", user_text: str = "") -> Optional[FirewallHit]:
+# ToolContext.extra 键：本轮已暴露的工具名集合（装配池 ∪ find_tools）。
+EXPOSED_TOOLS_EXTRA_KEY = "exposed_tool_names"
+_EXPOSED_TOOL_TOKEN_RE = re.compile(r"`([A-Za-z][A-Za-z0-9_]{2,})`|\b([A-Za-z][A-Za-z0-9_]{2,})\b")
+
+
+def _exposed_tool_name_leak(text: str, names: Sequence[str]) -> str | None:
+    """台词里是否出现本轮已暴露的工具标识符（词边界 / 反引号，全等）。"""
+    if not text or not names:
+        return None
+    lower_map = {n.lower(): n for n in names if n}
+    if not lower_map:
+        return None
+    for m in _EXPOSED_TOOL_TOKEN_RE.finditer(text):
+        token = m.group(1) or m.group(2)
+        if token is None:
+            continue
+        key = token.lower()
+        if key in lower_map:
+            return lower_map[key]
+    return None
+
+
+def check_ooc(
+    text: str,
+    tier: str = "roleplay",
+    user_text: str = "",
+    exposed_tool_names: Sequence[str] = (),
+) -> Optional[FirewallHit]:
     """检测 AI 输出是否命中出戏红线。``tier="plain"`` 直接放行（那类节点允许暴露系统信息）。
 
     命中返回 ``FirewallHit``，否则 None。规范化匹配词库 + 独立正则。
@@ -304,6 +332,12 @@ def check_ooc(text: str, tier: str = "roleplay", user_text: str = "") -> Optiona
     # 注意：tier="plain" 目前生产无调用方，为将来非角色扮演出口预留（尚未接线）
     if not text or tier == "plain":
         return None
+
+    # 交付状态汇报（系统日志腔）：优先于词库——形态独立，误杀面由双信号共现约束
+    from gsuid_core.ai_core.agent_run.speech_policy import looks_like_delivery_status_narration
+
+    if looks_like_delivery_status_narration(text):
+        return FirewallHit(category="delivery_narration", matched=["交付状态汇报"])
 
     norm = normalize_for_match(text)
     extra = _extra_terms()
@@ -345,6 +379,9 @@ def check_ooc(text: str, tier: str = "roleplay", user_text: str = "") -> Optiona
     _sc = _SYSTEM_COPY_LEAK_RE.search(text)
     if _sc is not None:
         system_hits.append(f"系统文案:{_sc.group(0)[:40]}")
+    _tool_leak = _exposed_tool_name_leak(text, exposed_tool_names)
+    if _tool_leak is not None:
+        system_hits.append(f"框架泄漏:{_tool_leak}")
     if system_hits:
         return FirewallHit(category="system_term", matched=system_hits)
     return None
@@ -373,6 +410,12 @@ def build_rewrite_warning(hit: FirewallHit) -> str:
         )
     if hit.category == "machine_dump":
         return "⛔ 内容像技术堆栈/状态 JSON，禁止当台词。用角色短句说稍后再试，不要复述 Traceback、status、错误码。"
+    if hit.category == "delivery_narration":
+        return (
+            "⛔ 你在用系统日志口吻向用户播报「任务已完成/图已发送/无需追加发言」。"
+            "交付已经完成，此刻正确的输出是 <SILENCE>；若确需收尾，只用一句角色口吻的短话，"
+            "禁止汇报任务状态、禁止念收件人、禁止自我静默声明。"
+        )
     if any("框架泄漏" in m or "系统文案" in m for m in hit.matched):
         return (
             "⛔ 内容含内部工具名 / 资源句柄 / 编排或系统文案（如 read_handle、res_/to_、"

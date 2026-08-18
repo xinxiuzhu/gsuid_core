@@ -10,7 +10,7 @@ import shutil
 import asyncio
 from pathlib import Path
 
-import websockets.client
+import websockets
 from msgspec import json as msgjson
 
 from gsuid_core.models import Message, MessageSend, MessageReceive
@@ -81,13 +81,13 @@ async def recv(ws, name: str, idle=50.0, hard=180.0):
 async def send(ws, text: str, user_type="direct", group_id=None, user_id="99999"):
     msg = MessageReceive(
         bot_id="console",
-        bot_self_id="3399214199",
+        bot_self_id="900000001",
         user_type=user_type,  # type: ignore[arg-type]
         user_pm=0,
         group_id=group_id,
         user_id=user_id,
         content=[Message(type="text", data=text)],
-        sender={"nickname": "Wuyi测试"},
+        sender={"nickname": "测试主人"},
     )
     await ws.send(msgjson.encode(msg))
     print(f"\n[SENT] {text}")
@@ -95,7 +95,7 @@ async def send(ws, text: str, user_type="direct", group_id=None, user_id="99999"
 
 async def main():
     print("connect", WS_URL)
-    ws = await websockets.client.connect(WS_URL, max_size=2**25, open_timeout=30)
+    ws = await websockets.connect(WS_URL, max_size=2**25, open_timeout=30)
     results = {}
 
     await send(ws, "sayu 广州近七天天气怎么样")

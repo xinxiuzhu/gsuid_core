@@ -3,11 +3,35 @@
 > **读者**：继续改 `ai_core` 的开发者 / Agent
 > **输入**：
 > - 目标基线：`plans/clear type.md`（旧目标，多数仍有效）
-> - 代码风格：`docs/LLM.md`
+> - 代码风格：`AGENTS.md`
 > - 本批改动：`agent_run` 拆分 + prompts / research / web_search / 配置微调
 > - 实测日志：`data/ai_core/session_logs/web_web_web-client-001_private_user_web_01_4a97e94e_20260808_220805.json`
 > - 关联子代理：`subagents/capagent_research_agent_…76cf8b07…`、`capagent_render_agent_…a498fa…a0caedd5…`
 > **原则**：归因走流程与提示词工程；**禁止**用业务域关键词/正则特判当主修复。
+
+---
+
+## 状态更新（2026-08-10）
+
+本报告列的多数 P 项已在 **2026-08-10 OOC 根治批次**落地，归因与方案详见
+[`AI_SESSION_OOC_ROOTCAUSE_20260810.md`](AI_SESSION_OOC_ROOTCAUSE_20260810.md)。对照：
+
+| 本报告项 | 2026-08-10 处置 |
+|----------|------------------|
+| **P0** 框架注入/交付轮对 C 端说话 | ✅ **DELIVERED 交付终局态**（带台词交付后只许 `<SILENCE>`）+ `delivery_narration` 防火墙 |
+| **P1** `saw_structured_return` 过粗误武装出图 | ✅ 出图候选加**时效+多点判据**（气候/月均、单点不武装） |
+| **P2** 墙钟 vs 多段委派 | 🔶 墙钟文案保留；DELIVERED/时效契约缓解契约分裂 |
+| **P3** 中间台词假完成 | 🔶 假完成闸保留；DELIVERED 堵住交付后状态汇报 |
+| **P4** find_tools 召回错域 | ✅ **召回相关度阈值** `tool_recall_threshold` + **能力缺口登记** |
+| **P5** 零编造破口（气候值冒充实时） | ✅ **时效契约**：无时点聚合禁说成「现在」读数 |
+| **P6** 搜索 thrash / 不读 handle | 🔶 thrash 闸保留 |
+| **P7** 工具池膨胀 / cache 前缀 | ✅ 召回阈值可配（减少无关工具进前缀） |
+| **P8** 能力代理工具污染 | 🔶 阈值缓解 |
+| **P9** 用户插话 vs Kanban 交付竞态 | ✅ **supersede 交接**（在途委派留交接语，后到 run 感知） |
+| **P10** 出图质量 | ✅ render prompt 加执行效率约束（规划≤5句、禁 thinking 重写 HTML） |
+
+另新增：**零工具纠正 SILENCE 自洽出口**（概念题不刷屏）、**主通道单轮出站配额**、
+**heartbeat 话头门**（无具体话头降级沉默）。
 
 ---
 
@@ -77,9 +101,9 @@
 | research 工具池混入游戏插件工具 | **中** | research log 可见 `send_waves_abyss_info` 等，干扰注意力与 token |
 | `find_tools` 语义召回错域 | **高（旧问题）** | 天气 → NTE；非本批引入，但本批未治 |
 | 中间 TextPart 在 tool 前发送 | **中** | 「图出了」假完成台词可在 create_subagent(render) 之前发出 |
-| LLM.md 红线 | **低~中** | `agent_run` 无 `cast`/`type: ignore`/`getattr`；但 `settle`/`loop` 保留大量 `try/except` 兜底发送/纠正路径（多由旧代码迁入） |
+| AGENTS.md 红线 | **低~中** | `agent_run` 无 `cast`/`type: ignore`/`getattr`；但 `settle`/`loop` 保留大量 `try/except` 兜底发送/纠正路径（多由旧代码迁入） |
 
-### 2.4 LLM.md 风格合规
+### 2.4 AGENTS.md 风格合规
 
 | 红线 | agent_run 现状 |
 |------|----------------|
@@ -89,7 +113,7 @@
 | 完全类型注解 | `RunOnceState` / `RunOnceHost` 方向正确 |
 | 注释 ≤2 行 88 字 | 大体遵守；少量阶段说明略长但仍克制 |
 
-**结论**：拆分**方向符合** LLM.md 的类型化与分层；**并未**借重构把「异常兜底文化」清干净。行为修复不应再堆 try/regex，而应把契约变成**状态机可判定**的阶段。
+**结论**：拆分**方向符合** AGENTS.md 的类型化与分层；**并未**借重构把「异常兜底文化」清干净。行为修复不应再堆 try/regex，而应把契约变成**状态机可判定**的阶段。
 
 ---
 

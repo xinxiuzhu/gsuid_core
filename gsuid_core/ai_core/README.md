@@ -8,13 +8,13 @@
 
 ## ⚠️ 必读注意点（动手前先看）
 
-1. **遵守 `docs/LLM.md` 的红线**：禁止 `try/except` 兜底、禁止 `cast()`、禁止 `type: ignore`、禁止 `getattr / dict.get` 兜底。所有红线在本目录代码里都会被实际 review。
+1. **遵守 `AGENTS.md` 的红线**：禁止 `try/except` 兜底、禁止 `cast()`、禁止 `type: ignore`、禁止 `getattr / dict.get` 兜底、禁止 `Any`（运行时变量类型必须可追踪，§1.8）。所有红线在本目录代码里都会被实际 review。
 2. **`Bot` ≠ `_Bot`**（`gsuid_core/bot.py`）：
    - `_Bot` 是底层 WebSocket 实现，**不依赖 Event**，构造为 `_Bot(_id, ws)`。
    - `Bot` 是高层包装，**强依赖 Event**，构造为 `Bot(_bot, ev)`。
    - 本目录所有"对外发送"路径都走 `Bot.send` / `send_chat_result`；想拿底层 `_Bot` 只能从 `gss.active_bot` 里捞。**不要**自己造一个无 `Event` 的 `Bot` 实例。
 3. **完全异步**：所有可能阻塞的方法必须 `async def`；同步 CPU 工作用 `@to_thread`（见 `gsuid_core/pool.py`）。
-4. **数据库**：本目录的所有表都继承 `BaseIDModel / BaseBotIDModel / BaseModel`，所有类方法用 `@with_session`；表名 = 类名全小写无下划线，**禁止** `__tablename__`。详见 `docs/LLM.md` §3。
+4. **数据库**：本目录的所有表都继承 `BaseIDModel / BaseBotIDModel / BaseModel`，所有类方法用 `@with_session`；表名 = 类名全小写无下划线，**禁止** `__tablename__`。详见 `AGENTS.md` §3。
 5. **主动消息（Heartbeat / ScheduledTask / Kanban / 工具主动 send）必须走 `ai_core.proactive.emit_proactive_message`**——不要直接 `bot.send` + 手动 `message_history.add_message` + 手动 `dispatcher.register_send`。详见 §"`proactive/`" 与 `plans/proactive_message_session_unification_20260529.md`。
 6. **会话日志统一在 `AISessionLogger`**（详见 `docs/AI_SESSION_LOGGING.md`）：**所有 `GsCoreAIAgent` 恒有 `_session_logger`**（非 Optional）——不传 `session_id` 的来源（评估 / meme / 记忆 / 图片理解等后台调用）会在 `__init__` 自动派生 `auto_<create_by>_<rand>` 的一次性 subagent id。SubAgent 日志落 `data/ai_core/session_logs/subagents/`，与主 session 物理隔离。**显式 SubAgent 用完仍建议 `agent._session_logger.close()`** 及时落盘（subagent 不跑后台轮询，靠 close/__del__ 落盘）。**相同 session_id 在 1 小时窗口内续写同一文件，超时滚动新文件**（`SESSION_WINDOW_SECONDS`）。
 7. **不要把任务 prompt 当 user_message 喂给主用户 session**（污染 `self.history` 与 `session_logger`，让用户回放历史时看到自己"发"过没发的话）。如果你要让人格执行某项后台任务，请派 SubAgent + emit_proactive_message。
@@ -243,8 +243,7 @@ Persona 与能力代理同构为一个 `AgentNode`（统一注册表 + persona �
 | `meme_tools.py` | 表情包检索 / 触发。 |
 | `html_render_tools.py` | `render_html_to_image`（**buildin 保底**，自由 HTML）；`render_card` / `render_markdown_to_image`（media 按需）。 |
 | `web_search.py / web_fetch.py` | 联网。 |
-| `rag_search.py` | 知识库检索。 |
-| `database_query.py` | 让 LLM 安全查 GsCore 内置表。 |
+| `rag_search.py` | 知识库检索（`search_cognition`）。 |
 | `file_manager.py / file_operations.py` | 工件落盘 / 读取。 |
 | `command_executor.py` | 桥接到 GsCore 触发器（让 LLM 主动调一条命令）。 |
 | `self_info.py / get_time.py / favorability_manager.py` | 自我认知 / 时间 / 好感度。 |
@@ -345,9 +344,14 @@ Persona 与能力代理同构为一个 `AgentNode`（统一注册表 + persona �
 
 | 文件 | 用途 |
 |---|---|
-| `web_search/search.py` | 顶层调度，自动选 Exa / Tavily。 |
-| `web_search/exa_search.py` / `tavily_search.py` | 具体 provider。 |
-| `web_fetch/` | URL 抓取 + 正文提取。 |
+| `web_search/search.py` | 顶层调度：主用 + 多源策略（`none` / `error_switch` / `auto_balance`）。默认主用 **Tavily**；异常**或空结果**换源。 |
+| `web_search/tavily_search.py` | Tavily（默认主用；Key 失败抛错）。 |
+| `web_search/jina_search.py` | Jina 搜索 `s.jina.ai`（需 API Key）。 |
+| `web_search/exa_search.py` | Exa；Key 失败抛错以便切换。 |
+| `web_fetch/__init__.py` | URL 抓取：默认 **Jina** `r.jina.ai`（Key 可选）+ 备用 **local** 直连；空正文/错误换源。 |
+
+配置：`ai_config` 的 `websearch_*` / `webfetch_*`；`tavily_config.json` / `jina_config.json` / `exa_config.json` / `web_fetch_config.json`。**热读，改配置无需重启。**
+内置工具：`web_search_tool` / `web_fetch_tool` 外层 `timeout=100`。控制台：`/ai-config` → 网络搜索服务 / 网页抓取服务。
 
 ---
 
@@ -387,7 +391,7 @@ User → Trigger → handle_ai
 ```
 
 > 完整时序：[`docs/AI_AGENT_LIFECYCLE_SEQUENCE.md`](../../docs/AI_AGENT_LIFECYCLE_SEQUENCE.md) §10.4–§10.6；
-> 开发导航：[`docs/skills/gscore-development/references/07-tool-registry-and-agent.md`](../../docs/skills/gscore-development/references/07-tool-registry-and-agent.md) §7.12。
+> 开发导航：[`.agents/skills/gscore-development/references/07-tool-registry-and-agent.md`](../../.agents/skills/gscore-development/references/07-tool-registry-and-agent.md) §7.12。
 
 
 ### B. 主动回复（统一闭包）
@@ -424,9 +428,9 @@ User → Trigger → handle_ai
 
 ## 相关上层文档
 
-- `docs/LLM.md` — 代码红线（**写代码前先读**）。
+- `AGENTS.md` — 代码红线（**写代码前先读**）。
 - `docs/AI_AGENT_LIFECYCLE_SEQUENCE.md` — 一条消息完整生命周期（Agent loop / **pre_send_gate** / 呈现层）。
 - `docs/TAKUMI_HTML_GUIDE.md` — HTML 出图 / table rewrite 约束。
-- `docs/skills/gscore-development/SKILL.md` — 框架开发指南（§7 输出闸、§12.22 不变量）。
-- `docs/skills/gscore-ai-core-api/SKILL.md` — 插件侧 AI API（内置工具分类）。
+- `.agents/skills/gscore-development/SKILL.md` — 框架开发指南（§7 输出闸、§12.22 不变量）。
+- `.agents/skills/gscore-ai-core-api/SKILL.md` — 插件侧 AI API（内置工具分类）。
 - `gsuid_core/ai_core/rag/README.md` / `persona/README.md` / `scheduled_task/README.md` / `buildin_tools/README.md` — 各子模块 README。

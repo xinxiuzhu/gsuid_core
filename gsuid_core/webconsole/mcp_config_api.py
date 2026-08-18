@@ -11,13 +11,15 @@ from typing import Any, Dict, List, Optional
 from fastapi import Depends
 from pydantic import BaseModel
 
+from gsuid_core.utils.secret_mask import unmask_against
 from gsuid_core.webconsole.app_app import app
-from gsuid_core.webconsole.web_api import require_auth
+from gsuid_core.webconsole.web_api import require_auth, require_admin, require_admin_header
 from gsuid_core.ai_core.mcp.startup import (
     unregister_mcp_server,
     register_all_mcp_tools,
     register_single_mcp_server,
 )
+from gsuid_core.ai_core.mcp.transport import MCP_TRANSPORT_STDIO, resolve_mcp_transport
 from gsuid_core.ai_core.mcp.mcp_presets import MCP_PRESETS
 from gsuid_core.ai_core.mcp.config_manager import MCPConfig, MCPToolDefinition, mcp_config_manager
 from gsuid_core.utils.plugins_config.models import GsStrConfig
@@ -98,12 +100,12 @@ class MCPConfigCreate(BaseModel):
     """MCP 配置创建请求模型"""
 
     name: str
-    transport: str = "stdio"  # "stdio" 或 "sse"
+    transport: str = MCP_TRANSPORT_STDIO
     command: str = ""
     args: List[str] = []
     env: Dict[str, str] = {}
-    url: str = ""  # SSE 服务器 URL
-    headers: Dict[str, str] = {}  # SSE HTTP 请求头
+    url: str = ""
+    headers: Dict[str, str] = {}
     enabled: bool = True
     register_as_ai_tools: bool = False
     tools: List[MCPToolDefinitionModel] = []
@@ -128,7 +130,7 @@ class MCPConfigUpdate(BaseModel):
 
 @app.get("/api/ai/mcp/list", summary="获取 MCP 配置列表", tags=MCP_CONFIG)
 async def get_mcp_configs_list(
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin_header),
 ) -> Dict[str, Any]:
     """
     获取所有 MCP 配置列表
@@ -179,7 +181,7 @@ MCP_STATIC_ROUTES = frozenset({"list", "presets", "discover", "import", "reload"
 @app.get("/api/ai/mcp/{config_id}", summary="获取 MCP 配置详情", tags=MCP_CONFIG)
 async def get_mcp_config_detail(
     config_id: str,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin_header),
 ) -> Dict[str, Any]:
     """
     获取指定 MCP 配置的详细信息
@@ -219,7 +221,7 @@ async def get_mcp_config_detail(
 @app.post("/api/ai/mcp", summary="创建 MCP 配置", tags=MCP_CONFIG)
 async def create_mcp_config(
     body: MCPConfigCreate,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     创建新的 MCP 配置
@@ -260,7 +262,11 @@ async def create_mcp_config(
 
     config = MCPConfig(
         name=body.name,
-        transport=body.transport,
+        transport=resolve_mcp_transport(
+            body.transport,
+            url=body.url,
+            command=body.command,
+        ),
         command=body.command,
         args=body.args,
         env=body.env,
@@ -302,7 +308,7 @@ async def create_mcp_config(
 async def update_mcp_config(
     config_id: str,
     body: MCPConfigUpdate,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     更新 MCP 配置
@@ -317,6 +323,9 @@ async def update_mcp_config(
     """
     # 过滤掉 None 字段
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    existing = mcp_config_manager.get_config(config_id)
+    if existing is not None:
+        updates = unmask_against(updates, existing.to_dict())
 
     if not updates:
         return {
@@ -350,7 +359,7 @@ async def update_mcp_config(
 @app.delete("/api/ai/mcp/{config_id}", summary="删除 MCP 配置", tags=MCP_CONFIG)
 async def delete_mcp_config(
     config_id: str,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     删除 MCP 配置
@@ -386,7 +395,7 @@ async def delete_mcp_config(
 @app.post("/api/ai/mcp/{config_id}/toggle", summary="切换启用/禁用状态", tags=MCP_CONFIG)
 async def toggle_mcp_config(
     config_id: str,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     切换 MCP 配置的启用/禁用状态
@@ -437,7 +446,7 @@ async def toggle_mcp_config(
 
 @app.post("/api/ai/mcp/reload", summary="热重载所有配置", tags=MCP_CONFIG)
 async def reload_mcp_configs(
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     热重载所有 MCP 配置并重新注册工具
@@ -509,6 +518,7 @@ async def discover_mcp_tools(
     try:
         client = MCPClient(
             name=config.name,
+            transport=config.get_transport(),
             command=config.command,
             args=config.args,
             env=config.env,
@@ -552,18 +562,18 @@ class MCPDiscoverRequest(BaseModel):
     """MCP 临时配置（仅用于发现工具，不保存）"""
 
     name: str
-    transport: str = "stdio"  # "stdio" 或 "sse"
+    transport: str = MCP_TRANSPORT_STDIO
     command: str = ""
     args: List[str] = []
     env: Dict[str, str] = {}
-    url: str = ""  # SSE 服务器 URL
-    headers: Dict[str, str] = {}  # SSE HTTP 请求头
+    url: str = ""
+    headers: Dict[str, str] = {}
 
 
 @app.post("/api/ai/mcp/tools/discover", summary="从临时配置发现工具", tags=MCP_CONFIG)
 async def discover_tools_from_temp_config(
     body: MCPDiscoverRequest,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     从临时 MCP 配置发现可用工具（不保存配置）
@@ -583,6 +593,11 @@ async def discover_tools_from_temp_config(
     try:
         client = MCPClient(
             name=body.name,
+            transport=resolve_mcp_transport(
+                body.transport,
+                url=body.url,
+                command=body.command,
+            ),
             command=body.command,
             args=body.args,
             env=body.env,
@@ -626,7 +641,7 @@ class MCPImportRequest(BaseModel):
 @app.post("/api/ai/mcp/tools/import", summary="从 JSON 配置导入 MCP 服务器", tags=MCP_CONFIG)
 async def import_mcp_from_json(
     body: MCPImportRequest,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     从 JSON 配置导入 MCP 服务器
@@ -679,28 +694,23 @@ async def import_mcp_from_json(
                 "data": None,
             }
 
-        # 构建 MCPConfig（兼容 stdio 和 sse 两种格式）
         env = server_config.get("env", {})
         args = server_config.get("args", [])
         url = server_config.get("url", server_config.get("sseUrl", ""))
         headers = server_config.get("headers", server_config.get("headersTemplate", {}))
-        transport = server_config.get("transport", "")
+        command = server_config.get("command", "")
+        # 官方格式可能用 type，部分客户端用 transport
+        raw_transport = server_config.get("transport", "") or server_config.get("type", "")
+        transport = resolve_mcp_transport(raw_transport, url=url, command=command)
 
-        # 自动推断 transport：如果 url 存在且以 http 开头，则为 sse
-        if not transport or transport == "auto":
-            if url and isinstance(url, str) and url.startswith("http"):
-                transport = "sse"
-            else:
-                transport = "stdio"
-
-        # 如果没有 tools，先连接服务器发现工具
         tools = []
         try:
             from gsuid_core.ai_core.mcp import MCPClient
 
             client = MCPClient(
                 name=server_name,
-                command=server_config.get("command", ""),
+                transport=transport,
+                command=command,
                 args=args,
                 env=env,
                 url=url,
@@ -722,7 +732,7 @@ async def import_mcp_from_json(
         mcp_config = MCPConfig(
             name=server_name,
             transport=transport,
-            command=server_config.get("command", ""),
+            command=command,
             args=args,
             env=env,
             url=url,
@@ -849,7 +859,7 @@ class MCPToolDetailsUpdate(BaseModel):
 async def update_mcp_tools_config(
     item_key: str,
     body: MCPToolDetailsUpdate,
-    _: Dict[str, Any] = Depends(require_auth),
+    _: Dict[str, Any] = Depends(require_admin),
 ) -> Dict[str, Any]:
     """
     更新指定 MCP 工具配置项（含 details 参数映射）

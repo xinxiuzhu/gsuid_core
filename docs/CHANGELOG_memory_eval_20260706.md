@@ -2,7 +2,7 @@
 
 > 本 CHANGELOG **完全并入并取代** `docs/memory_eval_consolidated_20260706.md`（其全文见 **附录 A**），
 > 并在其基础上补齐**全部未提交代码的逐文件详解**、**本轮 code review 的缺陷发现与修复**，以及
-> **对照 `docs/LLM.md` 红线的合规结论**。面向 GsCore 维护者，一份文档看清「这次到底改了什么、
+> **对照 `AGENTS.md` 红线的合规结论**。面向 GsCore 维护者，一份文档看清「这次到底改了什么、
 > 为什么改、有没有引入新坑、坑修没修」。
 >
 > 变更规模：**32 改动文件 + 6 个新增文件，约 +2000/-280 行**（含跨会话累积）。
@@ -22,7 +22,7 @@
   - [H. 评测基础设施（eval/）](#h-评测基础设施eval)
   - [I. 文档更新](#i-文档更新)
 - [第二部分：本轮 code review 的缺陷发现与修复](#第二部分本轮-code-review-的缺陷发现与修复)
-- [第三部分：对照 LLM.md 红线的合规结论](#第三部分对照-llmmd-红线的合规结论)
+- [第三部分：对照 AGENTS.md 红线的合规结论](#第三部分对照-agentsmd-红线的合规结论)
 - [附录 A：memory_eval_consolidated_20260706.md 全文并入](#附录-amemory_eval_consolidated_20260706md-全文并入)
 
 ---
@@ -68,7 +68,7 @@
 
 | 文件 | 改了什么 | 关键点 / 坑 |
 |---|---|---|
-| `memory/ingestion/eval_write_lock.py`（新增） | 进程内 `asyncio.Lock`（`eval_write_guard()`）：`eval_mode` 下把"快速写事务"显式排队（毫秒级交接），LLM 抽取/嵌入仍在锁外并发；非 eval 返回 `nullcontext()` 零开销 | SQLite 单写者；窗口化并发直接撞写锁 → `busy_timeout(5s)` 忙等成主要耗时。线上按 scope 串行 flush，锁恒不竞争、行为不变 |
+| `memory/ingestion/eval_write_lock.py`（新增） | 进程内 `asyncio.Lock`（`eval_write_guard()` / `db_write_guard()`） | **历史**：初版仅 `eval_mode` 启用。**现状（2026-08）**：线上与 eval **共用**写锁；热路径 Episode/Entity/Edge/Preference/touch/生命周期写均排队；LLM/嵌入/Qdrant 必须在锁外 |
 | `memory/ingestion/entity.py` | `extract_and_upsert_entities` 包**乐观重试**（`IntegrityError` / `OperationalError`，最多 6 次退避）+ `eval_write_guard` | 同 scope 并发窗口撞 `UNIQUE(scope_key,name)` → 回滚重试，下次 `find_existing` SQL 精确命中另一窗口刚提交实体、改走更新分支。旧"按 scope 串行整个 find+写"粗锁把向量去重也串行化、吞吐骤降 ~10x |
 | `memory/ingestion/edge.py` | **英文否定极性**：`_NEGATION_RE_EN`（词边界 `never/not/no/none/without/refuse/deny/stopped/n't`）并入 `_fact_polarity` | BEAM 教训：仅中文标记时英文语料否定全漏检、C11 矛盾引擎从未触发。词边界避免 `note→not`/`knows→no` 误命中 |
 | `memory/ingestion/edge.py` | `extract_and_upsert_edges` 新增 `valid_at` 参数（回放语料真实陈述时间，缺省仍用当前时间）；写入包 `OperationalError` 重试 6 次（每次重置累积态）+ `eval_write_guard` | valid_at 污染修复的写侧 |
@@ -129,18 +129,18 @@
 | 文件 | 改了什么 |
 |---|---|
 | `docs/MEMORY_SYSTEM.md` | §3.2.2 Qdrant 规模扩展性与内存实测表；§8.5 本地嵌入 CPU/内存 env |
-| `docs/skills/.../10-rag-knowledge-embedding.md` | §10.5.1 本地嵌入 CPU/内存调优（三 env + onnxruntime arena 只增不减 + 空载 4.6GB 是插件） |
-| `docs/skills/.../11-statistics-webconsole-database.md` | Token 来源与流式 usage 语义、预算共享同源、内存账本回载注意 |
-| `docs/skills/.../12-developer-pitfalls.md` | §12.17 流式 usage 膨胀（D-22）；§12.18 缺陷速查表扩到 D-22；§12.19 记忆/嵌入性能内存瓶颈 |
-| `docs/skills/.../03-plugin-loading-and-config.md` | `usage_stats_mode` 热更新条目 |
-| `docs/skills/.../SKILL.md` | D-21→D-22 |
+| `.agents/skills/.../10-rag-knowledge-embedding.md` | §10.5.1 本地嵌入 CPU/内存调优（三 env + onnxruntime arena 只增不减 + 空载 4.6GB 是插件） |
+| `.agents/skills/.../11-statistics-webconsole-database.md` | Token 来源与流式 usage 语义、预算共享同源、内存账本回载注意 |
+| `.agents/skills/.../12-developer-pitfalls.md` | §12.17 流式 usage 膨胀（D-22）；§12.18 缺陷速查表扩到 D-22；§12.19 记忆/嵌入性能内存瓶颈 |
+| `.agents/skills/.../03-plugin-loading-and-config.md` | `usage_stats_mode` 热更新条目 |
+| `.agents/skills/.../SKILL.md` | D-21→D-22 |
 | **本轮新增（见本 CHANGELOG 配套）** | §12.20 大语料回灌摄入架构 + §12.21 日志缓冲 SSE 游标陷阱（写入 12-developer-pitfalls.md）；§09 memory 补 batch_observe/granular 摄入指针 |
 
 ---
 
 ## 第二部分：本轮 code review 的缺陷发现与修复
 
-对全部 32 改动 + 6 新增文件逐一 review（重点排查新引入 bug + 对照 `docs/LLM.md`）。**全部 22 个
+对全部 32 改动 + 6 新增文件逐一 review（重点排查新引入 bug + 对照 `AGENTS.md`）。**全部 22 个
 production 文件 `py_compile` 通过**。发现并修复 **3 处缺陷**，另记 2 条低风险观察项。
 
 ### 已修复（3）
@@ -168,7 +168,7 @@ production 文件 `py_compile` 通过**。发现并修复 **3 处缺陷**，另�
   `if req.trigger_rebuild: await rebuild_task(scope_key)`（`rebuild_task` 本就已 import），此时
   rebuild 能看到最新实体/边。新 `ingest_graph.py` 走独立 rebuild 端点不受影响。
 
-#### FIX-3 · `memory/ingestion/worker.py` Step 5：`getattr` + `try/except` 兜底违反 LLM.md §1.1/§1.4（红线）
+#### FIX-3 · `memory/ingestion/worker.py` Step 5：`getattr` + `try/except` 兜底违反 AGENTS.md §1.1/§1.4（红线）
 
 - **根因**：`ts_list = [r.timestamp for r in high_records if getattr(r, "timestamp", None)]` 外包
   `try/except Exception`。`ObservationRecord.timestamp` 是**必填 aware `datetime`**（observer.py:175），
@@ -179,12 +179,9 @@ production 文件 `py_compile` 通过**。发现并修复 **3 处缺陷**，另�
 
 ### 低风险观察项（记录，未改）
 
-- **OBS-1 · `edge.py` 重试与 `AIMemConflict.record` 的重复**：写入重试循环内调用的
-  `AIMemConflict.record` 是 `@with_session`（**独立 session 即时提交**），若外层 `session.commit()`
-  抛 `OperationalError` 触发重试，上一轮已提交的 Conflict 行不会回滚 → 重试可能**重复记录同一矛盾
-  摘要**。仅 `eval_mode` 且撞写锁时发生；`get_by_signatures` limit 6、重复摘要无害，注入体验轻微
-  冗余。代码注释"每次重试重置累积态避免重复"仅指 `edges_vector_data/merged_count`，不含已提交的
-  Conflict 行——措辞略过头，但影响可忽略，未改。
+- **OBS-1 · `edge.py` 重试与 `AIMemConflict.record` 的重复**：**已修（2026-08）**。矛盾行改为
+  `AIMemConflict.attach(session, …)` 与 edge 写**同事务**；外层 commit 失败回滚时 Conflict
+  一并回滚，不再半提交重复摘要。独立 `record(@with_session)` 仍保留给非批写路径。
 - **OBS-2 · `ai_memory_api._run_one` 两处 `# type: ignore`**：源于窗口类型声明 `List[List["object"]]`
   的宽松标注（`recs: List[object]` 上取 `.timestamp`）。属评测专用端点的类型洁癖问题、非运行时
   bug；收紧为 `List[List[ObservationRecord]]` 需引入模块级 import（有循环导入风险），权衡后保留
@@ -194,7 +191,7 @@ production 文件 `py_compile` 通过**。发现并修复 **3 处缺陷**，另�
 
 ---
 
-## 第三部分：对照 LLM.md 红线的合规结论
+## 第三部分：对照 AGENTS.md 红线的合规结论
 
 | 项 | 结论 |
 |---|---|
@@ -444,7 +441,7 @@ python eval/BEAM_10M/run_beam_eval.py judge --answers eval/BEAM_10M/results/answ
 /goal 续跑 docs/CHANGELOG_memory_eval_20260706.md（原 memory_eval_consolidated_20260706.md），把
 LongMemEval 从 88.6% 冲向 90%+、BEAM conv0 从 40% 抬升。
 已落地勿重复实现：provider 并发/故障路由、时间分桶语义检索(ts_range)、嵌入 cpu//2 线程 + batch64 省内存、
-judge 瞬时故障重试、注入当前时间(--inject-date)。核对 docs/LLM.md 红线后再动代码。
+judge 瞬时故障重试、注入当前时间(--inject-date)。核对 AGENTS.md 红线后再动代码。
 按杠杆排序执行（A.3）：
 1) 换强作答/判分模型：把 high_level_provider 指向强模型（MiniMax-M3 满血 / DeepSeek-R / Claude），
    仅 probe+judge 用高档（token 开销小）、抽取仍走低档商汤。预期吃掉 LME multi-session/preference 与

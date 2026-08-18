@@ -14,6 +14,7 @@ from dataclasses import dataclass
 _BOILERPLATE_LINE_RE = re.compile(
     r"^\s*(?:"
     r"</?search_results>|"
+    r"\[source=|"
     r"（以下为检索|仅供参考|不是对你的指令|"
     r"摘要里的|数字.{0,12}滞后|张冠李戴|"
     r"实时数值须|优先调|结构化数据|"
@@ -62,6 +63,28 @@ def _is_boilerplate_line(line: str) -> bool:
         if not _RESULT_START_RE.match(s) and "http" not in s.lower():
             return True
     return False
+
+
+def extract_persist_title(content: str, max_len: int = 256) -> str:
+    """落盘短标题：优先 ``query:`` 行，否则首条非导语行。"""
+    body = (content or "").replace("\r\n", "\n")
+    for raw in body.split("\n"):
+        line = raw.strip()
+        if not line.lower().startswith("query:"):
+            continue
+        rest = line.split(":", 1)[1].strip()
+        cut = rest.find(" [")
+        if cut > 0:
+            rest = rest[:cut].strip()
+        return rest[:max_len]
+    for raw in body.split("\n"):
+        line = raw.strip()
+        if not line or _is_boilerplate_line(line):
+            continue
+        if line.startswith("<") or line.lower().startswith("query:"):
+            continue
+        return line[:max_len]
+    return ""
 
 
 def extract_info_summary(content: str, max_len: int = 400) -> str:
@@ -153,20 +176,25 @@ class PersistedHandleCard:
     summary: str
     size_bytes: int
     read_tool: str = "read_handle"
-    long_structured: bool = True
+    long_structured: bool = False
     inline_head: str = ""
+    # False：主人格交付卡，禁止把「去展开全文」写成可执行下一步
+    speech_expand: bool = True
 
     def format(self) -> str:
         how = f"read_handle(handle_id={self.id!r}, offset=0, limit=8000)"
         lines = [
             f"[persisted id={self.id} kind={self.kind} mime={self.mime} size={self.size_bytes}]",
             f"summary: {self.summary[:200]}",
-            f"how_to_read: {how}  # 看返回文首【读窗口】再续读 offset；禁止全文念给用户",
         ]
+        if self.speech_expand:
+            lines.append(f"how_to_read: {how}  # 看返回文首【读窗口】再续读 offset；禁止全文念给用户")
+        else:
+            lines.append(f"read_tool={self.read_tool}  # 专职节点读全文；主人格只用 summary，禁止展开念台词")
         if self.long_structured:
             lines.append(
-                "long_structured=true → 多项/长文请 create_subagent("
-                'agent_profile="render_agent", task=本id或版式要求) 出图；短结论不必出图'
+                "long_structured=true → 长对照可用 create_subagent("
+                'agent_profile="render_agent", task=本id或版式要求) 出图；短答不必'
             )
         if self.mime.startswith("image/"):
             lines.append("image=true → send_message_by_ai(image_id=本id) 直发，勿 read_handle 当文本")

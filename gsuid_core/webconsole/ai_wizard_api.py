@@ -175,6 +175,17 @@ def _check_websearch_config() -> Dict[str, Any]:
         else:
             result["configured"] = True
             result["note"] = f"已配置 {len([k for k in api_keys if k])} 个 Exa API Key"
+    elif provider == "Jina":
+        from gsuid_core.ai_core.configs.ai_config import jina_config
+
+        api_keys = jina_config.get_config("api_key").data
+        if not api_keys or (isinstance(api_keys, list) and len(api_keys) == 0):
+            result["issues"].append("Jina API Key 未配置（s.jina.ai 搜索需要 Key）")
+        elif isinstance(api_keys, list) and all(not k for k in api_keys):
+            result["issues"].append("Jina API Key 为空")
+        else:
+            result["configured"] = True
+            result["note"] = f"已配置 {len([k for k in api_keys if k])} 个 Jina API Key"
     elif provider == "MCP":
         # MCP 作为 web search 提供方，检查是否有相关工具
         try:
@@ -325,7 +336,11 @@ def _check_persona_and_enable_range() -> Dict[str, Any]:
                 if scope == "disabled":
                     scope_desc = "已禁用"
                 elif scope == "global":
-                    scope_desc = "全部群聊"
+                    scope_desc = "全部群聊与私聊"
+                elif scope == "global_group":
+                    scope_desc = "全部群聊（不含私聊）"
+                elif scope == "global_private":
+                    scope_desc = "全部私聊（不含群聊）"
                 else:  # specific
                     if target_groups and len(target_groups) > 0:
                         scope_desc = f"限定 {len(target_groups)} 个群聊"

@@ -1,6 +1,7 @@
 from typing import Dict
 
 from gsuid_core.data_store import get_res_path
+from gsuid_core.ai_core.kits.base import OFF, KIT_SLOTS
 from gsuid_core.utils.plugins_config.models import (
     GSC,
     GsIntConfig,
@@ -92,10 +93,41 @@ AI_CONFIG: Dict[str, GSC] = {
         options=["local", "remote"],
     ),
     "websearch_provider": GsStrConfig(
-        "网络搜索服务提供方",
-        "指定网络搜索服务提供方",
+        "网络搜索服务提供方（主用）",
+        "指定网络搜索的主用提供方。多源策略非「无」时，失败会按备用顺序切换到其它已配置源",
         "Tavily",
-        options=["Tavily", "Exa", "MCP"],
+        options=["Tavily", "Jina", "Exa", "MCP"],
+    ),
+    "websearch_lb_strategy": GsStrConfig(
+        "网络搜索多源策略",
+        "无：仅使用主用源；错误切换：主用失败后按备用顺序尝试下一个已配置源；自动分流：在已配置源之间轮询分发请求",
+        "error_switch",
+        options=["none", "error_switch", "auto_balance"],
+    ),
+    "websearch_fallback_order": GsListStrConfig(
+        "网络搜索备用源顺序",
+        "错误切换/自动分流时的候选顺序（不含主用源）。留空则自动收集所有已配置的源（顺序：Tavily → Exa → Jina → MCP）",
+        [],
+        options=["Tavily", "Jina", "Exa", "MCP"],
+    ),
+    "webfetch_provider": GsStrConfig(
+        "网页抓取服务提供方（主用）",
+        "Jina：经 r.jina.ai 读取（API Key 可选）；local：本机直连抓取并转 Markdown。"
+        "多源策略非「无」时，失败会按备用顺序切换",
+        "Jina",
+        options=["Jina", "local"],
+    ),
+    "webfetch_lb_strategy": GsStrConfig(
+        "网页抓取多源策略",
+        "无：仅主用；错误切换：失败后按备用顺序切换；自动分流：候选源轮询",
+        "error_switch",
+        options=["none", "error_switch", "auto_balance"],
+    ),
+    "webfetch_fallback_order": GsListStrConfig(
+        "网页抓取备用源顺序",
+        "错误切换/自动分流时的候选顺序（不含主用）。默认 local",
+        ["local"],
+        options=["Jina", "local"],
     ),
     "image_understand_provider": GsStrConfig(
         "图片理解服务提供方",
@@ -183,9 +215,11 @@ AI_CONFIG: Dict[str, GSC] = {
     ),
     "agent_max_history": GsIntConfig(
         "对话历史保留条数",
-        "单会话注入模型的最大历史消息条数, 调大可记住更多上文但更费Token、也更易超出模型上下文",
-        15,
-        options=[10, 15, 20, 30, 50],
+        "单会话注入模型的最大历史消息条数。工具型 run 单轮产生 10+ 条消息, 过小会导致"
+        "几乎每轮触发 compact、provider 前缀缓存反复失效(方案五); 调大可记住更多上文、"
+        "减少 compact, 但更费 Token、也更易超出模型上下文",
+        30,
+        options=[10, 15, 20, 30, 50, 80],
     ),
     "suppress_intermediate_text": GsBoolConfig(
         "抑制中间文本",
@@ -268,10 +302,66 @@ AI_CONFIG: Dict[str, GSC] = {
         options=[100, 150, 200],
     ),
     "favor_daily_decay": GsIntConfig(
-        "好感度每日衰减步长",
-        "每日让好感度向中性(0)回归的步长, 0=不衰减。使亲密需持续正向互动维持, 一次性刷分会随时间回落",
+        "好感度闲置衰减步长",
+        "闲置超过'闲置衰减天数'的用户每日向中性(0)回归的步长, 0=不衰减。活跃用户不衰减",
         1,
         options=[0, 1, 2, 3],
+    ),
+    "Relationship": GsDivider(
+        "关系温度(好感度)引擎",
+        "好感度 = 人格对'这个人'的长期关系温度: 由互动质量与越界行为驱动, 不是聊天条数",
+        "关系温度(好感度)引擎",
+    ),
+    "favor_engine_enable": GsBoolConfig(
+        "关系引擎总开关",
+        "关闭则只读不写(管理员 set_user_favorability 工具除外), 用于回滚",
+        True,
+    ),
+    "favor_idle_days": GsIntConfig(
+        "闲置衰减天数",
+        "距最近一次正向互动超过该天数才开始每日衰减; 天天水群的用户不会被衰减掉档",
+        3,
+        options=[1, 3, 7, 14],
+    ),
+    "favor_daily_gain_cap": GsIntConfig(
+        "每日增益上限",
+        "同一用户单日最多涨多少好感, 防止'聊得多就涨满'",
+        3,
+        options=[1, 2, 3, 5],
+    ),
+    "favor_daily_loss_cap": GsIntConfig(
+        "每日扣分上限(绝对值)",
+        "同一用户单日最多扣多少好感, 防止单日螺旋下坠",
+        8,
+        options=[4, 8, 12, 20],
+    ),
+    "favor_session_gain_cap": GsIntConfig(
+        "会话窗增益上限",
+        "同一用户在'会话窗分钟数'内普通正信号最多涨多少",
+        1,
+        options=[1, 2, 3],
+    ),
+    "favor_session_window_minutes": GsIntConfig(
+        "会话窗分钟数",
+        "普通正信号的节流窗口长度(分钟)",
+        30,
+        options=[15, 30, 60],
+    ),
+    "favor_high_zone_diminish": GsBoolConfig(
+        "高分段递减",
+        "开启后 familiar 及以上区间忽略普通正信号, 只保留显著正信号",
+        True,
+    ),
+    "favor_meaningful_min_len": GsIntConfig(
+        "有内容对话最小字数",
+        "闲聊轮要被算作'当日首次有内容'所需的最小文本长度",
+        12,
+        options=[8, 12, 20],
+    ),
+    "favor_care_signal_enable": GsBoolConfig(
+        "正向照顾信号",
+        "开启后'分享情绪/身体状况且本轮履约'可 +1; 关闭则只保留负向规则与当日首次有内容",
+        True,
     ),
     "OutputRendering": GsDivider(
         "长文本呈现",
@@ -320,6 +410,18 @@ AI_CONFIG: Dict[str, GSC] = {
         3,
         options=[1, 2, 3, 5],
     ),
+    "tool_recall_threshold": GsFloatConfig(
+        "工具召回相关度阈值",
+        "工具向量召回的相似度下限; 低于该值的工具不装配(宁可由 find_tools 二次发现), "
+        "调高可减少无关工具混入、稳定请求前缀缓存, 调低可提升召回面",
+        0.38,
+    ),
+    "knowledge_recall_threshold": GsFloatConfig(
+        "知识库召回相关度阈值",
+        "知识库混合检索 dense 分支的余弦下限(方案六): 挡住跨域低相关条目(如金融问题召回"
+        "游戏词条)。只作用于 dense 分支, BM25 精确词命中不受影响; 调高更严、调低更宽",
+        0.35,
+    ),
     "web_search_default_limit": GsIntConfig(
         "Web搜索默认结果数",
         "web_search_tool 未显式指定时返回的搜索结果条数默认值",
@@ -355,6 +457,48 @@ AI_CONFIG: Dict[str, GSC] = {
         120,
         options=[60, 120, 180, 300],
     ),
+    "AgentKits": GsDivider(
+        "Agent 套件与 Hook 总线",
+        "loop 是薄编排器, 产品能力都是可替换套件。关某槽 = 该能力不注册(自然跳过), 不是在内核写 if 开关",
+        "Agent 套件与 Hook 总线",
+    ),
+    "agent_hooks_enable": GsBoolConfig(
+        "Hook 总线总闸",
+        "关闭后所有 Agent 环 hook 与套件均不触发, 回落到纯内核编排(应急回滚用)",
+        True,
+    ),
+    "allow_replace_sealed": GsBoolConfig(
+        "允许替换密封槽",
+        "密封槽(出站话术态 / 身份锚)承载安全面, 替换会拆防线。除非你清楚后果, 保持关闭",
+        False,
+    ),
+    "Cognition": GsDivider(
+        "认知联邦检索",
+        "记忆 / 知识 / 工具落盘 / 任务产物合成一个检索面, 让 Agent 一次调用拿到排过序的证据包",
+        "认知联邦检索",
+    ),
+    "cognition_artifact_enable": GsBoolConfig(
+        "认知检索含任务产物",
+        "把 Kanban 任务产物摘要纳入 search_cognition 的联邦范围(SQL 近期摘要, 不做向量)",
+        True,
+    ),
+    "cognition_min_score_ratio": GsFloatConfig(
+        "认知检索相对分下限",
+        "低于'最高分 x 该比例'的命中被判为弱相关, 不标高置信(挡跨域噪声)",
+        0.55,
+        min_value=0.0,
+        max_value=1.0,
+    ),
+    "cognition_prefetch_enable": GsBoolConfig(
+        "认知探针预取",
+        "问答/回指轮由框架在 H05 预取一次认知检索(闲聊仍 0 检索)。灰度后再开",
+        False,
+    ),
+    "cognition_mount_enable": GsBoolConfig(
+        "启动后挂载公共枢纽",
+        "READY 之后后台把插件/手动知识挂到公共枢纽, 并把完整匹配的环境实体连上去。关闭则不扫描",
+        True,
+    ),
 }
 
 
@@ -387,6 +531,16 @@ MCP_SERVER_CONFIG: Dict[str, GSC] = {
         options=[],
     ),
 }
+
+# 槽位配置从 KIT_SLOTS 派生: 18 个近似条目手写必然与槽位表漂移。
+for _slot_spec in KIT_SLOTS:
+    _hint = "off=该槽无占用者" + ("(密封槽, 关闭会拆安全面)" if _slot_spec.sealed else "")
+    AI_CONFIG[f"kit_slots.{_slot_spec.name}"] = GsStrConfig(
+        f"套件槽·{_slot_spec.name}",
+        f"{_slot_spec.description}。{_hint}",
+        _slot_spec.default_kit_id,
+        options=[_slot_spec.default_kit_id, OFF],
+    )
 
 
 PERSONA_CONFIG: Dict[str, GSC] = {
@@ -464,6 +618,91 @@ MINIMAX_CONFIG: Dict[str, GSC] = {
         "指定资源提供方式，url 为返回 URL 链接，local 为返回本地文件路径",
         "url",
         options=["url", "local"],
+    ),
+}
+
+# Jina Reader 全家桶：s.jina.ai（搜索）+ r.jina.ai（抓取）共用 API Key
+JINA_CONFIG: Dict[str, GSC] = {
+    "api_key": GsListStrConfig(
+        "Jina API密钥",
+        "前往 https://jina.ai 获取。搜索 s.jina.ai 需要 Key；抓取 r.jina.ai 可不填（匿名有额度限制），"
+        "填写后可获得更高请求额度。支持多 Key 池轮询",
+        [],
+        options=[],
+    ),
+    "max_results": GsIntConfig(
+        "最大搜索结果数",
+        "s.jina.ai 每次搜索的最大返回结果数量",
+        10,
+        options=[5, 10, 15, 20],
+    ),
+    "timeout": GsIntConfig(
+        "请求超时(秒)",
+        "调用 s.jina.ai / r.jina.ai 的超时时间",
+        30,
+        options=[10, 15, 20, 30, 45, 60],
+    ),
+    "search_base_url": GsStrConfig(
+        "搜索 API 地址",
+        "Jina 网页搜索端点，默认 https://s.jina.ai",
+        "https://s.jina.ai",
+        options=["https://s.jina.ai"],
+    ),
+    "reader_base_url": GsStrConfig(
+        "抓取 API 地址",
+        "Jina Reader 端点，默认 https://r.jina.ai（请求形式为 {base}/{target_url}）",
+        "https://r.jina.ai",
+        options=["https://r.jina.ai"],
+    ),
+}
+
+# web_fetch_tool 直连抓页配置（proxy / 超时 / UA 等运维向参数）
+_DEFAULT_WEB_FETCH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+WEB_FETCH_CONFIG: Dict[str, GSC] = {
+    "proxy": GsStrConfig(
+        "HTTP(S) 代理",
+        "网页抓取使用的代理地址，如 http://127.0.0.1:7890 或 http://user:pass@host:port。"
+        "留空则直连（若开启「读取系统代理」则仍可走环境变量 HTTP_PROXY/HTTPS_PROXY）",
+        "",
+        options=[],
+    ),
+    "trust_env": GsBoolConfig(
+        "读取系统代理环境变量",
+        "为 True 时，未单独配置 proxy 时会读取 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 等环境变量",
+        True,
+    ),
+    "timeout": GsIntConfig(
+        "请求超时(秒)",
+        "单次网页抓取的总超时时间（含连接与读响应），超时返回错误给 Agent",
+        20,
+        options=[5, 10, 15, 20, 30, 45, 60],
+    ),
+    "user_agent": GsStrConfig(
+        "User-Agent",
+        "HTTP 请求的 User-Agent；部分站点会拦截默认爬虫 UA，可改成浏览器标识",
+        _DEFAULT_WEB_FETCH_UA,
+        options=[_DEFAULT_WEB_FETCH_UA],
+    ),
+    "accept_language": GsStrConfig(
+        "Accept-Language",
+        "请求头 Accept-Language，影响部分站点返回语言",
+        "zh-CN,zh;q=0.9,en;q=0.8",
+        options=["zh-CN,zh;q=0.9,en;q=0.8", "en-US,en;q=0.9", "ja,en;q=0.9"],
+    ),
+    "max_download_mb": GsIntConfig(
+        "最大下载体积(MB)",
+        "响应体下载上限（兆字节），防止超大页面占满内存；超出则中止并报错",
+        5,
+        options=[1, 2, 5, 10, 20],
+    ),
+    "max_content_length": GsIntConfig(
+        "Markdown 最大字符数",
+        "返回给 Agent 的 Markdown 正文字符数上限，超出截断",
+        100000,
+        options=[20000, 50000, 100000, 200000],
     ),
 }
 
@@ -639,12 +878,6 @@ MEMORY_CONFIG: Dict[str, GSC] = {
         "指定最终检索数量, 可以提高检索精度但会增加性能开销",
         15,
         options=[5, 10, 15, 20],
-    ),
-    "query_tool_top_k": GsIntConfig(
-        "记忆查询工具召回条数",
-        "query_user_memory 工具(主人格主动查记忆)未显式指定时的检索召回条数",
-        20,
-        options=[10, 15, 20, 30],
     ),
     "memory_inject_max_chars": GsIntConfig(
         "记忆注入字符预算",
@@ -881,6 +1114,18 @@ exa_config = StringConfig(
     "GsCore AI Exa搜索配置",
     get_res_path("ai_core") / "exa_config.json",
     EXA_CONFIG,
+)
+
+jina_config = StringConfig(
+    "GsCore AI Jina搜索抓取配置",
+    get_res_path("ai_core") / "jina_config.json",
+    JINA_CONFIG,
+)
+
+web_fetch_config = StringConfig(
+    "GsCore AI WebFetch抓取配置",
+    get_res_path("ai_core") / "web_fetch_config.json",
+    WEB_FETCH_CONFIG,
 )
 
 persona_config = StringConfig(

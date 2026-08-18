@@ -163,7 +163,7 @@ AI 配置向导 API 用于帮助前端展示 AI 功能配置状态，提供配�
 | `persona.personas[].ai_mode` | array | AI 行动模式列表 |
 | `persona.personas[].inspect_interval` | int/null | 定时巡检间隔（分钟） |
 | `persona.personas[].has_inspect` | bool | 是否启用了定时巡检 |
-| `persona.personas[].scope` | string | 启用范围：`disabled`/`global`/`specific` |
+| `persona.personas[].scope` | string | 启用范围：`disabled`/`global`/`global_group`/`global_private`/`specific` |
 | `persona.personas[].target_groups` | array | 限定的群聊 ID 列表（仅 scope=specific 时有效） |
 | `persona.personas[].is_enabled` | bool | 该人格是否启用 |
 | `persona.personas[].scope_desc` | string | 范围描述文本 |
@@ -172,7 +172,7 @@ AI 配置向导 API 用于帮助前端展示 AI 功能配置状态，提供配�
 | `memory.memory_mode` | array | 记忆路径列表（被动感知/主动会话） |
 | `memory.memory_session` | string | 被动感知范围（按人格配置/全部群聊） |
 | `embedding` | object | 嵌入模型配置 |
-| `web_search` | object | Web Search 配置 |
+| `web_search` | object | Web Search 配置；`provider` 为 `Tavily`（默认）/`Jina`/`Exa`/`MCP`，Jina 时校验 `jina_config.api_key` |
 | `missing_configs` | array | 缺失配置项列表 |
 | `missing_configs[].category` | string | 问题分类 |
 | `missing_configs[].item` | string | 问题项名称 |

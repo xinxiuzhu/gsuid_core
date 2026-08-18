@@ -29,6 +29,7 @@ from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
+from gsuid_core.ai_core.buildin_tools.visibility import visible_to_capability_only
 
 from . import kanban
 from .models import AIAgentTask, AIAgentArtifact
@@ -868,7 +869,7 @@ async def artifact_put(
     return f"✅ 已登记 artifact: {art.id}（{art.size_bytes} bytes，mime={art.mime}）{binary_hint}"
 
 
-@ai_tools(category="planning", capability_domain="产物")
+@ai_tools(category="planning", capability_domain="产物", visible_when=visible_to_capability_only)
 async def artifact_get(
     ctx: RunContext[ToolContext],
     res_id: str,
@@ -935,7 +936,7 @@ async def artifact_get_recent(
 
     主人追问"为什么这样选 / 基于什么数据决定"时调用本工具，把专职代理留下的
     完整原文拿回来再用角色口吻转告主人；**严禁**自己重新 web_search /
-    search_knowledge 拼凑一个新理由——那不是当时做决定的依据，会与原文矛盾。
+    search_cognition 拼凑一个新理由——那不是当时做决定的依据，会与原文矛盾。
 
     `task_ref_text` 留空时取主人最近活跃的根任务；传自然语言引用时按引用解析。
 

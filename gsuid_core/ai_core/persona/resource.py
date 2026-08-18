@@ -271,7 +271,7 @@ def migrate_voice_anchor_from_config(persona_name: str) -> bool:
     if not isinstance(cfg, dict) or "voice_anchor" not in cfg:
         return False
 
-    # 已确认 "voice_anchor" in cfg，直接访问（LLM.md §1.4：存在性检查后直接访问）
+    # 已确认 "voice_anchor" in cfg，直接访问（AGENTS.md §1.4：存在性检查后直接访问）
     raw = cfg["voice_anchor"]
     wrote_txt = False
 
@@ -508,11 +508,15 @@ def delete_persona(char_name: str) -> bool:
         True 如果成功删除，False 如果角色不存在
     """
     # 先删除配置文件
+    from gsuid_core.utils.path_safety import PathEscapeError
+
     from .config import persona_config_manager
 
-    persona_config_manager.delete_persona_config(char_name)
-
-    persona = Persona(char_name)
+    try:
+        persona_config_manager.delete_persona_config(char_name)
+        persona = Persona(char_name)
+    except (ValueError, PathEscapeError):
+        return False
     deleted = persona.delete()
     if deleted:
         invalidate_voice_anchor_cache(char_name)

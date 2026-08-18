@@ -3,7 +3,7 @@ import re
 import json
 import base64
 import asyncio
-from typing import Any, Set, Dict, List, Tuple, Union, Literal, Optional, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Set, Dict, List, Tuple, Union, Literal, Optional, Protocol, Sequence
 
 import httpx
 from PIL import Image
@@ -37,6 +37,9 @@ from gsuid_core.ai_core.const import (
 from gsuid_core.utils.image.convert import convert_img
 from gsuid_core.utils.resource_manager import RM
 
+if TYPE_CHECKING:
+    from gsuid_core.ai_core.content_guard import GuardFlags
+
 # 表情包标记正则：兼容全角/半角冒号，以及前后任意数量的反引号包裹
 # 例如：<meme: 困>  `<meme：困>`  ``<meme: 开心>``
 MEME_TAG_PATTERN = re.compile(
@@ -56,6 +59,52 @@ SILENCE_MARKERS: frozenset[str] = frozenset(
     }
 )
 
+# 协议标签（开/闭/自闭合）。代码块内字面量不剥，避免教学回复被当成沉默。
+_PROTOCOL_TAG_RE = re.compile(
+    r"<\s*/?\s*(?:silence|end_turn|no_tool_call)\s*/?\s*>"
+    r"|\[\s*silence\s*\]",
+    re.IGNORECASE,
+)
+_PROTOCOL_CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
+_BARE_SILENCE_RE = re.compile(r"^\s*silence\s*$", re.IGNORECASE)
+_PROTOCOL_EMPTYISH_RE = re.compile(r"^[\s\-–—.,，。！？!?、；;：:\u3000·•…]*$")
+
+
+def remainder_after_protocol_tags(text: str) -> str:
+    """剥掉协议标签，返回剩余台词。代码围栏/行内代码内的字面量保留。"""
+    if not text:
+        return ""
+    held: list[str] = []
+
+    def _hold(m: re.Match[str]) -> str:
+        held.append(m.group(0))
+        return f"\x00{len(held) - 1}\x00"
+
+    protected = _PROTOCOL_CODE_SPAN_RE.sub(_hold, text)
+    stripped = _PROTOCOL_TAG_RE.sub("", protected)
+    for i, chunk in enumerate(held):
+        stripped = stripped.replace(f"\x00{i}\x00", chunk)
+    return stripped
+
+
+def is_silence_marker(text: str) -> bool:
+    """整段是否沉默：裸 SILENCE、协议标签、或剥标签后只剩空白/标点。
+
+    从未含协议标签的纯标点（…… / ... / 。）是可见台词，不是沉默。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _BARE_SILENCE_RE.match(raw) is not None:
+        return True
+    leftover = remainder_after_protocol_tags(raw).strip()
+    if leftover == raw:
+        return False
+    if not leftover:
+        return True
+    return _PROTOCOL_EMPTYISH_RE.match(leftover) is not None
+
+
 # run 失败返回值协议：生产端(gs_agent)与全部消费端(handle_ai/executor/sanitize)引用
 # 同一组常量做前缀/子串判断，文案微调不再让嗅探点静默失效（评审修复 E11）。
 ERROR_RESULT_PREFIX = "执行出错"
@@ -71,7 +120,7 @@ def has_model_visible_content(ev: Event) -> bool:
     """
     if ev.text and ev.text.strip():
         return True
-    return bool(ev.image_id_list or ev.audio_id or ev.audio_id_list or ev.file)
+    return bool(ev.image_id_list or ev.audio_id or ev.audio_id_list or ev.file or ev.node)
 
 
 # 工具调用标记残留正则（弱模型 / 兼容网关把工具调用当普通文本输出）， 详见 _strip_tool_call_artifacts 的 docstring。
@@ -166,8 +215,11 @@ def _strip_special_control_tokens(text: str) -> str:
 
 # 内部资源句柄（纯内部寻址 ID，绝不该进正文；
 # hex）、models.py 出 res_（12 位 hex）。
-_RESOURCE_HANDLE_RE = re.compile(r"`*\b(?:res|img|aud|vid)_[0-9a-fA-F]{6,}\b`*")
-_RESOURCE_HANDLE_HINTS = ("res_", "img_", "aud_", "vid_")
+_RESOURCE_HANDLE_RE = re.compile(
+    r"`*\b(?:res|img|aud|vid)_[0-9a-fA-F]{6,}\b`*"
+    r"|`*\bdlg_[0-9a-fA-F-]{8,}\b`*"
+)
+_RESOURCE_HANDLE_HINTS = ("res_", "img_", "aud_", "vid_", "dlg_")
 
 
 def _strip_resource_handles(text: str) -> str:
@@ -313,7 +365,7 @@ def extract_json_from_text(raw_text: str) -> dict | list:
 
     # 过滤已知的非 JSON 特殊标记（如模型输出的 <SILENCE>）
     stripped = raw_text.strip()
-    if stripped in SILENCE_MARKERS:
+    if is_silence_marker(stripped):
         raise ValueError(f"Special marker '{stripped}' is not valid JSON")
 
     # 上游 agent 出错时会返回 "执行出错: ..." 之类的字符串，这里提前拦截
@@ -354,18 +406,16 @@ def extract_json_from_text(raw_text: str) -> dict | list:
     raise ValueError(f"Failed to parse JSON from text: {stripped[:120]!r}")
 
 
-async def handle_tool_result(bot: Optional[Bot], result: Any, max_length: int = 4000) -> str:
-    """
-    序列化工具执行结果, 当函数返回Message对象时调用Bot.send方法发送, 并将序列化后的字符串返回方便AI识别。
+# 病理级硬顶；主人格长文控长走 FileOS，勿在此用 4k 砍刀污染落盘真身
+_TOOL_RESULT_SAFETY_MAX_CHARS = 2_000_000
 
-    Args:
-        bot: Bot 对象
-        result: 工具函数返回的结果
-        max_length: 最大返回长度，超长会被截断
 
-    Returns:
-        序列化的字符串
-    """
+async def handle_tool_result(
+    bot: Optional[Bot],
+    result: Any,
+    max_length: int = _TOOL_RESULT_SAFETY_MAX_CHARS,
+) -> str:
+    """序列化工具返回；Message 会尝试 send。默认仅病理级长度硬顶。"""
     if isinstance(result, Message):
         a = "生成内容成功!"
         if bot is not None:
@@ -406,8 +456,7 @@ async def handle_tool_result(bot: Optional[Bot], result: Any, max_length: int = 
     else:
         res_str = str(result)
 
-    # 截断过长返回，防 Token 爆炸。自带【读窗口】分页的读工具禁止再砍头：
-    # 否则续读 offset 丢失；默认读窗 8k 与外层 max_length 错位会跳页丢内容。
+    # 【读窗口】分页体永不砍，避免 offset 续读丢页
     if len(res_str) > max_length:
         if "【读窗口】" in res_str[:800] or "…[分页 " in res_str or "\n[分页 " in res_str:
             return res_str
@@ -543,7 +592,6 @@ def _is_master_user(user_id: str) -> bool:
 
 
 def _build_relationship_description(
-    favorability: Optional[int],
     user_name: Optional[str],
     user_id: str,
 ) -> str:
@@ -553,8 +601,8 @@ def _build_relationship_description(
     **必须显式带上用户ID**，否则昵称重复或为"我"这类无意义值时，
     Agent 无法区分到底是谁在说话。
 
-    关系级别（熟/不熟）由 assemble_dynamic_context 统一注入，此处不重复，
-    避免同一信息双写浪费 token。主人标记保留（优先级最高，不可省略）。
+    关系温度（熟/不熟）由 ``assemble_dynamic_context`` 的 ``relationship`` 块统一注入，
+    此处不重复，避免同一信息双写浪费 token。主人标记保留（权限正交，不可省略）。
     """
     # 说话者标识：始终包含用户ID，昵称仅作辅助（与 history 块同一形状，便于模型对齐）
     if user_name and user_name.strip() and user_name.strip() != str(user_id):
@@ -565,17 +613,14 @@ def _build_relationship_description(
     # 主人：只标身份与优先级，不再写「直接…」——是否直连由 is_tome 时注入的
     # DIRECT_MARKER 单独表达，避免与寻址标记语义叠床架屋。
     if _is_master_user(user_id):
-        return f"[⚡主人] {speaker} 找你说话了。"
-
-    return f"{speaker} 找你说话了。"
+        return f"[⚡主人] {speaker}"
+    return speaker
 
 
 async def prepare_content_payload(
     ev: Event,
     task_level: Literal["high", "low"] = "high",
-    favorability: Optional[int] = None,
-    favorability_zone: Optional[str] = None,
-) -> Sequence[UserContent]:
+) -> Tuple[Sequence[UserContent], "GuardFlags"]:
     """
     准备消息内容列表给AI看, 包含文本、图片ID、文件内容、事件对象
 
@@ -589,12 +634,12 @@ async def prepare_content_payload(
     Args:
         ev: 事件对象
         task_level: 任务级别
-        favorability: 当前用户好感度 (可选)
-        favorability_zone: 好感度区间描述 (可选)
 
     Returns:
-        content payload 列表（惰性模式仅含文本；直接模式可能含 ImageUrl）
+        ``(content payload, 输入守卫命中标记)``。标记透传给 ⑩ 结算判负向信号，
+        不再像历史实现那样把三个探测器的 bool 丢掉。
     """
+    from gsuid_core.ai_core.content_guard import GuardFlags
     from gsuid_core.ai_core.configs.ai_config import ai_config
 
     # 惰性图片投喂开关：群聊图片多时, 默认只透传图片ID, 由 AI 按需 read_image 读图,
@@ -608,8 +653,8 @@ async def prepare_content_payload(
     if ev.sender:
         nickname = ev.sender.get("nickname") or ev.sender.get("card") or None
 
-    # 叙事性关系描述（Bug-01 + Prompt-2.2: 替代数字+区间标签）
-    relationship_desc = _build_relationship_description(favorability, nickname, str(ev.user_id))
+    # 说话者标识（群聊共享 session 时必须带 ID）
+    relationship_desc = _build_relationship_description(nickname, str(ev.user_id))
     current_turn_header = f"{relationship_desc}\n"
 
     # @状态：只在被@时才注入（潜在-01: 修正 is_at_me → is_tome）。
@@ -623,19 +668,29 @@ async def prepare_content_payload(
     current_turn_header += "--- 消息 ---\n"
 
     text = current_turn_header
+    guard_flags = GuardFlags()
     if not ev.text:
         text += "用户没有发送文本内容。"
     else:
         # 输入侧安全标注（§B.3-2）：伪造工具返回降权。只加标注、不改原意；
         # 受 content_guard_enable 开关控制。低俗/钓鱼防线在 system prompt 合规层。
         body = ev.text.strip()
-        from gsuid_core.ai_core.configs.ai_config import ai_config
-
         if ai_config.get_config("content_guard_enable").data:
-            from gsuid_core.ai_core.content_guard import annotate_untrusted_message
+            from gsuid_core.ai_core.content_guard import annotate_untrusted_message_ex
 
-            body = annotate_untrusted_message(body)
+            body, guard_flags = annotate_untrusted_message_ex(body)
         text += body
+
+    if ev.reply:
+        text += f"\n--- 引用消息 ---\n{ev.reply}\n"
+
+    if ev.node is not None:
+        from gsuid_core.models import format_node_preview
+
+        preview = format_node_preview(ev.node)
+        text += "\n--- 合并转发 ---\n"
+        if not ev.reply or preview not in str(ev.reply):
+            text += f"{preview}\n"
 
     # 预处理, 将用户发送的文本/AT/图片ID/音频ID等信息整合到一个字符串中, 方便AI处理
     if ev.image_id_list:
@@ -664,7 +719,7 @@ async def prepare_content_payload(
 
     # 惰性模式：图片只以 ID 形式存在（已在上方文本注明），不把本体喂进多模态上下文， 由 AI 调用 read_image 按需读取。
     if lazy_image_read:
-        return content_payload
+        return content_payload, guard_flags
 
     # Fix-07: 收到消息时立即物化远程图片 URL，避免过期后写入历史。
     # 远程 URL（如 QQ 带 rkey 的临时链接）会在短时间内过期；一旦以原始
@@ -694,7 +749,7 @@ async def prepare_content_payload(
         else:
             logger.warning(i18n_t("log.ai.unable_process_image_id", i=i))
 
-    return content_payload
+    return content_payload, guard_flags
 
 
 def _looks_like_tool_table(text: str) -> bool:
@@ -1168,9 +1223,13 @@ async def send_chat_result(
 
     # 过滤模型输出的特殊控制标记（如 <end_turn>），避免发送给用户
     _trimmed = text.strip()
-    if _trimmed in SILENCE_MARKERS:
+    if is_silence_marker(_trimmed):
         logger.debug(i18n_t("log.ai.send_chat_result_special_trimmed_skip", _trimmed=repr(_trimmed)))
         return
+    _speech = remainder_after_protocol_tags(_trimmed).strip()
+    if not _speech:
+        return
+    text = _speech
 
     # 拦截 LLM API 错误消息（429/超时等），角色化替换后下发
     if _ERROR_OUTPUT_RE.search(text):
@@ -1488,12 +1547,109 @@ def _truncate_message_for_log(msg: Any, max_base64_len: int = 100) -> Any:
     return msg
 
 
+def _collect_tool_call_return_ids(messages: Sequence[ModelMessage]) -> tuple[Set[str], Set[str]]:
+    """扫描消息序列，收集 ToolCall / ToolReturn(含 Retry) 的 tool_call_id 集合。"""
+    call_ids: Set[str] = set()
+    return_ids: Set[str] = set()
+    for msg in messages:
+        if isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if isinstance(part, ToolCallPart):
+                    call_ids.add(part.tool_call_id)
+        elif isinstance(msg, ModelRequest):
+            for part in msg.parts:
+                if isinstance(part, ToolReturnPart):
+                    return_ids.add(part.tool_call_id)
+                elif isinstance(part, RetryPromptPart) and part.tool_name is not None:
+                    return_ids.add(part.tool_call_id)
+    return call_ids, return_ids
+
+
+def _has_orphan_tool_returns(messages: Sequence[ModelMessage]) -> bool:
+    """保留集里是否存在「有 return 无 call」的断裂配对。"""
+    call_ids, return_ids = _collect_tool_call_return_ids(messages)
+    return bool(return_ids - call_ids)
+
+
+def _truncate_history_keep_prefix(
+    history: List[ModelMessage],
+    max_keep: int,
+    *,
+    prefix_ratio: float = 0.35,
+) -> List[ModelMessage]:
+    """前缀稳定截断：永不丢头部，只裁中段，保留近期尾部。
+
+    Provider 前缀缓存依赖 message_history **从左起**字节不变。旧策略
+    ``history[-n:]`` 每轮砍头 → 整段前缀失效。本函数保证
+    ``history[:prefix_n]`` 在历次 compact 间对象序列不变，只丢掉
+    ``prefix_n .. tail_start`` 的中段。
+
+    工具配对：若尾部有孤立 ToolReturn，向左吞并中段直至配对完整；
+    仍无法配对则放弃裁剪、原样返回（安全阀）。
+    """
+    if len(history) <= max_keep:
+        return history
+    if max_keep <= 1:
+        return list(history[-1:])
+
+    prefix_n = max(2, int(max_keep * prefix_ratio))
+    prefix_n = min(prefix_n, max_keep - 1)
+    tail_budget = max_keep - prefix_n
+    tail_start = len(history) - tail_budget
+
+    # 尾段向左扩展以补齐工具 call/return；绝不侵入 prefix（保头）
+    while tail_start > prefix_n:
+        retained = history[:prefix_n] + history[tail_start:]
+        if not _has_orphan_tool_returns(retained):
+            logger.debug(
+                i18n_t(
+                    "log.ai.safe_truncation_history_cutoff",
+                    p0=len(history),
+                    p1=len(retained),
+                    truncate_index=tail_start,
+                )
+            )
+            return retained
+        tail_start -= 1
+
+    # tail 已顶到 prefix：无法在保头前提下安全裁中段
+    if not _has_orphan_tool_returns(history):
+        logger.warning(i18n_t("log.ai.cannot_safely_truncate_history", p0=len(history)))
+    return history
+
+
+def compact_session_history(
+    history: List[ModelMessage],
+    max_history: int,
+    *,
+    trim_ratio: float = 0.6,
+) -> tuple[List[ModelMessage], bool]:
+    """会话 history 高低水位 compact（保头裁中段 + 孤儿清理）。
+
+    Returns:
+        (new_history, did_truncate) — did_truncate 表示因超水位主动丢过中段。
+    """
+    if max_history <= 0:
+        return [], True
+    before = len(history)
+    if before <= max_history:
+        return _drop_orphan_tool_results(history), False
+    low_target = max(1, int(max_history * trim_ratio))
+    trimmed = _truncate_history_keep_prefix(history, low_target)
+    cleaned = _drop_orphan_tool_results(trimmed)
+    return cleaned, len(cleaned) < before
+
+
 def _truncate_history_with_tool_safety(
     history: List[ModelMessage],
     max_history: int,
 ) -> List[ModelMessage]:
     """
     安全截断 history，确保保留的消息中 ToolCallPart 和 ToolReturnPart 完全配对。
+
+    .. deprecated::
+        主会话请用 ``_truncate_history_keep_prefix``（保头裁中段，前缀缓存友好）。
+        本函数仍为「保留尾部」语义，供需要旧行为的调用方。
 
     问题：如果简单地从末尾截断 history，可能导致 ToolReturnPart 被保留
     但其对应的 ToolCallPart 被丢弃（在被截断的前半部分），从而在下一轮请求时出现
@@ -1522,26 +1678,8 @@ def _truncate_history_with_tool_safety(
     while truncate_index > 0:
         truncated = history[truncate_index:]
 
-        # 收集截断结果中所有 ToolCallPart 的 tool_call_id
-        retained_call_ids: Set[str] = set()
-        # 收集截断结果中所有 ToolReturnPart 的 tool_call_id
-        retained_return_ids: Set[str] = set()
-
-        for msg in truncated:
-            if isinstance(msg, ModelResponse):
-                for part in msg.parts:
-                    if isinstance(part, ToolCallPart):
-                        retained_call_ids.add(part.tool_call_id)
-            elif isinstance(msg, ModelRequest):
-                for part in msg.parts:
-                    if isinstance(part, ToolReturnPart):
-                        retained_return_ids.add(part.tool_call_id)
-                    # RetryPromptPart 也是"工具结果型"消息：工具参数校验失败时 由 PydanticAI 生成，
-                    elif isinstance(part, RetryPromptPart) and part.tool_name is not None:
-                        retained_return_ids.add(part.tool_call_id)
-
-        # 找出截断结果中的孤立 return（有 return 但没有对应的 call）
-        orphaned = retained_return_ids - retained_call_ids
+        call_ids, return_ids = _collect_tool_call_return_ids(truncated)
+        orphaned = return_ids - call_ids
 
         if not orphaned:
             # 所有保留的 return 都有对应的 call，截断安全
@@ -1812,21 +1950,62 @@ def _relean_user_turn(
             msg.parts = kept_parts
 
 
+# 现役控制面走 <control> 信封（按类型判定身份）；本表只兜遗留文案。
+# 曾漏 `（系统校验·内部轮）`（表里只有全角冒号版），使框架指令穿成 user 发言。
+_LEGACY_FRAMEWORK_PREFIXES: tuple[str, ...] = (
+    "[框架·",
+    "[系统·",
+    "（系统校验",
+    "（系统：",
+    "（系统提示：",
+    "<control",
+)
+
+_USER_SPEECH_SHELL = "[用户发言]"
+
+
 def _is_framework_prompt_content(content: str) -> bool:
     """框架/校验注入：不得当作真人发言进入 B 轨。"""
     s = content.lstrip()
-    if s.startswith("[框架·") or s.startswith("[系统·"):
-        return True
-    if s.startswith("（系统校验：") or s.startswith("（系统：") or s.startswith("（系统提示："):
-        return True
-    # 包在 [用户发言] 外壳里的框架句
-    if s.startswith("[用户发言]"):
-        rest = s[len("[用户发言]") :].lstrip()
-        if rest.startswith("[框架·") or rest.startswith("[系统·"):
-            return True
-        if rest.startswith("（系统校验：") or rest.startswith("（系统：") or rest.startswith("（系统提示："):
-            return True
-    return False
+    if s.startswith(_USER_SPEECH_SHELL):
+        s = s[len(_USER_SPEECH_SHELL) :].lstrip()
+    return s.startswith(_LEGACY_FRAMEWORK_PREFIXES)
+
+
+def _normalize_thinking_tags(thinking_tags: tuple[str, str]) -> tuple[str, str]:
+    """把 profile 里的裸标签名补成成对尖括号。
+
+    pydantic_ai 的 ``DEFAULT_THINKING_TAGS`` 是 ``('<think>', '</think>')``；
+    我们曾把缺省写成 ``('think', 'think')``。裸名直接 ``str.find`` 会命中英文
+    思考里的单词 think，把正文拆碎。已是 ``<…>`` / ``</…>`` 的原样返回。
+    """
+    start, end = thinking_tags
+    if start and not start.startswith("<"):
+        start = f"<{start}>"
+    if end and not end.startswith("<"):
+        end = f"</{end}>"
+    return (start, end)
+
+
+def _dedupe_thinking_parts(parts: Sequence[ModelResponsePart]) -> List[ModelResponsePart]:
+    """同一响应里相同思考只留一份（先出现的优先，通常是原生 reasoning 字段）。
+
+    MiniMax 等兼容网关会同时给出 ``reasoning_content``（pydantic_ai 已做成
+    ThinkingPart）和 ``content`` 里再包一层 ``<think>…</think>``。流式路径下
+    标签常不单独成 SSE chunk，补拆后又得到一份相同 ThinkingPart。重复会：
+    session log 双记、history 回放双倍 token、thinking_segments 膨胀。
+    """
+    seen: Set[str] = set()
+    kept: List[ModelResponsePart] = []
+    for part in parts:
+        if isinstance(part, ThinkingPart):
+            key = part.content.strip()
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+        kept.append(part)
+    return kept
 
 
 def _split_embedded_thinking(
@@ -1841,8 +2020,10 @@ def _split_embedded_thinking(
     意图-行为一致性检测。这里按完整文本重新拆分，对齐非流式路径
     （openai 模型的 split_content_into_text_and_thinking）的行为。非 TextPart 与不含
     起始标签的 TextPart 原样透传。
+
+    拆完后按内容去重：网关常把同一段思考同时放进 reasoning 字段和 ``<think>`` 文本。
     """
-    start_tag, end_tag = thinking_tags
+    start_tag, end_tag = _normalize_thinking_tags(thinking_tags)
     result: List[ModelResponsePart] = []
     for part in parts:
         if not isinstance(part, TextPart) or start_tag not in part.content:
@@ -1865,7 +2046,7 @@ def _split_embedded_thinking(
             start_index = content.find(start_tag)
         if content:
             result.append(TextPart(content=content))
-    return result
+    return _dedupe_thinking_parts(result)
 
 
 def _canonicalize_tool_call_args_in_parts(

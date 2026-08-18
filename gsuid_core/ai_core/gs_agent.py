@@ -36,19 +36,18 @@ from gsuid_core.ai_core.const import (
     STALE_CHAT_REQUEST_TTL,
 )
 from gsuid_core.ai_core.utils import (
-    SILENCE_MARKERS,
     ERROR_TIMEOUT_TEXT,
     ERROR_RESULT_PREFIX,
     ERROR_CONTENT_REJECTED,
     send_chat_result,
     fetch_video_bytes,
+    is_silence_marker,
     _is_content_rejected,
     materialize_image_url,
-    _drop_orphan_tool_results,
+    compact_session_history,
     _is_retryable_client_error,
     _is_non_retryable_model_error,
     _strip_remote_images_from_history,
-    _truncate_history_with_tool_safety,
 )
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.rag.tools import (
@@ -65,6 +64,7 @@ from gsuid_core.ai_core.configs.models import (
 from gsuid_core.ai_core.session_logger import AISessionLogger, ProactiveSource
 from gsuid_core.ai_core.persona.prompts import CHARACTER_BUILDING_TEMPLATE
 from gsuid_core.ai_core.configs.ai_config import ai_config
+from gsuid_core.ai_core.interaction_scaffold import CheapGate, TurnGraph
 from gsuid_core.ai_core.configs.provider_router import (
     provider_router,
     looks_like_provider_failure,
@@ -92,9 +92,9 @@ _ = (
 
 _T = TypeVar("_T")
 
-# 历史裁剪低水位比例：超过 max_history 时一次裁到 max_history * 该比例。
-# 比例越高裁剪越温和，保留更多可缓存前缀（0.85 = 仅丢弃 15% 溢出量）。
-_HISTORY_TRIM_RATIO = 0.85
+# 超过 max_history 时裁到 max_history * 该比例；越低则单次腾出越多、compact 越稀。
+# compact 走 keep_prefix（保头裁中段），绝不砍头部字节——前缀缓存的前提。
+_HISTORY_TRIM_RATIO = 0.6
 
 # 预算 scope + run-once 共享符号（实现在 agent_run；此处 re-export 保持 import 稳定）
 from gsuid_core.ai_core.agent_run.support import (  # noqa: E402
@@ -117,6 +117,7 @@ from gsuid_core.ai_core.agent_run.support import (  # noqa: E402
     TraceKind,
     _append_user_text,
     _claims_fake_done,
+    _correction_nudge_markers,
     _format_capability_roster,
     _tool_return_looks_failed,
     _tool_return_is_async_pending,
@@ -155,6 +156,7 @@ _ = (
     _append_user_text,
     _capability_exclusive_tool_names,
     _claims_fake_done,
+    _correction_nudge_markers,
     _format_capability_roster,
     _matched_delegation_only_profile,
     _pool_overlaps_capability_agent,
@@ -285,6 +287,7 @@ class GsCoreAIAgent(RunOnceMixin):
         self._cancel_generation = asyncio.Event()
         # 当前锁内是否在跑框架回灌：与真人消息互不 supersede，只排队
         self._running_framework: bool = False
+        # 4.7 supersede 交接语已删：在途根任务由 build_task_context 每轮从库注入。
         self.max_tokens = _max_tokens
         self.max_iterations = max_iterations  # 自定义迭代次数限制，None时使用配置默认值
         # C-4 墙钟软预算(秒)覆写：None=沿用全局 scaffold_wall_clock_budget；<=0=本 Agent 关闭软预算。
@@ -328,8 +331,16 @@ class GsCoreAIAgent(RunOnceMixin):
         self._recent_user_texts: List[str] = []
         # by_bot 单轮已发送文本去重集合：弱模型常跨轮重复同一段最终答复，叠加瞬时 故障重试重发，
         self._run_sent_texts: set[str] = set()
+        # 本用户轮内模型对框架校验的申辩理由（dispute_directive 写，settle 读）。
+        # 与 _run_sent_texts 同样同引用透传进纠正轮，使外层能看到内层的申辩。
+        self._run_disputes: List[str] = []
         # 最近一次 attempt 内已执行的工具名（与 _execute_run_once 的局部列表同引用）：
         self._last_attempt_tool_calls: List[str] = []
+        # 纠正轮是新 RunOnceState；cleanup 把结构事实写到宿主，外层 settle 再并回父 st。
+        self._last_attempt_delegated_render: bool = False
+        self._last_attempt_image_sent: bool = False
+        self._last_attempt_pending_async: bool = False
+        self._last_attempt_has_status_tool: bool = False
         # C-2 漂移预算的上轮计数：只在计数**增加**时注入提醒，防一次 push 滞留
         # recent 窗口导致后续每轮重复唠叨（会话级状态，正是"预算"的容器）。
         self._last_drift_push_count: int = 0
@@ -343,6 +354,9 @@ class GsCoreAIAgent(RunOnceMixin):
             self.model = get_model_for_task(task_level)
             self.model_config_name = get_config_name_for_task(task_level)
             self.model_config_fingerprint = get_model_fingerprint_for_task(task_level)
+        # 本次 run 实际路由到的配置全名：故障切换时会临时指向备用配置，与 model 同步；
+        # 显式传 model 的会话恒为 None（无配置文件可读）。
+        self._active_config_name: Optional[str] = self.model_config_name
 
         # 初始化会话日志记录器：所有 Agent 恒有 logger（session_id 已在上方自动派生
         # 兜底），因此 _session_logger 非 Optional，run() 中不再需要 None 守卫。
@@ -425,48 +439,22 @@ class GsCoreAIAgent(RunOnceMixin):
         self.extract_history()
 
     def extract_history(self):
-        if self.max_history <= 0:
-            self.history = []
-            return
+        """裁剪 message_history：超水位时**保头裁中段**，绝不改写 system_prompt。
 
+        前缀缓存红线：
+        - system_prompt 会话内只建一次、只追加契约到 user 侧（见 loop UserPromptPart）；
+        - history 头部字节跨 compact 不变（``compact_session_history`` / keep_prefix）；
+        - 禁止把角色锚点等消息插回头部（会整体平移前缀）。
+        """
         before: int = len(self.history)
-        truncated: bool = before > self.max_history
-        if truncated:
-            # 高低水位惰性裁剪：超过 max_history 才裁、一次裁到低水位。旧行为"超 1 条裁 1 条"
-            # 让历史头部每轮都变，provider 前缀缓存永不命中（§25 命中率卡 54% 的直接原因）。
-            low_target: int = max(1, int(self.max_history * _HISTORY_TRIM_RATIO))
-
-            # OOC 修复 5.5：compact 时保留 1-2 条"角色锚定消息"（最早的、最符合人设的 assistant 文本回复）。
-            # 早期在角色内的回复被丢弃后，模型失去"我应该是这样
-            _anchor_msgs: list[ModelMessage] = []
-            if self.persona_name:
-                _anchor_msgs = _extract_character_anchors(self.history, count=2)
-
-            self.history = _truncate_history_with_tool_safety(
-                self.history,
-                low_target,
-            )
-
-            # 将锚定消息插回历史头部（截断后的最早消息之前）
-            if _anchor_msgs:
-                # 去重：如果锚定消息已经在截断后的历史中，不重复插入
-                _existing_ids = {id(m) for m in self.history}
-                _to_insert = [m for m in _anchor_msgs if id(m) not in _existing_ids]
-                if _to_insert:
-                    self.history = _to_insert + self.history
-                    logger.debug(
-                        i18n_t(
-                            "log.agent.compact_retained",
-                            p0=len(_to_insert),
-                        )
-                    )
-
-        # 兜底：无论是否截断，都做一次孤儿工具结果清理，确保历史对 API 自洽
-        self.history = _drop_orphan_tool_results(self.history)
+        self.history, did_truncate = compact_session_history(
+            self.history,
+            self.max_history,
+            trim_ratio=_HISTORY_TRIM_RATIO,
+        )
         after: int = len(self.history)
-        # 仅「因超长主动裁剪且确有条目被丢弃」才打 auto_compact（供 webconsole 画独立色块）；
-        # 纯孤儿清理属结构性整理、stateless 模式每轮清空，均不打标以免噪声。
-        if truncated and after < before:
+        # 仅「因超长主动裁剪且确有条目被丢弃」才打 auto_compact（供 webconsole 画独立色块）
+        if did_truncate and after < before:
             self._session_logger.log_history_reset("auto_compact", {"before": before, "after": after})
         logger.debug(i18n_t("log.agent.history_processed_entries", p0=len(self.history)))
 
@@ -800,8 +788,8 @@ class GsCoreAIAgent(RunOnceMixin):
         has_active_task: bool = False,
         budget_gate: bool = False,
         suppress_intermediate_text: bool = False,
-        turn_graph: Optional[Any] = None,
-        cheap_gate: Optional[Any] = None,
+        turn_graph: Optional[TurnGraph] = None,
+        cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
     ) -> str: ...
 
@@ -820,8 +808,8 @@ class GsCoreAIAgent(RunOnceMixin):
         has_active_task: bool = False,
         budget_gate: bool = False,
         suppress_intermediate_text: bool = False,
-        turn_graph: Optional[Any] = None,
-        cheap_gate: Optional[Any] = None,
+        turn_graph: Optional[TurnGraph] = None,
+        cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
     ) -> _T: ...
 
@@ -838,8 +826,8 @@ class GsCoreAIAgent(RunOnceMixin):
         has_active_task: bool = False,
         budget_gate: bool = False,
         suppress_intermediate_text: bool = False,
-        turn_graph: Optional[Any] = None,
-        cheap_gate: Optional[Any] = None,
+        turn_graph: Optional[TurnGraph] = None,
+        cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
     ) -> Union[str, Any]:
         """核心回复请求的瞬时失败重试包装。
@@ -855,6 +843,7 @@ class GsCoreAIAgent(RunOnceMixin):
         # 跨重试共享、按用户轮次重置：重试重跑 _execute_run_once 不会重发已送达的段；
         # 新一轮 run 则允许合法地再说同样的话。
         self._run_sent_texts = set()
+        self._run_disputes = []
 
         max_attempts: int = ai_config.get_config("agent_max_run_attempts").data
         retry_delay: float = ai_config.get_config("agent_run_retry_delay").data
@@ -1025,7 +1014,7 @@ class GsCoreAIAgent(RunOnceMixin):
         except Exception as e:
             logger.warning(i18n_t("log.agent.firewall_regeneration_fallback", e=e))
             return ""
-        if not out or out in SILENCE_MARKERS:
+        if not out or is_silence_marker(out):
             return ""
         return out
 
@@ -1209,11 +1198,10 @@ class GsCoreAIAgent(RunOnceMixin):
         ab_abort: bool,
     ) -> bool:
         """尖括号收尾 + OOC 重说。返回是否尖括号熔断静默。"""
-        silence_markers = SILENCE_MARKERS
         clean_sent = [
             t
             for t in self._run_sent_texts
-            if t and t not in silence_markers and not angle_bracket_guard.has_illegal_angle_tags(t)
+            if t and not is_silence_marker(t) and not angle_bracket_guard.has_illegal_angle_tags(t)
         ]
         plan = output_gate.plan_angle_after_run(context.extra, clean_sent=clean_sent)
         angle_fused = ab_abort or plan.fused
@@ -1273,10 +1261,14 @@ class GsCoreAIAgent(RunOnceMixin):
         return angle_fused
 
     def _scrub_fake_done_history(self, fabricated_texts: set[str]) -> None:
-        """假完成收尾：删纠正 nudge 与未发出的编造声明（与闸门 scrub 共用编辑器）。"""
+        """假完成收尾：删纠正 nudge 与未发出的编造声明（与闸门 scrub 共用编辑器）。
+
+        纠正 nudge 一律剥掉**全部**系统校验 user turn（不止假完成那条）：
+        它们是框架内部指令，留在 history 会污染上下文并破坏前缀缓存（方案四/五）。
+        """
         self._edit_history_tail(
             tail_n=8,
-            drop_user_markers=(_FAKE_DONE_NUDGE,),
+            drop_user_markers=_correction_nudge_markers(),
             drop_text_parts=fabricated_texts,
         )
 
@@ -1297,8 +1289,8 @@ class GsCoreAIAgent(RunOnceMixin):
         has_active_task: bool = False,
         budget_gate: bool = False,
         suppress_intermediate_text: bool = False,
-        turn_graph: Optional[Any] = None,
-        cheap_gate: Optional[Any] = None,
+        turn_graph: Optional[TurnGraph] = None,
+        cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
     ) -> str: ...
 
@@ -1318,8 +1310,8 @@ class GsCoreAIAgent(RunOnceMixin):
         has_active_task: bool = False,
         budget_gate: bool = False,
         suppress_intermediate_text: bool = False,
-        turn_graph: Optional[Any] = None,
-        cheap_gate: Optional[Any] = None,
+        turn_graph: Optional[TurnGraph] = None,
+        cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
     ) -> _T: ...
 
@@ -1337,10 +1329,10 @@ class GsCoreAIAgent(RunOnceMixin):
         has_active_task: bool = False,
         budget_gate: bool = False,
         suppress_intermediate_text: bool = False,
-        turn_graph: Optional[Any] = None,
-        cheap_gate: Optional[Any] = None,
+        turn_graph: Optional[TurnGraph] = None,
+        cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
-    ) -> Union[str, Any]:
+    ) -> object:
         """
         运行 Agent 并返回结果
 
@@ -1419,8 +1411,8 @@ class GsCoreAIAgent(RunOnceMixin):
         has_active_task: bool,
         budget_gate: bool,
         suppress_intermediate_text: bool,
-        turn_graph: Optional[Any],
-        cheap_gate: Optional[Any],
+        turn_graph: Optional[TurnGraph],
+        cheap_gate: Optional[CheapGate],
         is_framework_injection: bool,
     ) -> Union[str, Any]:
         """已持锁：TTL 校验 + provider 路由 + 真正执行。"""
@@ -1480,6 +1472,7 @@ class GsCoreAIAgent(RunOnceMixin):
                 )
                 temp_model = None
                 orig_model = self.model
+                orig_active_cfg = self._active_config_name
                 if routed_name and routed_name != self.model_config_name:
                     try:
                         temp_model = get_model_by_full_name(routed_name)
@@ -1493,6 +1486,7 @@ class GsCoreAIAgent(RunOnceMixin):
                             )
                         )
                         routed_name = self.model_config_name
+                self._active_config_name = routed_name or self.model_config_name
                 try:
                     result = await _do_run()
                     _is_error_str = isinstance(result, str) and result.startswith(ERROR_RESULT_PREFIX)
@@ -1527,6 +1521,7 @@ class GsCoreAIAgent(RunOnceMixin):
                 finally:
                     if temp_model is not None:
                         self.model = orig_model
+                    self._active_config_name = orig_active_cfg
         return "" if output_type is None else None
 
 

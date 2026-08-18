@@ -293,6 +293,7 @@ class MemoryContext:
         max_chars: int = 2000,
         priority_speakers: Optional[set] = None,
         current_speaker_ids: Optional[set] = None,
+        query: str = "",
     ) -> str:
         """格式化为可注入 System Prompt 的记忆上下文文本。
 
@@ -430,12 +431,16 @@ class MemoryContext:
 
         # 语义类目摘要（话题大纲）
         if self.categories:
-            cat_budget = int(max_chars * 0.15)
-            sorted_cats = sorted(self.categories, key=lambda c: c["layer"], reverse=True)
-            cat_lines = [f"• [L{c['layer']}] {c['name']}: {(c['summary'] or '')[:100]}" for c in sorted_cats[:6]]
-            taken = _take(cat_lines, cat_budget)
-            if taken:
-                parts.append("【语义类目摘要】\n" + "\n".join(taken))
+            cats = self.categories
+            if query:
+                cats = [c for c in cats if c["name"] and c["name"] in query]
+            if cats:
+                cat_budget = int(max_chars * 0.15)
+                sorted_cats = sorted(cats, key=lambda c: c["layer"], reverse=True)
+                cat_lines = [f"• [L{c['layer']}] {c['name']}: {(c['summary'] or '')[:100]}" for c in sorted_cats[:6]]
+                taken = _take(cat_lines, cat_budget)
+                if taken:
+                    parts.append("【语义类目摘要】\n" + "\n".join(taken))
 
         # 相关对话片段：吃掉前面区块（偏好/事实/类目）用剩的全部预算——纯 episode-RAG
         # （无图谱时，如大语料回灌 / 评测）episodes 是唯一召回源，必须给足空间，否则被
@@ -451,7 +456,8 @@ class MemoryContext:
                 # temporal_mode：单条上限压到 600，让更多时段进入预算
                 ep_cap = 600 if self.temporal_mode else 1000
                 # 去重 + 过滤极短无信息量片段（纯寒暄/单字），统一时间格式
-                ep_lines: list[str] = []
+                dated: list[str] = []
+                undated: list[str] = []
                 seen_content: set[str] = set()
                 for ep in eps:
                     raw = (ep["content"] or "").strip()
@@ -461,9 +467,12 @@ class MemoryContext:
                     if key in seen_content:
                         continue
                     seen_content.add(key)
-                    ts = (ep["valid_at"] or "")[:19].replace("T", " ")
-                    ep_lines.append(f"[{ts}] {raw[:ep_cap]}")
-                taken = _take(ep_lines, ep_budget)
+                    ts = (ep["valid_at"] or "").strip()[:19].replace("T", " ")
+                    if ts:
+                        dated.append(f"[{ts}] {raw[:ep_cap]}")
+                    else:
+                        undated.append(raw[:ep_cap])
+                taken = _take(dated + undated, ep_budget)
                 if taken:
                     parts.append("【相关对话片段】\n" + "\n".join(taken))
 
@@ -614,9 +623,10 @@ async def _rerank_edges(query: str, items: list[Edge], top_k: int) -> list[Edge]
 async def dual_route_retrieve(
     query: str,
     user_id: str,
+    *,
+    enable_system2: bool,
     group_id: Optional[str] = None,
     top_k: int = 20,
-    enable_system2: bool = True,
     enable_user_global: bool = True,
     inject_preferences: bool = True,
     preference_contexts: Optional[list[str]] = None,
@@ -625,11 +635,14 @@ async def dual_route_retrieve(
 
     Args:
         query:              用户的原始查询文本
-        group_id:           原始群组 ID（如 "789012"）
+        group_id:           原始群组 ID（如 "789012"）；**私聊必须传 None**，回退成
+            user_id 只会去查一个空的幻影 ``group:{user_id}``，召回恒为 0
         user_id:            触发用户的 ID（可选，用于联合用户全局记忆）
-        session:            SQLAlchemy AsyncSession
         top_k:              最终返回的 Episode 数量上限
-        enable_system2:     是否启用 System-2 全局选择（成本较高）
+        enable_system2:     是否启用 System-2 全局选择（成本较高）。**必填、无默认值**：
+            这里曾是 ``True`` 而生产配置默认关，不传的调用点（工具路径）一直在偷跑一条
+            更贵的图遍历。跨模块边界的语义性参数不许在函数签名里给默认值——
+            需要默认就在唯一的配置层给。
         enable_user_global: 是否联合查询用户跨群画像
         inject_preferences: 是否注入程序性/偏好规则（意图门：纯闲聊轮可传 False 整轮跳过）
         preference_contexts: 选择性注入——本轮相关的能力域/工具名集合。``None`` = 不过滤

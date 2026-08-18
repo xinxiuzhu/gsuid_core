@@ -1,19 +1,24 @@
 # GsCore AI：一条消息的完整生命周期
 
-> 日期：**2026-08-08**（对齐源码：system 前缀缓存 / exclusive 委派 / `pre_send_gate` /
+> 日期：**2026-08-16**（对齐源码：system 前缀缓存 / exclusive 委派 / `pre_send_gate` /
 > 能力代理 **return 不做 roleplay OOC scrub** / incomplete 认 `res_` /
 > POST_TOOL 分通道 / **出图主路径 `render_agent`** / 长 MD 兜底默认关 /
 > DELEGATION_FIRST + web_search 降权 / 身份锚定 /
-> **Agent 单次 run 已拆 `ai_core/agent_run/` 阶段包**）
+> **Agent 单次 run 已拆 `ai_core/agent_run/` 阶段包** /
+> **DELIVERED 交付终局态 + `delivery_narration` 防火墙** /
+> 出图候选时效+多点判据 / 能力缺口登记 / 召回阈值可配 / heartbeat 话头门 /
+> **出图委派 ToolCall 即在途静默 / 多点读数结构闸 / `in_flight_short` 瘦工具池 /
+> `render_chart_spec` series+图例+零轴**）
 > 主线：**适配器推来一条群聊消息 → 是否进 AI → 读哪些数据 → 激活哪些模块 → 怎么回复 → 什么被沉淀 → 首尾日志**
 > 源码是唯一事实源。改 `handler` / `handle_ai` / `gs_agent` / **`agent_run/*`** / `output_gate` /
-> `subagent` / `delegation_contracts` / 装配 / 记忆后请同步本文。
+> `output_firewall` / `subagent` / `delegation_contracts` / 装配 / 记忆后请同步本文。
 > 关联：
-> - 开发技能：`docs/skills/gscore-development/references/02-startup-lifecycle.md`、`04-event-trigger-flow.md`、`06-ai-session-and-persona.md`、`07-tool-registry-and-agent.md`、`09-memory-system.md`
+> - 开发技能：`.agents/skills/gscore-development/references/02-startup-lifecycle.md`、`04-event-trigger-flow.md`、`06-ai-session-and-persona.md`、`07-tool-registry-and-agent.md`、`09-memory-system.md`
 > - 会话日志：`AI_SESSION_LOG_CHAIN_AND_WATERFALL_20260708.md`
 > - 委派/OOC 历史交接：`AI_CORE_OOC_DELEGATION_UPDATE_20260724.md`
 > - **Agent run 拆分**：[`AI_AGENT_RUN_REFACTOR_20260808.md`](AI_AGENT_RUN_REFACTOR_20260808.md)
-> - 生产问题归因：`plans/AI_CORE_SESSION_PROBLEM_ANALYSIS_20260808.md`
+> - **2026-08-10 OOC 根治归因**：[`AI_SESSION_OOC_ROOTCAUSE_20260810.md`](AI_SESSION_OOC_ROOTCAUSE_20260810.md)
+> - 生产问题归因（历史）：`plans/AI_CORE_SESSION_PROBLEM_ANALYSIS_20260808.md`
 > - 渲染：`docs/TAKUMI_HTML_GUIDE.md`、`ai_core/buildin_tools/html_render_tools.py`
 
 ---
@@ -41,8 +46,10 @@
 **测生产插件行为不要用 `--dev`**：
 
 ```bash
-# 加载全部插件（含业务插件）
-GSUID_LOCAL_TEST_MODE=1 GSUID_LOCAL_TEST_TOKEN=... PYTHONUTF8=1 uv run core --port 8765
+# 加载全部插件（含业务插件）。Windows 必须带 NO_PROXY，否则系统代理会把
+# 本机 Qdrant / chat_with_history 打成 502（curl 通、httpx 失败）。
+GSUID_LOCAL_TEST_MODE=1 GSUID_LOCAL_TEST_TOKEN=... PYTHONUTF8=1 \
+  NO_PROXY=localhost,127.0.0.1 uv run core --port 8765
 
 # --dev 只加载目录名 endswith("-dev") 的插件；普通插件全部跳过
 ```
@@ -56,7 +63,7 @@ GSUID_LOCAL_TEST_MODE=1 GSUID_LOCAL_TEST_TOKEN=... PYTHONUTF8=1 uv run core --po
 1. `uv run core` 已 `init_database` + `load_plugins`（`@sv` / `@ai_tools` 进表）
 2. lifespan 里 `init_ai_core` **已完成**（RAG/Persona/Planning/Memory/MCP/统计…）
 3. 适配器已 WS 连上，`bot._process` 在消费 `ws.queue`
-4. 当前群已配 persona（`scope=global` 或 `specific` 含本群）
+4. 当前会话已配 persona（`global` / 群聊 `global_group` / 私聊 `global_private` / `specific` 含本群或本用户）
 
 若 `init_ai_core` 未完成：`handler` 会打 `ai_initializing` / `ai_init_incomplete` 并 **不入队** AI。
 
@@ -96,12 +103,48 @@ GSUID_LOCAL_TEST_MODE=1 GSUID_LOCAL_TEST_TOKEN=... PYTHONUTF8=1 uv run core --po
     │  POST_TOOL 分通道 / **pre_send_gate** / send_chat_result
     │  （重任务理想：research→render→短句+图）
     ▼
-⑩ 回合收尾：history lean / 闸门收尾重写 / 好感度 / mood
+⑩ 回合收尾：history lean / 闸门收尾重写 / 关系温度结算 / mood
     ▼
 ⑪ 发送路径旁路：Bot 出站 + 助手侧记忆 observe  [bot.send]
     ▼
-⑫ 异步沉淀：session_log 刷盘 / 记忆 flush / 统计
+⑫ 异步沉淀：session_log 刷盘 / 记忆 flush / 统计 / 认知节点回流
 ```
+
+### 1.1 内核 vs 套件（2026-08-15 起）
+
+上面 12 阶段是**内核编排**。产品能力（记忆 / 关系温度 / 情绪 / 意图分类 / 软门 /
+脚手架注入 / 工具装配 / FileOS 折叠 / 质量纠正）**不再写在阶段函数体里**，而是 18 个
+可替换**套件**，挂在同一张 **31 点位 hook 总线**上：
+
+```text
+handler   ①  ──→ H00 ON_INBOUND                    记忆观察 / 表情观察 / 图片记忆
+handle_ai ④  ──→ H01 BEFORE_AI_CHAT                会话静默窗（abort）
+          ⑤  ──→ H02 AFTER_SESSION                 关系温度 View / 主动会话 observe
+          ⑥  ──→ H03 CLASSIFY                      意图（**由槽位占用者写入**）
+          ⑦  ──→ H04 REACTIVE_GATE                 软触发沉默门（silence）
+          ⑧  ──→ H05 RETRIEVE_CONTEXT              贵检索窗（唯一 15s 长超时）
+              ──→ H06 COMPOSE_CONTEXT              各套件填命名块
+              ──→ H07 AFTER_CONTEXT                第三方追加 hint
+          ⑩  ──→ H08 AFTER_RUN                     mood / 统计上报
+              ──→ H09 ON_AI_ERROR
+agent_run    ──→ H10–H13   prepare（预算后 / ToolContext / user 外壳）
+             ──→ H14/H15/H15b  工具装配 / 钉工具 / 建 Agent 后
+             ──→ H16–H22   iter（模型请求前 / ToolReturn / ToolCall / 出站前后）
+             ──→ H23–H28   settle / 纠正 / usage limit / 取消 / 失败 / cleanup
+建 session   ──→ H29 ON_STABLE_CONTEXT              **唯一**允许写 system 的点位
+```
+
+- 关某个能力 = `kit_slots.<slot> = off` → 套件**不注册** → 自然跳过。
+  内核里没有 `if enable_x`（闸门应该过滤，不该整轮跳过）。
+- 总闸 `agent_hooks_enable=false` → 回落纯内核编排（应急回滚）。
+- 单个 hook 异常 / 超时一律 **fail-open + warning**，**不得**升级成 ABORT_RUN、
+  不得变成人格台词。
+- 详见 [`AI_CORE_THREE_LINE_REFACTOR_20260815.md`](AI_CORE_THREE_LINE_REFACTOR_20260815.md)
+  §6 与 [`skills/gscore-development/references/13-agent-loop-hooks.md`](skills/gscore-development/references/13-agent-loop-hooks.md)。
+
+**留在内核、不许做成可关套件的**：`system_prompt` 稳定、预算闸与记账、exclusive 剥离、
+`pre_send_gate` 唯一入口、保头裁中段、`_relean`、`_run_lock` / 抢答、AI 总开关、
+`content_guard` 输入侧防护、TurnGraph 构建、C-3 寻址门的零工具硬约束。
 
 ---
 
@@ -131,7 +174,7 @@ GSUID_LOCAL_TEST_MODE=1 GSUID_LOCAL_TEST_TOKEN=... PYTHONUTF8=1 uv run core --po
 | GsAgent | `gs_agent.GsCoreAIAgent` + `agent_run/*` | 单次 run 编排；工具五层 + LLM 迭代 + 出站闸 |
 | Toolset | `register` / `dynamic_toolset` / `rag.tools` | 保底/状态/向量/find_tools |
 | LLM | pydantic-ai `Agent.iter` | 模型请求与 tool 循环 |
-| OutGate | `output_gate.pre_send_gate` | **统一发送前闸门**（尖括号 + OOC） |
+| OutGate | `output_gate.pre_send_gate` | **统一发送前闸门**（尖括号 + OOC；本轮工具名集合防泄漏） |
 | SubAgent | `buildin_tools.subagent.create_subagent` | 通用子代理 / 能力代理入口 |
 | CapRunner | `capability_agents.runner` | 无人格能力节点执行 |
 | Kanban | `planning.kanban` / `kanban_executor` | 任务树、kick、转译推群 |
@@ -213,12 +256,12 @@ sequenceDiagram
             LLM-->>GsAgent: Thinking / ToolCall / Text
             opt ToolCall
                 GsAgent->>GsAgent: 执行工具（可 create_subagent）
-                Note over GsAgent: POST_TOOL 分通道：主人格→render_agent<br/>能力代理→事实包；return 不 scrub res_
+                Note over GsAgent: POST_TOOL 分通道：主人格→render_agent<br/>能力代理→事实包；return 不 scrub res_<br/>send 带台词成功回执→DELIVERED 终局
             end
             opt Text 且 by_bot
-                GsAgent->>GsAgent: pre_send_gate（尖括号+OOC）
-                alt REWRITE / FUSE / FALLBACK
-                    Note over GsAgent: 打回注入 / 熔断静默 / 发兜底句
+                GsAgent->>GsAgent: speech_policy + pre_send_gate（尖括号+OOC）
+                alt REWRITE / FUSE / FALLBACK / DELIVERED
+                    Note over GsAgent: 打回注入 / 熔断静默 / 发兜底句 / 终局沉默
                 else ALLOW
                     GsAgent->>SendPath: send_chat_result（呈现层）
                     SendPath->>BotSend: bot.send
@@ -444,6 +487,16 @@ sequenceDiagram
 
     HandleAI->>GsAgent: run(user_messages, rag_context=full_context, intent, has_active_task)
 ```
+
+> **2026-08-17 Everything is Memory**：统一写契约 `remember(MemoryWrite)`；
+> web 搜索/抓取 ≥40 字同步落 FileOS（当轮可回想）；`search_cognition` 补 History A /
+> record / 图片 / 表情，产物走 SQL+向量。⑧ 每轮自动注入仍只打记忆+偏好。
+> 公共概念的**路径卡 + 选定全文**只出现在工具 `search_cognition` 的回执里，不灌闲聊。
+> 门面 `cognition.facade.search_cognition` 签名不变；展开在 `cognition.hub.expand_hub`
+> （失败 fail-open，独立 i18n `cognition_expand_fail`，不挡联邦命中列表）。
+> 只问正式名不附全文（枢纽名本身不是点名）；同 slot 两篇也不附。
+> 选定全文只 inline `kb_plugin:` / `kb_kbdoc:`；`to_` 留在路径卡，走 `read_handle` ACL。
+> 启动挂载见 **§15.2**（READY 之后后台 `create_task`，不进 `_INIT_STEPS`）。
 
 ---
 
@@ -819,11 +872,13 @@ logger.info  ai_initializing
 **入队**：
 
 ```python
-ws.queue.put_nowait(TaskContext(
-    coro=handle_ai_chat(Bot(ws, event), event, enqueue_ts=now, soft_triggered=...),
-    name="handle_ai_chat",
-    priority=event.user_pm,
-))
+ws.queue.put_nowait(
+    TaskContext(
+        coro=handle_ai_chat(Bot(ws, event), event, enqueue_ts=now, soft_triggered=...),
+        name="handle_ai_chat",
+        priority=event.user_pm,
+    )
+)
 ```
 
 `bot._process` **串行**消费队列（同 bot 上命令与 AI 互不并发抢同一 send 路径）。
@@ -1005,16 +1060,29 @@ user_messages = prepare_content_payload(event, favorability)
 追加：【当前时间】
 ```
 
-### 9.2 记忆检索（读，不写）
+### 9.2 记忆检索：H05 `RETRIEVE_CONTEXT`（读，不写）
+
+内核**只开窗、不判断**——「要不要检索、检索多深、预算怎么切」全在 `gscore.memory` 套件里：
 
 ```text
-若 enable_memory 且 enable_retrieval：
-  寒暄门控（短+闲聊+无实体）→ 跳过
-  否则 dual_route_retrieve(query, group_id|None, user_id, ...)
-       → memory_context_text（预算截断 + 第三方隐私过滤）
+fire_hooks(RETRIEVE_CONTEXT, ctx)        # 内核唯一动作
+└─ gscore.memory.retrieve（H05，唯一允许的 15s 长超时）
+   ├─ enable_memory / enable_retrieval 检查
+   ├─ 寒暄门控 should_retrieve()（短+闲聊+无实体/情绪/回指 → 跳过；主人恒检索）
+   ├─ 偏好能力域过滤（闲聊轮传**空 list**，不是 None）
+   ├─ cognition.inject_memory_slice(kinds={memory,preference})
+   │     → dual_route_retrieve(..., enable_system2=<配置>)   # 必填，不吃函数默认值
+   │     → to_prompt_text(预算五配额位 + priority_speakers + 第三方隐私门)
+   └─ 可选：探针预取全联邦（`cognition_prefetch_enable`，**默认关**）
 ```
 
-日志：`命中寒暄门控` / `检索到记忆上下文 (N 字符)` / warning 失败。
+关 `memory` 槽 = 套件不注册 = 这一步自然跳过；内核里**没有** `if enable_memory`
+（闸门应该过滤，不该整轮跳过）。
+
+`priority_speakers` = masters ∪ 本 scope 内 `close` 用户（由
+`relationship.collect_priority_speakers` 算出，高好感只是回忆时少被裁掉，不等于主人）。
+
+日志：`命中寒暄门控` / `检索到记忆上下文 (N 字符)` / `[Cognition] 命中 N 条` / warning 失败。
 
 ### 9.3 群消息历史渲染（读 A 轨）
 
@@ -1026,24 +1094,35 @@ history = raw[:-1]                          # 去掉本轮（已在 payload）
 rag_context = "【历史对话】\n" + format_history_for_agent(...)
 ```
 
-### 9.4 动态上下文唯一顺序（`assemble_dynamic_context`）
+### 9.4 动态上下文唯一顺序（`CONTEXT_BLOCK_ORDER` + 合成器）
 
 **全部拼进 user 侧**（`rag_context` → 本轮 `final_user_message`）。
 结束后 `_relean_user_turn` 剥掉，**不进**持久 Agent history（B 轨瘦身 + 不污染前缀叙事）。
 
-当前源码顺序（`context_assembly.py`）：
+自 2026-08-15 起，顺序的唯一定义在 **`kits/base.py::CONTEXT_BLOCK_ORDER`**（跨计划冻结
+接口）。`assemble_dynamic_context` 只做三件事：建 `AgentHookContext` → 开火
+**H06 `COMPOSE_CONTEXT`** / **H07 `AFTER_CONTEXT`** → 按块名表拼装。
+各来源只 `set_context_block(name, text)` **填命名块**，未知块名直接拒绝
+（`HookCapabilityError`），防止有人把块插到身份锚前面。
 
-1. 情绪 mood（括号包裹）
-2. 关系行（per-user，绝不能进共享 system）
-3. 口吻锚点（极短截断）
-4. **身份锚定**（`（身份：你是「{persona_name}」…禁止改物种/性别迎合绰号）`）——防群聊历史把人设拖成别的称呼
-5. 历史对话块（若有）
-6. 长期记忆·高置信（过长截断至约 1200；细节靠 `query_user_memory`）
-7. 长任务 Kanban 进度 → `has_actionable`
-8. 闲聊风格提示（仅 intent=闲聊且无上轮工具且无活跃任务）
-9. **事务优先级**（intent∈{工具, 问答}：优先调工具，困/懒不是跳过理由）
-10. 上一轮资料图标题
-11. **最后**软触发 `SOFT_TRIGGER_NOTE`（近因）
+| # | 块名 | 谁填 |
+|---|------|------|
+| 1 | `mood` | `gscore.mood`（括号包裹，暗示内心状态） |
+| 2 | `relationship` | `gscore.favorability`（per-user，**绝不能进共享 system**） |
+| 3 | `voice_anchor` | `gscore.self_cognition`（口吻锚点 + 当前 zone 的一句口气） |
+| 4 | `identity` | `gscore.identity`（**密封槽**，关不掉）——防群聊历史把人设拖成别的称呼 |
+| 5 | `history` | **内核**（`turn_pipeline.build_group_history_block`；HistoryManager 是消息基础设施） |
+| 6 | `memory` | `gscore.memory`（H05 检索 → H06 注入；预算只有 `memory_inject_max_chars` 一层） |
+| 7 | `task` | `gscore.planning_context`（顺带写 `has_actionable`） |
+| 8 | `chitchat_style` | `gscore.scaffold`（仅 intent=闲聊且无上轮工具且无活跃任务） |
+| 9 | `transaction_priority` | `gscore.scaffold`（intent∈{工具,问答}：优先调工具，困/懒不是跳过理由） |
+| 10 | `report_titles` | `gscore.scaffold`（上一轮资料图标题） |
+| 11 | `soft_trigger` | `gscore.reactive_gate`（`SOFT_TRIGGER_NOTE`，近因） |
+| 12 | `plugin_hints` | 第三方 H07 `append_user_hint` 汇入，**恒在最后** |
+
+> 历史注意：本节旧版写的顺序是「历史对话 → 情绪 → …」，与代码不符（代码里情绪在最前），
+> 已按实际 append 顺序更正。记忆块曾在配置预算之外再被一个 **1200 字面量**硬截一刀，
+> 使 `memory_inject_max_chars` 形同虚设——该字面量已删除。
 
 **已移出本块、固化在 system 的：**
 
@@ -1051,15 +1130,18 @@ rag_context = "【历史对话】\n" + format_history_for_agent(...)
   （含 **DELEGATION_FIRST**、web_search 降权、禁念工具名）
 - 能力代理 roster（`format_capability_roster`）
 - 日级「当前日期」
+- self_model 自述 / 群画像 —— 只在**建 session** 时经 **H29 `ON_STABLE_CONTEXT`** 贡献，
+  写入后冻结。dispatcher 硬拒非建 session 阶段的 H29 调用（运行中改 system 会打光前缀缓存）。
 
-**精确时间**在 `prepare_content_payload` / user 正文侧（`[当前时间：…]`），不进 system。
+**精确时间**在 `turn_pipeline.stamp_current_time` / user 正文侧（`[当前时间：…]`），不进 system。
 
 ### 9.5 交给 Agent
 
 ```python
 chat_result = await session.run(
     user_message=user_messages,
-    bot=bot, ev=event,
+    bot=bot,
+    ev=event,
     rag_context=full_context,
     return_mode="by_bot",
     enqueue_ts=enqueue_ts,
@@ -1186,32 +1268,50 @@ session_logger.log_tools_list([...])
 ```text
 agent.iter(message_history=self.history + 本轮 user)   # loop.py
   loop:
-    若 _cancel_generation.is_set() → break（A 抢答中止）
+    若 _cancel_generation.is_set() → break（A 抢答中止；有在途委派则留交接语 4.7）
     ModelRequestNode → _run_once_on_model_request
       请求前可注入 UserPromptPart：
         · 墙钟软预算 / 同工具 thrash fuse
         · 输出闸 REWRITE feedback（上一轮 Text 被打回）
         · 输出闸 FUSE 提示（熔断后最多注入一次）
+        · **交付终局 SILENCE 指令**（DELIVERED 后只注入一次，取代 POST_TOOL）
       请求侧 ToolReturn 处理：
         · is_tech_dump → TECH_DUMP_TOOL_SHIELD（主人格）
-        · FileOS：主人格长文落盘折叠 → 句柄卡 + inline_head；只读工具/句柄卡永不二次折
+        · FileOS：主人格长文落盘折叠 → 句柄卡；群聊无 inline_head；只读工具/句柄卡永不二次折
         · 高密度 JSON → 摘要折叠（CapabilityAgent 不折叠）
+        · 无时点聚合 → saw_timeless_aggregate（只记账，不往请求里塞禁令）
         · post_tool_contracts_for(create_by, capability_node_id=…):
-            Chat/Agent → POST_TOOL_OUTPUT：长结构 → create_subagent(render_agent)
+            Chat/Agent → POST_TOOL_OUTPUT：软提示（长对照可出图，短答/换路均可）
             Capability 非 render → 事实包；禁嵌套 create_subagent/render
             render_agent → 单次 render_html_to_image；只登记 artifact
             失败 → 对应 FAIL 契约
+            **DELIVERED 终局** → 改注入 POST_DELIVERY_SILENCE（禁再注入 POST_TOOL）
     CallToolsNode → _run_once_on_call_tools
       清洗：embedded thinking / tool_call 伪影 / 参数规范化 / thrash 剥重复 call
+      **先扫**本响应是否有 create_subagent(render_agent)：有则立刻
+        delegated_render + pending_async + silence_only
+        （TextPart 可能排在 ToolCall 前，不能等遍历到 call 才静默）
       parts:
         ToolCall  → log_tool_call / on_trace
+                    create_subagent 仅当 agent_profile 解析到 render_agent
+                    才抢先静默（看 profile 字段，不扫 task 正文）
+                    send_message_by_ai → image_sent，解除异步静默
                     （工具本体由 pydantic-ai 执行；send_message_by_ai 入口
-                     tool_gate_feedback = pre_send_gate(channel=tool)）
+                     tool_gate_feedback = pre_send_gate(channel=tool)；
+                     带台词成功交付 → extra["delivered_with_speech"]）
+        ToolReturn create_subagent → inflight_after_create_subagent_return：
+                    异步 ack / 完成回执确认在途；失败且未 ack 则回滚抢先静默
         TextPart  → log_text_output；return_mode=by_bot 时按序：
                     1) SILENCE / 本轮去重 / 中间文本抑制
-                    2) **pre_send_gate(channel=main)**  ← 统一合规闸（见 §10.5）
-                    3) 假完成预检（零工具却声称办完）→ 暂扣（进 RunOnceState.fab_blocked）
-                    4) ALLOW → send_chat_result（呈现层，见 §10.6）
+                    2) **speech_policy.should_block**（delivered/silence_only/…
+                       话术态；DELIVERED 终局只许 SILENCE；发图后拦交付状态汇报；
+                       pending_async 或 render_inflight → 只放行一句等待；
+                       has_active_task + 多点读数密度 → numeric_recitation 丢弃，
+                       不进 presentation_withheld）
+                    3) **pre_send_gate(channel=main)**  ← 统一合规闸（见 §10.5）
+                    4) 假完成预检（零工具却声称办完）→ 暂扣（进 RunOnceState.fab_blocked）
+                    5) 主通道单轮出站配额（超 MAIN_CHANNEL_VISIBLE_LIMIT 静默）
+                    6) ALLOW → send_chat_result（呈现层，见 §10.6）
         Thinking  → log_thinking
     End → log_node_transition
   未被 supersede → _run_once_settle_result（settle.py）:
@@ -1220,8 +1320,68 @@ agent.iter(message_history=self.history + 本轮 user)   # loop.py
       尖括号：熔断 scrub / replace_map / 补轻量重写
       OOC：_ooc_rewrite_and_send（**尖括号熔断仍执行**；与 angle scrub 正交）
     假完成 / 结构零工具 / render 未委派 → 可选纠正重跑 _execute_run_once
+      （结构零工具纠正带 **SILENCE 自洽出口**：概念题已答全则不刷屏、不削原答）
+    出口消毒后再 log_result（避免 raw 念数被当成已出站）
     return 路径：见 §10.8（Capability/subagent 跳过 roleplay scrub）
 ```
+
+**控制面收口（2026-08-14）**：settle 的四条纠正（假完成 / 结构零工具 / 进度零工具 /
+出图未委派）不再塞裸文本进 `user_message`，统一走
+`control.corrections.*` → `render_control_envelope()` → **`<control>` 信封**，并传
+`is_framework_injection=True`。三条硬规矩（详见
+[`AI_CONTROL_PLANE_UNIFICATION_20260814.md`](AI_CONTROL_PLANE_UNIFICATION_20260814.md)）：
+
+1. **INV-1 出处 ≠ 排版**：`saw_structured_return` 只能由真实 `ToolReturnPart` 置位；
+   台词呈长结构只记 `presentation_mismatch`，**不得**据此强制工具或销毁内容。
+   出图义务只在「真出处 +（台词呈报告体 / empty_handoff 暂扣）」时武装。
+   观测源栅栏（`image_ocr` 等）不得武装出图。报告体拦截仍要 `fact_pack_pending`。
+2. **INV-3 纠正非破坏性**：`_corrected_or_original()` —— 纠正沉默或脏输出则**原答案生效**。
+   旧版「纠正判据误报 → 模型选 `<SILENCE>` → 原答被 scrub」是整轮零输出的活锁根因。
+   假完成一条**有意分岔**：原答是编造的完成声明，不能当 fallback，无干净纠正则静默。
+3. **义务轮无空操作出口**：`<control>` 有 `Obligation` 时不提供 `<SILENCE>`；模型认为观察
+   不成立就调 `dispute_directive(reason=…)`，原答照原样交付。义务由
+   `settle._obligations_met()` 按 `RunOnceState` 结构事实校验，不看模型文本。
+
+**INV-4 兜底**：排版闸暂扣过原文、而纠正被申辩或未履行义务时，`settle._deliver_withheld()`
+在 by_bot 的 `return ""` **之前**真把原文发出去——否则整轮零输出。
+`dispute_directive` / `check_delegation` 已进 `SLIM_GROUP_CORE_TOOLS`：群聊是主战场，
+这两个缺席则模型只能用用户可见文本争辩，正是要消的 OOC。
+
+**在途委派（2026-08-14）**：`create_subagent` 回执改印 `dlg_<root_task_id>` 句柄（原印
+`root.id[:8]`，而 `list_persisted_outputs` 是 SQL 等值 → 模型怎么查都是空）。`dlg_` 已接进
+`handle_resolver`，`read_handle` 与 `check_delegation(id, wait_sec=)` 均可消费；内联等待
+与轮询共用 `control.delegation.await_delegation`，5s 只是默认参数。产物按 **root** 取
+（`list_for_root`：多节点树的产物挂在 child 上）。执行体完成先 `mailbox.post_to_session`，
+再由短窗 flush 用 `drain_one(session, "delivery", root)` 精确消费——会话级 drain 会抽走
+兄弟 root 的投递。
+
+**出图在途静默（2026-08-16）**：群聊里「先念完整事实包、再 `create_subagent(render_agent)`」
+会把图上的信息误解成气泡正文。修复是**结构通道**，不是业务词表：
+
+1. `create_subagent` 的 `agent_profile` 解析到 `render_agent` 时（只看 profile 字段，
+   **不**扫 `task` 正文里的节点名），在 **ToolCall 当下**置 `delegated_render` +
+   `pending_async_delivery` + `speech_policy=silence_only`。同响应先扫 call 再处理 TextPart。
+2. ToolReturn：异步 ack / 完成回执确认在途（`render_ack_seen`）；失败且未 ack 则回滚静默，
+   避免整轮哑火。`pending_async` 期间不注入 POST_TOOL（那会提醒模型「再说一句」）。
+3. `should_block_user_visible_text(..., render_inflight=, has_active_task=)`：
+   在途台词额度 **一句**（≤96 字）：等待安慰 **或** 短应；清单/多点读数/完成腔不占额度、直接静默。
+   活跃任务下「多点读数密度」拦为 `numeric_recitation`，**不进** `presentation_withheld`。
+   `status_ok` 且已查状态工具时放行进度句。发图后另有一句短收尾额度（与在途额度分开）。
+4. 主人格折叠卡：群聊 **不内嵌 inline_head**（summary + 句柄）；长 `create_subagent` 回执同样折成卡。
+   反问时按需 `read_handle`，默认不当事实总线。交付回灌卡 `speech_expand=False`。
+5. `in_flight_short`：`has_active_task` 且剥壳后真人句 ≤48 字 → 跳过语境标签池与向量检索，
+   `max_extra_tools≤2`，保住 L2 kanban/`check_delegation`。唤醒词只剥「装配壳内 ASCII 直接
+   贴非 ASCII」，不切英文句首词。
+
+**图表编码（2026-08-16）**：`render_chart_spec` 支持 `series=[{name,data}]` 分组柱/多折线 +
+图例；`signed` 只表达正负，系列身份不用升/降色；有负值走零轴；缺测点断线不补 0；类目标签
+保留 18 字。事实包禁止把多源分歧合成「a~b」假区间。详见
+[`TAKUMI_HTML_GUIDE.md`](TAKUMI_HTML_GUIDE.md) §8.5、`chart_svg.py`。
+
+**DELIVERED 终局态（2026-08-10，P0 OOC 根治）**：`send_message_by_ai` **带台词**成功交付时
+（工具侧写结构信号 `extra["delivered_with_speech"]`，非文本关键词），loop 把本 run 置为
+`speech_policy="delivered"`：此后对用户只许 `<SILENCE>`，杜绝「任务已完成，图已发送给…」
+这类系统日志腔 OOC。media-only 交付不置位，保留一句角色收尾额度（post_image_ok）。
 
 **机器腔判据（形态，非业务词）**：`Traceback`、`File "…", line`、`"status": 5xx`、`status_code`、常见 `*Error:`、内存地址、框架栈特征等（`output_firewall._TECH_DUMP_RE` / `is_tech_dump`）。
 
@@ -1234,9 +1394,16 @@ agent.iter(message_history=self.history + 本轮 user)   # loop.py
 | 策略顺序 | 模块 | 命中决策 | 同 turn 行为 |
 |----------|------|----------|--------------|
 | 1 `angle_bracket` | `angle_bracket_guard` | 非法 `<>`（如 `<bubble/>` / **`<br>`**）→ **REWRITE**；同 ModelResponse 多段只计 1 次 attempt；累计 3 次 → **FUSE** | 主路径：下一轮 ModelRequest 注入 feedback（`merge_rewrite_feedbacks`）；工具：return 警告；熔断后本轮静默并 scrub 历史 |
-| 2 `ooc` | `output_firewall.check_ooc` | **machine_dump** 主路径 → **FALLBACK**「额…出错了，稍后再试」；其它主路径 → **REWRITE+defer**（记入 `_ooc_blocked`，run 末轻量重说）；工具路径：提醒一次再命中非 never-release 可放行；资金/机器腔 never-release 持续打回 | 状态仅 `extra["output_gate"]` → **`GateBag`**（`angle_bracket` / `ooc` 的 `PolicyState` + `ooc_warned_turn_ids`） |
+| 2 `ooc` | `output_firewall.check_ooc` | **machine_dump** 主路径 → **FALLBACK**「额…出错了，稍后再试」；**delivery_narration** 主路径 → **FUSE**（交付已完成，重说无意义，直接静默）；其它主路径 → **REWRITE+defer**（记入 `_ooc_blocked`，run 末轻量重说）；工具路径：提醒一次再命中非 never-release 可放行；资金/机器腔 never-release 持续打回 | 状态仅 `extra["output_gate"]` → **`GateBag`**（`angle_bracket` / `ooc` 的 `PolicyState` + `ooc_warned_turn_ids`） |
 
 **决策枚举** `GateDecision`：`ALLOW` | `REWRITE` | `FALLBACK` | `FUSE`。
+
+**OOC 类目**（`check_ooc` 返回 `FirewallHit.category`）：`model_identity` / `ai_selfref` /
+`system_term`（框架泄漏 / 系统文案）/ `fund_claim` / `machine_dump` / **`delivery_narration`**。
+`delivery_narration`（2026-08-10）= 交付状态汇报的系统日志腔（「任务已完成 / 图已发送给X /
+无需追加发言」），由 `speech_policy.looks_like_delivery_status_narration` 双信号共现检测
+（交付/完成播报 × 行政化自我静默），不认业务关键词；与 DELIVERED 终局态互补（终局态是主闸，
+此类目是未置终局时的兜底）。
 
 **协议标签不触发尖括号闸**（检测前剥掉）：`<SILENCE>`、`<meme:…>`。
 **`<br>` / `<report>` 不是协议**——与其它自造标签一样打回。
@@ -1251,8 +1418,11 @@ agent.iter(message_history=self.history + 本轮 user)   # loop.py
 
 | 类别 | 位置 | 说明 |
 |------|------|------|
+| 话术态 / DELIVERED 终局 / 交付状态汇报 | `agent_run/speech_policy.should_block_user_visible_text`（gate **之前**） | 交付后只许 SILENCE；发图后拦状态汇报；沉默/进度/回灌分流；出图在途 / 多点读数密度 |
+| **报告体（长结构台词）** | 同上，但**必须** `fact_pack_pending=True` | 出处凭据；无事实包的长正文是用户要的，不拦（INV-1）；被拦的原文进 `presentation_withheld` 供 INV-4 兜底；**numeric_recitation 不进暂扣** |
+| **框架纠正指令** | `control/corrections.py` → `<control>` 信封（settle 发起） | 观察 + 凭据 + 可申辩义务；不进 user 槽/B 轨/工具 query（INV-2） |
 | 假完成 | `agent_run/loop` TextPart（gate **之后**）+ `settle` 结算 | 与「是否调过工具」结构绑定，不是纯文本合规 |
-| SILENCE / 去重 / 中间抑制 | `agent_run/loop` | 通道与节奏 |
+| SILENCE / 去重 / 中间抑制 / 出站配额 | `agent_run/loop` | 通道与节奏 |
 | 剥 tool_call 伪影 / 私有 token / 资源句柄 | `send_chat_result` | 静默 sanitize，不打回 |
 | report / meme / 长 markdown 出图 / 空行拆条 | `send_chat_result` | **呈现层** |
 | 无反馈通道 OOC 末端替换 | `send_chat_result(ooc_check=True)` | proactive 等：直接换兜底句 |
@@ -1341,6 +1511,11 @@ session_log entries（磁盘，可稍后刷）：
 禁止：主人格自搜后先发长 markdown 台词（再被呈现层兜底出丑图）
 ```
 
+> **与 DELIVERED 终局态的关系（2026-08-10）**：本节讲的是 **return 路径**（子代理回执
+> 不回 scrub）；而 `send_message_by_ai` 把图/台词真正发给用户属于 **by_bot 主通道**——
+> 那条路由 DELIVERED 终局态接管（见 §10.4）：带台词交付成功后本 run 只许 `<SILENCE>`。
+> 二者互补：return 路径保住事实包形态，by_bot 路径堵住交付后的状态汇报 OOC。
+
 ---
 
 ## 11. 阶段 ⑩：回合收尾（内存 lean + 业务沉淀）
@@ -1367,14 +1542,25 @@ session_log entries（磁盘，可稍后刷）：
 
 ### 11.2 `handle_ai_chat` 尾
 
+结果**只分类一次**（`turn_pipeline.classify_run_result`），出站与结算复用同一判定：
+
 | 动作 | 条件 |
 |------|------|
 | `SILENCE` | info「角色选择沉默」——不发（by_bot 可能已发过则依赖 Agent 内） |
-| 错误串 | 脱敏 send + 通知主人 |
+| 错误串 | 脱敏 send + 通知主人（`turn_pipeline.deliver_run_result`） |
 | 成功且仍有字符串 | 再 `send_chat_result`（by_bot 多为空）→ info「回复已发送」 |
-| 好感度 +1 | 有效可见回复 |
-| mood 异步更新 | persona 情绪状态机 |
+| **关系温度结算** | `relationship.engine.settle_turn(reached_model=True, …)`，**唯一写主** |
+| H08 `AFTER_RUN` | mood 更新 / 统计上报，消费结算返回的**同一份**信号扫描结果 |
 | （可选）助手侧 observe | 部分路径；出站主路径在 bot.send |
+
+**每轮无条件 +1 已删除。** 涨分靠规则（当日首次有内容 / 明确照顾），扣分靠规则
+（侮辱 / 越狱 / 设好感命令 / 强迫称谓），都受日预算与高分段递减约束。详见
+[`AI_CORE_THREE_LINE_REFACTOR_20260815.md`](AI_CORE_THREE_LINE_REFACTOR_20260815.md) §4。
+
+> **两处结算调用点**：正常收尾 `reached_model=True`；**CheapGate 静音早退**
+> `reached_model=False`（Engine 内部只放行负信号）。不补第二处就会出现吸收态——
+> 用户越界 → zone 掉到 cold → 以后未 @ 的越界发言全部走早退 → 再也扣不到分。
+> 结构性静音（@了别人 / 多人互聊 / 催别人）**不结算**：那些内容不是冲着人格来的。
 
 ---
 
@@ -1438,15 +1624,39 @@ uv run core
 ### 15.2 T1 `init_ai_core`（后台串行，单步失败不阻断）
 
 1. 导入 handle_ai / buildin_tools
-2. RAG：嵌入 + tools/knowledge Qdrant 同步
-3. Persona 默认/迁移
-4. 审批中心
-5. 定时任务 `reload_pending`
-6. Planning：Kanban + **内置**能力代理节点
-7. Memory：IngestionWorker + memory collections
-8. MCP / Meme / 统计（含 Heartbeat job）
+2. **Agent 套件**：`load_enabled_kits()` 按 `kit_slots.*` 装 18 个第一方套件
+3. RAG：嵌入 + tools/knowledge Qdrant 同步
+4. Persona 默认/迁移
+5. 审批中心
+6. 定时任务 `reload_pending`
+7. Planning：Kanban + **内置**能力代理节点
+8. Memory：IngestionWorker + memory collections
+9. MCP / Meme / 统计（含 Heartbeat job）/ MCP Server / 命令执行
 
-**WS 可连 ≠ AI 就绪**。
+流水线 `finally` 置 `_AI_CORE_READY = True` **之后**（不 await）：
+`spawn_cognition_mount()` → `asyncio.create_task` 跑：插件 → 手动知识建公共枢纽 →
+**Agent 文回挂已有枢纽**（`tags` 含 `hub:{正式名}`，`writable=true`，启动扫描禁止自己新建 `world:`）→
+环境实体完整匹配连边。正式名来自 `entity` / 本插件 alias / 标题段 tag，枢纽按插件隔离；
+跨插件同名各建一颗。没声明主语的索引页仍跳过（只计入 `skipped_unresolved`，不逐条刷日志）。失败只 warning，**不得**把 READY 改回 false。
+开关 `cognition_mount_enable`（默认 true）。
+**禁止**把挂载放进 `_INIT_STEPS` 或套件 `init_step`。
+`rebuild_cognition_mount` 清挂件 + `world:`/`ent:` 镜像后再跑同一套；**先拍**
+Agent/网页挂件，插件回挂后再 `ensure_public_hub` 回挂，避免控制台重建不可逆丢挂。
+深度对账 `deep_reconcile_manual_knowledge` 覆盖 `manual` **和** `agent`。
+
+**WS 可连 ≠ AI 就绪**。AI 就绪 ≠ 认知挂载完成（挂载窗口内回想退回无路径卡的联邦，聊天可用）。
+
+**套件为什么排第 2（RAG 之前）**：`AgentKit.register` 只挂 hook（纯注册，重依赖在 hook
+体内懒导入，实测 0.14s），但整条 agent loop 的情绪 / 关系 / 记忆 / **工具装配**都由套件
+接线。这个循环**没有硬超时**——单步只每 60s 打一条「仍在执行中」然后继续等，卡死的步骤
+会无限期挡住它后面的所有步骤。套件排末尾时，Meme 的一次性向量迁移（实测 337s）会让
+hook 总线在整个启动窗口内空转：那段时间里所有请求**零工具、零记忆注入**。
+
+**推论（改这里前必读）**：往 `_INIT_STEPS` 插新步骤时，位置就是可用性决策——便宜且
+关键的放前面，慢且可选的放后面。另外，一个子系统的 bring-up **只能有一个主**：
+套件的 `init_step` 与 `_INIT_STEPS` 条目不可同时指向同一个初始化（否则每次启动跑两遍，
+不报错也不告警）。详见
+`.agents/skills/gscore-development/references/02-startup-lifecycle.md` §2.3。
 
 ### 15.3 关闭
 
@@ -1489,29 +1699,38 @@ uv run core
 | 优先级 | 来源 | 用途 |
 |--------|------|------|
 | 1 | 结构化数据工具 | 实时读数、状态、业务字段 |
-| 2 | `search_knowledge` | 入库资料（非实时） |
+| 2 | `search_cognition` | 入库资料（非实时） |
 | 3 | `web_search` / `web_fetch` | 事件/叙事；**摘要常过时，禁止当未核对的实时值** |
 
-`web_search_tool` 返回框极短通用 disclaimer；折叠时 **句柄卡 + inline_head**，全文 `read_handle`（保底）。
+`web_search_tool` 返回框极短通用 disclaimer；折叠时 **句柄卡**（群聊无 inline_head），全文 `read_handle`（保底）。
 
 ---
 
-## 17. 附录 C：成本 / 委派 / 出图 / 闸门备忘（2026-08-08）
+## 17. 附录 C：成本 / 委派 / 出图 / 闸门备忘（2026-08-10，2026-08-16 增补）
 
 1. **system 前缀缓存**：会话内 system **不改串**（TTL=inf）；mood/关系/记忆/精确时间/身份锚只进 user。
+   系统契约只 **append UserPromptPart**，落盘前 `_relean` 剥掉。history **保头裁中段**
+   （`compact_session_history`），禁止砍头/锚点插头。
 2. **工具规程**：`TOOL_ORCHESTRATION` + **DELEGATION_FIRST** 在 system；重任务禁主人格长业务正文。
 3. **意图**：prior 拼接 + 省略/短句升工具；装配不因闲聊砍向量/状态族；intent=工具/问答 → user 侧事务优先级句。
 4. **工具池**：保底 self+buildin（含 `read_handle`）；recall 默认 3、extra max 默认 6；驻留 2 轮；exclusive 剥离 + find_tools 不回灌。
-5. **抢答（A）**：同 Session 新 run 在锁被占时 set cancel；旧 generation 节点间隙 abort 且不写 history。
-6. **机器腔（B）**：tool return tech dump 屏蔽；输出 `machine_dump` 经 `pre_send_gate` → FALLBACK。
-7. **统一输出闸（C）**：`pre_send_gate` 顺序 **尖括号 → OOC**；尖括号同 turn 3 次熔断；勿在 `agent_run/loop` 平行第二套顺序。
-   另拦框架泄漏 / 系统文案口头禅（过程元话语不对用户）。
-8. **呈现 vs 合规**：`send_chat_result` 只做通道变换；打回/熔断只在 gate。
-9. **出图主路径**：`create_subagent(render_agent)` → 自由 HTML → `res_` 图 → 主人格 `send_message_by_ai`。
-   长 markdown 呈现层兜底 **默认关**（`render_long_markdown_as_image=False`）。
-10. **return OOC 分岔**：Capability/subagent **不做** roleplay scrub；incomplete 认 `res_`/artifact 登记。
-11. **web 降权**：结构化数据工具 ≫ web 摘要；禁止用过时摘要冒充实时读数。
-12. **软门 / Kanban / 无业务特判**：规则预筛；文本 profile 默认可 transient；能力节点靠插件 `register_agent_node` + 工具描述。
+   **召回阈值** `tool_recall_threshold`（0.38）；**知识库 dense** `knowledge_recall_threshold`（0.35）。
+   检索文本 = **name+docstring+covers+aliases**（`ToolBase.retrieval_text`）。
+5. **find_tools 分流**：真无命中 / exclusive 剥离 / visible 隐藏 → 语义节点 + `owning_nodes_of_tools` 指路委派；
+   **禁止**「据现有能力作答」。节点语义路由见 `agent_node/semantic_routing.py`；roster 附 covers。
+6. **抢答（A）**：同 Session 新 run 在锁被占时 set cancel；旧 generation 节点间隙 abort 且不写 history；**有在途委派则留交接语**。
+7. **机器腔（B）**：tool return tech dump 屏蔽；输出 `machine_dump` 经 `pre_send_gate` → FALLBACK。
+8. **统一输出闸（C）**：`pre_send_gate` 顺序 **尖括号 → OOC**；勿在 loop 平行第二套顺序。
+9. **呈现 vs 合规**：`send_chat_result` 只做通道变换；打回/熔断只在 gate。
+10. **出图主路径**：`create_subagent(render_agent)` → 自由 HTML / **`render_chart_spec` SVG** → `res_` 图 → `send_message_by_ai`。
+    多点结构只给软提示（`POST_TOOL_OUTPUT_CONTRACT`），**不再**注入「唯一合法下一步出图」。
+    委派 **ToolCall 即静默**；图表必须 `series`+图例，禁止把身份拍扁进 label、禁止升/降色当系列色。
+11. **web / 时效**：web 返回 `[source=web|staleness_risk=high]`；结构化带 `[as_of=…]`。
+    不再额外叠气候/仅 web 禁令；find_tools 的 🔎/🔒/✅ 装配文案**不算** non_web 数据。
+12. **DELIVERED 终局**：带台词成功交付 → `speech_policy="delivered"`，只许 `<SILENCE>`。
+13. **能力缺口登记**：`find_tools` 未命中计数（`get_capability_gaps`）。
+14. **heartbeat 话头门** / **零工具纠正 SILENCE 出口** / **工具健康度**（❌/timeout 连败冻结执行，schema 保留）。
+15. **agent_max_history** 默认 30；trim 低水位 0.6；compact 降频 + 保头。
 
 ---
 
@@ -1534,6 +1753,7 @@ uv run core
 | LLM provider | 是 | 除非软门沉默/早退 |
 | 插件工具 / MCP | 条件 | 模型点名才执行 |
 | **create_subagent / 能力代理** | 条件 | 重任务 / 出图；return 跳过 roleplay scrub |
+| **speech_policy / DELIVERED 终局** | 条件 | by_bot 台词前话术态分流；带台词交付后只许 SILENCE；出图在途静默；多点读数密度闸 |
 | **output_gate / pre_send_gate** | 条件 | by_bot 发台词或 `send_message_by_ai` 时 |
 | send_chat_result | 条件 | gate ALLOW/FALLBACK 后有可见文本/report |
 | session_logger | 是 | 进 run 即 log（子代理独立 subagents/ 目录） |

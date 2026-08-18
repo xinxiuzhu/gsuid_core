@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, List
 
 from pydantic_ai import Agent
+from pydantic_ai.settings import ModelSettings, merge_model_settings
+from pydantic_ai.capabilities import AbstractCapability
 
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
@@ -17,6 +19,7 @@ from gsuid_core.ai_core.const import (
     _STICKY_FAMILY_TURNS,
     ENABLE_PROGRESSIVE_TOOLS,
 )
+from gsuid_core.ai_core.utils import _normalize_thinking_tags
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.skills import skills_toolset
 from gsuid_core.ai_core.register import find_tool_base, get_tools_by_capability_domain
@@ -28,6 +31,7 @@ from gsuid_core.ai_core.rag.tools import (
     get_tools_by_context_tags,
     search_tools_with_entity_routing,
 )
+from gsuid_core.ai_core.tool_safety import build_tool_safety_capability
 from gsuid_core.ai_core.agent_run.host import RunOnceHost
 from gsuid_core.ai_core.agent_run.state import (
     RunOnceState,
@@ -41,6 +45,31 @@ from gsuid_core.ai_core.agent_run.support import (
     _matched_delegation_only_profile,
 )
 from gsuid_core.ai_core.configs.ai_config import ai_config
+from gsuid_core.ai_core.configs.attribution import resolve_attribution_settings
+from gsuid_core.ai_core.agent_run.remote_web_search import attach_remote_web_search
+
+
+def _kernel_owns_tool_assembly() -> bool:
+    """``tool_assembly`` 槽是否仍由第一方套件占据（= 内核跑五层装配）。
+
+    槽位 ``off`` 或被用户套件占据时返回 False：内核让位，只留调用方传入的工具
+    与自己的 exclusive 收口。总闸关闭时视为内核自管（回落纯内核编排）。
+
+    判据取**配置**而非运行期占用表：占用表是在 ``load_enabled_kits`` 里填的，而它排在
+    ``_INIT_STEPS`` 后段。用占用表会把「套件还没加载完」误读成「用户把槽拆了」，于是
+    在启动窗口内所有请求都退化成零工具（``find_tools`` 一并消失）——实测某个前置
+    init 步骤卡住数分钟时，整轮基准 24 例全部 0 工具调用。「没装好」不等于「不要装」，
+    这个门必须 fail-open。
+    """
+    from gsuid_core.ai_core.kits import resolve_slot_config
+    from gsuid_core.ai_core.hooks import hooks_enabled
+
+    if not hooks_enabled():
+        return True
+    configured = resolve_slot_config("tool_assembly")
+    if not configured:
+        return False
+    return all(kit_id.startswith("gscore.") for kit_id in configured)
 
 
 class ToolsPhase(RunOnceHost):
@@ -69,6 +98,14 @@ class ToolsPhase(RunOnceHost):
             _assemble = self.dynamic_tools
         else:
             _assemble = self.create_by in _AGENTIC_CREATE_BY and not st.tools
+
+        # tool_assembly 槽为 off（或被用户套件占据）时，内核**不跑**五层自动装配：
+        # 只留调用方传入的工具 + 下方的 exclusive 剥离与委派补全。
+        # 副作用：find_tools 是 meta 分类、由装配层注入，本槽 off 时渐进式工具发现
+        # 一并消失——这是正确行为（用户套件无权声明特权分类）。
+        if _assemble and not _kernel_owns_tool_assembly():
+            logger.info(i18n_t("log.agent.tool_assembly_slot_not_kernel"))
+            _assemble = False
 
         # persona 会话与其 AgentNode 声明同步：packs 去掉 dynamic 即关闭五层自动装配
         # 改为静态解析 packs + st.tool_names（与 task-mode 的 runner 同语义）。
@@ -100,7 +137,7 @@ class ToolsPhase(RunOnceHost):
                 )
 
         if st.addr_gated:
-            # C-3：@别人且未点自己 → 零工具
+            # C-3 寻址门（**内核密封**）：@别人且未点自己 → 零工具，且不打 ASSEMBLE_TOOLS
             st.tools = []
         elif _assemble or self.create_by in _AGENTIC_CREATE_BY:
             if _assemble:
@@ -188,12 +225,14 @@ class ToolsPhase(RunOnceHost):
 
                 # 第二层：语境工具池（群聊瘦模式也保留标签池，上限更紧）
                 ctx_tags: list[str] = []
+                ctx_scope_key = ""
                 if st.ev is not None and st.ev.group_id:
-                    try:
-                        from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+                    from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
 
-                        scope_key = make_scope_key(ScopeType.GROUP, str(st.ev.group_id))
-                        ctx_tags = await get_scope_context_tags(scope_key)
+                    ctx_scope_key = make_scope_key(ScopeType.GROUP, str(st.ev.group_id))
+                if ctx_scope_key and not st.in_flight_short:
+                    try:
+                        ctx_tags = await get_scope_context_tags(ctx_scope_key)
                         if ctx_tags:
                             _ctx_max = 4 if st.group_slim else 8
                             ctx_tools = get_tools_by_context_tags(ctx_tags, max_count=_ctx_max)
@@ -214,16 +253,21 @@ class ToolsPhase(RunOnceHost):
                 # soft_continue / ellipsis 与呼叫跟进同权：不得因 st.intent=闲聊 跳过检索。
                 _recall_limit = int(ai_config.get_config("tool_search_recall").data)
                 max_extra_tools: int = int(ai_config.get_config("tool_extra_pool_max").data)
+                _recall_threshold = float(ai_config.get_config("tool_recall_threshold").data)
                 _soft_cont = bool(st.tg.soft_continue) if st.tg is not None else False
                 _ellip = bool(st.tg.ellipsis_followup) if st.tg is not None else False
-                _skip_search = st.is_light or (
-                    st.group_slim
-                    and st.intent == "闲聊"
-                    and not st.followup_detected
-                    and not st.has_active_task
-                    and not st.has_media
-                    and not _ellip
-                    and not _soft_cont
+                _skip_search = (
+                    st.is_light
+                    or st.in_flight_short
+                    or (
+                        st.group_slim
+                        and st.intent == "闲聊"
+                        and not st.followup_detected
+                        and not st.has_active_task
+                        and not st.has_media
+                        and not _ellip
+                        and not _soft_cont
+                    )
                 )
                 if (
                     st.intent == "闲聊"
@@ -233,8 +277,10 @@ class ToolsPhase(RunOnceHost):
                 ):
                     _recall_limit = max(2, _recall_limit // 2)
                     max_extra_tools = max(3, max_extra_tools // 2)
-                if st.group_slim or st.is_light:
+                if st.group_slim or st.is_light or st.in_flight_short:
                     max_extra_tools = min(max_extra_tools, 6)
+                if st.in_flight_short:
+                    max_extra_tools = min(max_extra_tools, 2)
                 if qy and not _skip_search:
                     search_query = interaction_scaffold.build_tool_search_query(
                         qy,
@@ -248,10 +294,12 @@ class ToolsPhase(RunOnceHost):
                         route_text=qy,
                         limit=_recall_limit,
                         non_category=["self", "buildin"],
+                        threshold=_recall_threshold,
+                        scope_key=ctx_scope_key,
                     )
                     # 补搜索族（瘦保底已含 web_search_tool；再补 fetch/knowledge）
                     if (st.group_slim or st.is_light) and st.intent in ("工具", "问答"):
-                        for _tn in ("web_fetch_tool", "search_knowledge"):
+                        for _tn in ("web_fetch_tool", "search_cognition"):
                             if _tn in core_names:
                                 continue
                             _tb = find_tool_base(_tn)
@@ -355,11 +403,22 @@ class ToolsPhase(RunOnceHost):
         else:
             logger.debug(i18n_t("log.agent.skip_tool_search_searching_tools"))
 
+        # H14 / H15：工具装配套件与第三方钉工具。两点之后**各剥离一次** exclusive——
+        # H14 后防套件直接装上 render_*，H15 后防第三方 ensure 回来。
+        # addr_gated 时两点都不打（C-3 零工具硬约束）。
+        if not st.addr_gated:
+            await self._fire_tool_hooks(st)
+
         logger.debug(i18n_t("log.agent.tool_list", p0=[tool.name for tool in st.tools]))
 
         # 最终去重（兼容外部直接传入 st.tools 的情况）
         st.tools = list({obj.name: obj for obj in st.tools}.values())
         st.tool_names = [t.name for t in st.tools]
+        st.exposed_tool_names = list(st.tool_names)
+        _ctx = _require_context(st)
+        from gsuid_core.ai_core.output_firewall import EXPOSED_TOOLS_EXTRA_KEY
+
+        _ctx.extra[EXPOSED_TOOLS_EXTRA_KEY] = list(st.tool_names)
 
         # 回填本轮装配工具的能力域，供 handle_ai 偏好注入精确过滤（"装配后回传"）： 把工具名映射回 capability_domain
         # handle_ai 据此只注入本轮可用工具相关的软偏好。
@@ -375,7 +434,77 @@ class ToolsPhase(RunOnceHost):
         # 记录本次传给 AI 的工具列表
         self._session_logger.log_tools_list(st.tool_names)
 
-    def _run_once_build_agent_meta(self, st: RunOnceState) -> Any:
+    async def _fire_tool_hooks(self, st: RunOnceState) -> None:
+        """开火 H14（装配套件）与 H15（第三方钉/砍工具），每点之后收口一次。
+
+        收口 = exclusive 再剥离 + 去重。护栏：只认已注册的工具名、拒绝特权分类
+        （``self`` / ``buildin`` / ``meta`` 是核心专用），且不许 drop ``create_subagent``。
+        """
+        from gsuid_core.ai_core.hooks import AgentHookPoint, AgentHookContext, fire_hooks, should_fire
+
+        for point in (AgentHookPoint.ASSEMBLE_TOOLS, AgentHookPoint.AFTER_ASSEMBLE_TOOLS):
+            if not should_fire(point):
+                continue
+            ctx = AgentHookContext(
+                point=point,
+                ev=st.ev,
+                bot=st.bot,
+                session_id=self.session_id,
+                persona_name=self.persona_name,
+                create_by=self.create_by,
+                is_subagent=self.is_subagent,
+                addr_gated=st.addr_gated,
+            )
+            await fire_hooks(point, ctx)
+            if ctx.ensured_tools or ctx.dropped_tools:
+                self._apply_tool_mutations(st, ctx.ensured_tools, ctx.dropped_tools)
+                self._reseal_tools(st)
+
+    def _apply_tool_mutations(self, st: RunOnceState, ensured: List[str], dropped: List[str]) -> None:
+        """按 hook 请求增删工具（护栏在此，不在 Context 里）。"""
+        from gsuid_core.ai_core.register import find_tool_base, is_core_only_category
+
+        present = {t.name for t in st.tools}
+        for name in ensured:
+            if name in present:
+                continue
+            tb = find_tool_base(name)
+            if tb is None:
+                logger.warning(i18n_t("log.agent.hook_ensure_unknown_tool", name=name))
+                continue
+            if is_core_only_category(name):
+                logger.warning(i18n_t("log.agent.hook_ensure_privileged_denied", name=name))
+                continue
+            present.add(name)
+            st.tools.append(tb.tool)
+        for name in dropped:
+            if name == "create_subagent":
+                logger.warning(i18n_t("log.agent.hook_drop_delegation_denied", name=name))
+                continue
+            st.tools = [t for t in st.tools if t.name != name]
+
+    def _reseal_tools(self, st: RunOnceState) -> None:
+        """内核收口：主人格交互轮再剥一遍 exclusive，然后去重。
+
+        换套件也逃不掉这一步——不能借 hook 让主人格拿回 ``render_html_to_image``。
+        """
+        if self.create_by in _INTERACTIVE_CREATE_BY:
+            exclusive = _capability_exclusive_tool_names()
+            if exclusive:
+                before = {t.name for t in st.tools}
+                st.tools = [t for t in st.tools if t.name not in exclusive]
+                stripped = before - {t.name for t in st.tools}
+                if stripped:
+                    logger.info(
+                        i18n_t(
+                            "log.agent.main_persona_stripped_capability",
+                            n=len(stripped),
+                            names=sorted(stripped)[:12],
+                        )
+                    )
+        st.tools = list({obj.name: obj for obj in st.tools}.values())
+
+    def _run_once_build_agent_meta(self, st: RunOnceState) -> object:
         """构建 pydantic-ai Agent 与流式统计元数据；返回 Agent 实例。"""
         # 当 return_model 指定时，使用 st.output_type 让 pydantic_ai 强制结构化输出
         # st.output_type 默认为 str（返回文本），指定 Pydantic 模型时强制返回结构化 JSON
@@ -389,12 +518,29 @@ class ToolsPhase(RunOnceHost):
         from gsuid_core.ai_core.memory.config import memory_config
 
         if self.model:
-            _model_settings = self.model.settings
-            if memory_config.eval_mode and _model_settings:
-                _model_settings["temperature"] = 0.0
+            # 必须拷贝：self.model.settings 是模型对象的共享状态，就地改会污染后续所有 run
+            _base_settings: ModelSettings = self.model.settings.copy() if self.model.settings else ModelSettings()
+            if memory_config.eval_mode:
+                _base_settings["temperature"] = 0.0
+            # 归属透传（默认关闭）：把本次 run 的调用方标识按配置带给上游网关
+            _model_settings: ModelSettings | None = merge_model_settings(
+                _base_settings,
+                resolve_attribution_settings(
+                    config_full_name=self._active_config_name or "",
+                    task_level=self.task_level,
+                    scope=st.budget_scope,
+                    session_id=self.session_id,
+                    create_by=self.create_by,
+                ),
+            )
         else:
             _model_settings = None
 
+        # 单工具抛错不炸整轮：SkillNotFound 等 → ⚠️ 回执，模型改道
+        _caps: list[AbstractCapability[Any]] = [build_tool_safety_capability()]
+        _remote_web = attach_remote_web_search(st, self._active_config_name)
+        if _remote_web is not None:
+            _caps.append(_remote_web)
         _agent = Agent(
             model=self.model,
             deps_type=ToolContext,
@@ -402,12 +548,15 @@ class ToolsPhase(RunOnceHost):
             model_settings=_model_settings,
             tools=st.tools,
             toolsets=_toolsets,
+            capabilities=_caps,
             retries=3,
             output_type=st.output_type or str,
         )
 
         # 截断历史记录，避免无限制增长
         self.extract_history()
+        # compact 保头；若首条 user 丢过 marker，补回第一条 user 末尾。
+        self._inject_deepseek_rp_marker(st)
 
         # TTFT/TPS 流式统计：按"每次模型请求"打点，在对应 CallToolsNode 中结算入库。
         # st.req_start 在 ModelRequestNode 发起前记录；_first/st.last_event_at 由
@@ -417,13 +566,20 @@ class ToolsPhase(RunOnceHost):
         st.model_name = self.model.model_name if self.model else "unknown"
         st.provider = self.model.system if self.model else "unknown"
         # 流式响应下需手动按完整文本重新拆分内嵌 <think> 标签（见 _split_embedded_thinking）。
-        # thinking_tags 取自模型 profile，默认 ('<think>','</think>')。
-        st.thinking_tags = ("think", "think")
+        # thinking_tags 取自模型 profile；缺省与 pydantic_ai DEFAULT_THINKING_TAGS 对齐。
+        # 裸名 ('think','think') 会误伤英文思考里的单词 think，必须先规范化。
+        st.thinking_tags = ("<think>", "</think>")
         if self.model is not None:
             _profile_obj = self.model.profile
             if isinstance(_profile_obj, dict):
                 if "thinking_tags" in _profile_obj:
-                    st.thinking_tags = _profile_obj["thinking_tags"]
+                    _raw_tags = _profile_obj["thinking_tags"]
+                    if (
+                        isinstance(_raw_tags, (tuple, list))
+                        and len(_raw_tags) == 2
+                        and all(isinstance(x, str) for x in _raw_tags)
+                    ):
+                        st.thinking_tags = _normalize_thinking_tags((_raw_tags[0], _raw_tags[1]))
             else:
                 logger.error(
                     i18n_t(

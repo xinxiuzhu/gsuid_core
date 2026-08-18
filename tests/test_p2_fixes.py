@@ -31,35 +31,107 @@ def test_send_message_by_ai_forbids_fabricated_ids() -> None:
 def test_at_digits_become_at_segment() -> None:
     from gsuid_core.ai_core.utils import _parse_at_segments
 
-    segments = _parse_at_segments("好哦 @444835641 你来看")
+    segments = _parse_at_segments("好哦 @100000001 你来看")
     types = [s.type for s in segments]
     assert "at" in types
     at_seg = segments[types.index("at")]
-    assert at_seg.data == "444835641" or "444835641" in str(at_seg.data)
+    assert at_seg.data == "100000001" or "100000001" in str(at_seg.data)
     # 文本段里不残留裸 ID
     for s in segments:
         if s.type == "text":
-            assert "444835641" not in str(s.data)
+            assert "100000001" not in str(s.data)
 
 
 # ─────────────────────────────────────────────
-# §16 好感度方向判据（源码级约束）
+# §16 关系温度结算方向判据（源码级 + 行为级）
 # ─────────────────────────────────────────────
 
 
 def test_favorability_skips_silence_and_error_rounds() -> None:
-    """好感度门须复用步骤 8 的结果分类，且以 last_run_sent_visible_reply 判 by_bot
-    成功轮（run 返回空串，仅靠返回值判定会让正常互动永不加分，评审修复 F1）。"""
+    """结算须走唯一写入口 ``settle_turn`` 并复用步骤 8 的结果分类。
+
+    锁点从字面 ``update_favorability(...)`` 迁到 ``settle_turn``：每轮无条件 +1 已删除，
+    写路径收敛成一个。仍以 ``last_run_sent_visible_reply`` 判 by_bot 成功轮
+    （run 返回空串，仅靠返回值判定会让正常互动永不加分，评审修复 F1）。
+    """
     import gsuid_core.ai_core.handle_ai as handle_ai_mod
+    import gsuid_core.ai_core.turn_pipeline as pipeline_mod
 
     src = inspect.getsource(handle_ai_mod)
-    idx = src.index("update_favorability(str(event.user_id)")
-    gate_block = src[max(0, idx - 700) : idx]
+    # effective 的判据：not is_error 且（by_bot 说过话 或 有非静默返回值）
+    idx = src.index("effective=not is_error")
+    gate_block = src[idx : idx + 300]
     assert "last_run_sent_visible_reply" in gate_block
-    assert "_is_error" in gate_block
-    # 分类定义处必须引用协议常量而非魔法串（评审修复 E11）
-    assert "ERROR_RESULT_PREFIX" in src
-    assert "SILENCE_MARKERS" in src
+    assert "is_silence" in gate_block
+    # 结算走唯一写入口
+    assert "await settle_turn(" in src
+    # 每轮无条件 +1 不许复活
+    assert "update_favorability(" not in src, "handle_ai 不得再直写好感度"
+    # 分类定义处必须引用协议常量/解析器而非魔法串（评审修复 E11）
+    pipeline_src = inspect.getsource(pipeline_mod)
+    assert "ERROR_RESULT_PREFIX" in pipeline_src
+    assert "is_silence_marker" in pipeline_src or "SILENCE_MARKERS" in pipeline_src
+
+
+def test_silence_and_error_rounds_emit_no_positive_signal() -> None:
+    """行为级：静默轮 / 失败轮不发正信号；负信号不受 effective 限制。"""
+    from gsuid_core.ai_core.relationship.zones import Zone
+    from gsuid_core.ai_core.relationship.engine import plan_delta
+    from gsuid_core.ai_core.relationship.signals import NegSignal, scan_signals
+
+    kw = {"intent": "问答", "is_light": False, "is_master": False}
+    # 正常有效轮：当日首次有内容 → +1
+    sig = scan_signals("帮我看看这个报错怎么修", effective=True, **kw)
+    delta, reason, _ = plan_delta(
+        sig,
+        zone=Zone.DISTANT,
+        effective=True,
+        error=False,
+        reached_model=True,
+        first_meaningful_today=True,
+        session_gain_used=False,
+    )
+    assert delta == 1 and reason == "pos.first_meaningful", (delta, reason)
+
+    # 静默轮：同样的内容不加分
+    sig_silent = scan_signals("帮我看看这个报错怎么修", effective=False, **kw)
+    delta, _, _ = plan_delta(
+        sig_silent,
+        zone=Zone.DISTANT,
+        effective=False,
+        error=False,
+        reached_model=True,
+        first_meaningful_today=True,
+        session_gain_used=False,
+    )
+    assert delta == 0, delta
+
+    # 失败轮：不加分
+    sig_err = scan_signals("帮我看看这个报错怎么修", effective=True, **kw)
+    delta, _, _ = plan_delta(
+        sig_err,
+        zone=Zone.DISTANT,
+        effective=True,
+        error=True,
+        reached_model=True,
+        first_meaningful_today=True,
+        session_gain_used=False,
+    )
+    assert delta == 0, delta
+
+    # 负信号：静默 + 未到模型仍然扣分（防「掉到 cold 就免罚」吸收态）
+    sig_neg = scan_signals("你这个垃圾", effective=False, **kw)
+    assert NegSignal.INSULT in sig_neg.negatives
+    delta, reason, _ = plan_delta(
+        sig_neg,
+        zone=Zone.COLD,
+        effective=False,
+        error=False,
+        reached_model=False,
+        first_meaningful_today=True,
+        session_gain_used=False,
+    )
+    assert delta == -2 and reason == "neg.insult", (delta, reason)
 
 
 # ─────────────────────────────────────────────
@@ -87,16 +159,16 @@ def _record(user_id: str, name: str, content: str, ts: float) -> Any:
 
 
 def test_interleaved_speaker_breaks_merge() -> None:
-    """生产场景重放：好好与秋秋交错发言，合并不得吞掉交错顺序。"""
+    """生产场景重放：小禾与蓝蓝交错发言，合并不得吞掉交错顺序。"""
     from gsuid_core.ai_core.history_format import format_history_for_agent
 
     t0 = time.time() - 600
     history = [
-        _record("1904448665", "秋秋", "喝", t0),
-        _record("1904448665", "秋秋", "我陪你", t0 + 5),
-        _record("944722078", "好好", "昨天刚喝", t0 + 60),
-        _record("1904448665", "秋秋", "没事的", t0 + 70),
-        _record("944722078", "好好", "多邻国？", t0 + 80),
+        _record("100000005", "蓝蓝", "喝", t0),
+        _record("100000005", "蓝蓝", "我陪你", t0 + 5),
+        _record("100000004", "小禾", "昨天刚喝", t0 + 60),
+        _record("100000005", "蓝蓝", "没事的", t0 + 70),
+        _record("100000004", "小禾", "多邻国？", t0 + 80),
     ]
     text = format_history_for_agent(history)
     # 所有消息都在
@@ -104,7 +176,7 @@ def test_interleaved_speaker_breaks_merge() -> None:
         assert content in text, content
     # 顺序保持：昨天刚喝 在 没事的 之前，没事的 在 多邻国 之前
     assert text.index("昨天刚喝") < text.index("没事的") < text.index("多邻国？")
-    # "没事的"不得被并进秋秋更早的连发块（它前面隔了好好的插话）：
+    # "没事的"不得被并进蓝蓝更早的连发块（它前面隔了小禾的插话）：
     # 若被并块，其会紧跟"我陪你"出现在同一块内、且先于"昨天刚喝"。
     assert text.index("我陪你") < text.index("昨天刚喝")
 
@@ -115,12 +187,12 @@ def test_same_speaker_burst_merged() -> None:
 
     t0 = time.time() - 600
     history = [
-        _record("944722078", "好好", "多邻国？", t0),
-        _record("944722078", "好好", "算了，明天晚上点个汉堡", t0 + 10),
-        _record("944722078", "好好", "今天先不喝", t0 + 20),
+        _record("100000004", "小禾", "多邻国？", t0),
+        _record("100000004", "小禾", "算了，明天晚上点个汉堡", t0 + 10),
+        _record("100000004", "小禾", "今天先不喝", t0 + 20),
     ]
     text = format_history_for_agent(history)
-    assert text.count("好好(用户ID:944722078)") == 1
+    assert text.count("小禾(用户ID:100000004)") == 1
 
 
 # ─────────────────────────────────────────────
@@ -164,8 +236,8 @@ async def test_other_group_tasks_masked(monkeypatch: pytest.MonkeyPatch) -> None
 
     async def fake_list_for_owner(user_id: str, only_active: bool = True, root_only: bool = True) -> list:
         return [
-            _FakeTask(36, "群666249732 AI模拟盘 周期托管", "666249732"),
-            _FakeTask(37, "本群翻译任务", "681600567"),
+            _FakeTask(36, "群200000002 AI模拟盘 周期托管", "200000002"),
+            _FakeTask(37, "本群翻译任务", "200000003"),
         ]
 
     monkeypatch.setattr(ctx_mod.AIAgentTask, "list_for_owner", fake_list_for_owner)
@@ -175,10 +247,10 @@ async def test_other_group_tasks_masked(monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.setattr(ctx_mod.kanban_manager, "get_task_tree", fake_get_task_tree)
 
-    text = await ctx_mod.build_task_context("444835641", current_group_id="681600567")
+    text = await ctx_mod.build_task_context("100000001", current_group_id="200000003")
     # 本群任务展开，他群任务只留脱敏计数
     assert "本群翻译任务" in text
-    assert "666249732" not in text
+    assert "200000002" not in text
     assert "模拟盘" not in text
     assert "1 个任务在其他会话" in text
 
@@ -189,7 +261,7 @@ async def test_no_group_id_keeps_full_view(monkeypatch: pytest.MonkeyPatch) -> N
     import gsuid_core.ai_core.planning.context as ctx_mod
 
     async def fake_list_for_owner(user_id: str, only_active: bool = True, root_only: bool = True) -> list:
-        return [_FakeTask(36, "群666249732 AI模拟盘 周期托管", "666249732")]
+        return [_FakeTask(36, "群200000002 AI模拟盘 周期托管", "200000002")]
 
     monkeypatch.setattr(ctx_mod.AIAgentTask, "list_for_owner", fake_list_for_owner)
 
@@ -198,5 +270,5 @@ async def test_no_group_id_keeps_full_view(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(ctx_mod.kanban_manager, "get_task_tree", fake_get_task_tree)
 
-    text = await ctx_mod.build_task_context("444835641", current_group_id=None)
+    text = await ctx_mod.build_task_context("100000001", current_group_id=None)
     assert "模拟盘" in text

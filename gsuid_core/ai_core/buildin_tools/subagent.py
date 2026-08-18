@@ -36,6 +36,7 @@ from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.rag.tools import search_tools
 from gsuid_core.ai_core.session_registry import get_ai_session_registry
 from gsuid_core.ai_core.configs.ai_config import ai_config
+from gsuid_core.ai_core.control.delegation import await_delegation, delegation_handle
 
 # 注意：create_agent 在 create_subagent() 内部懒加载导入
 # 避免 buildin_tools → subagent → gs_agent → persona → buildin_tools 的循环导入。
@@ -198,6 +199,7 @@ def _get_subagent_semaphore() -> asyncio.Semaphore:
 # create_subagent(agent_profile=...) 转 Kanban：短等快速完成，否则 deferred 回灌。
 # 短等上限须低于会话 _run_lock 排队 STALE，避免长任务占锁导致群聊应答率塌陷。
 _KANBAN_INLINE_WAIT_TIMEOUT_SEC = 5.0
+# 轮询间隔已收敛到 control.delegation.await_delegation；此处保留常量仅为兼容引用
 _KANBAN_INLINE_POLL_INTERVAL_SEC = 0.5
 
 # 文本结论类能力代理：默认同步 ad-hoc（transient），不建看板卡、不经调度排队。
@@ -261,8 +263,23 @@ async def create_subagent(
         )
 
 
+async def summarize_long_input(text: str, *, max_tokens: int = 18000) -> str:
+    """内核长度防护：无工具上下文的摘要委派（不是模型可调的 ``create_subagent``）。"""
+    from gsuid_core.ai_core.wall_clock import pause_wall_clock
+
+    async with pause_wall_clock():
+        return await _create_subagent_impl(
+            None,
+            task=f"请总结以下用户输入，保留关键信息：\n\n{text}",
+            max_tokens=max_tokens,
+            max_iterations=15,
+            agent_profile="",
+            transient=True,
+        )
+
+
 async def _create_subagent_impl(
-    ctx: RunContext[ToolContext],
+    ctx: RunContext[ToolContext] | None,
     *,
     task: str,
     max_tokens: int,
@@ -270,9 +287,9 @@ async def _create_subagent_impl(
     agent_profile: str,
     transient: bool,
 ) -> str:
-    """create_subagent 实现体（已在 pause_wall_clock 内）。"""
-    # 指定 profile：默认 transient 的走 ad-hoc，其余转 Kanban
-    if agent_profile:
+    """create_subagent 实现体（已在 pause_wall_clock 内）。``ctx is None`` 仅内核摘要用。"""
+    # 无 ctx 的内核摘要不走能力路由，避免摘要任务被误派到专域节点。
+    if ctx is not None and agent_profile:
         from gsuid_core.ai_core.agent_node import resolve_node
 
         pid = resolve_node(agent_profile) or agent_profile.strip()
@@ -281,18 +298,18 @@ async def _create_subagent_impl(
             return await _dispatch_transient_capability_agent(ctx, task, agent_profile)
         return await _dispatch_via_kanban(ctx, task, agent_profile)
 
-    # 未填 profile：用 task 文本匹配已注册能力节点（通用关键词），命中则走专职代理
-    from gsuid_core.ai_core.agent_node import get_node, match_capability_node
+    if ctx is not None and not agent_profile:
+        from gsuid_core.ai_core.agent_node import get_node, match_capability_node
 
-    auto_pid = match_capability_node(task)
-    if auto_pid and get_node(auto_pid) is not None:
-        logger.info(
-            i18n_t("log.ai.subagent_convert_kanban_leaf", p0=0, p1=auto_pid[:6], pid=auto_pid, p2=repr(task[:60]))
-        )
-        use_transient = transient or auto_pid in _TRANSIENT_DEFAULT_PROFILES
-        if use_transient:
-            return await _dispatch_transient_capability_agent(ctx, task, auto_pid)
-        return await _dispatch_via_kanban(ctx, task, auto_pid)
+        auto_pid = match_capability_node(task)
+        if auto_pid and get_node(auto_pid) is not None:
+            logger.info(
+                i18n_t("log.ai.subagent_convert_kanban_leaf", p0=0, p1=auto_pid[:6], pid=auto_pid, p2=repr(task[:60]))
+            )
+            use_transient = transient or auto_pid in _TRANSIENT_DEFAULT_PROFILES
+            if use_transient:
+                return await _dispatch_transient_capability_agent(ctx, task, auto_pid)
+            return await _dispatch_via_kanban(ctx, task, auto_pid)
 
     logger.info(i18n_t("log.ai.subagent_general_planning_executor_start", p0=task[:50]))
 
@@ -358,7 +375,7 @@ async def _create_subagent_impl(
         # 建立主 Agent ↔ SubAgent 的关联（双向）。
         # _session_logger / _file_path 都是已声明字段（见 gs_agent.GsCoreAIAgent.__init__
         try:
-            parent_session_id = ctx.deps.ev.session_id if ctx.deps.ev else None
+            parent_session_id = ctx.deps.ev.session_id if ctx is not None and ctx.deps.ev else None
             if parent_session_id:
                 parent_session = _session_registry.get_ai_session(parent_session_id)
                 if parent_session is not None:
@@ -401,8 +418,8 @@ async def _create_subagent_impl(
             # 直接把任务扔给它，它会被 system_prompt 逼着去先列 TODO list
             result = await agent.run(
                 user_message=f"【当前任务】\n{task}\n\n请立即开始你的规划与执行！",
-                bot=ctx.deps.bot,
-                ev=ctx.deps.ev,
+                bot=ctx.deps.bot if ctx is not None else None,
+                ev=ctx.deps.ev if ctx is not None else None,
                 tools=tools,
                 return_mode="return",  # 结果返回给主Agent，由主Agent决定何时发送给用户
             )
@@ -644,18 +661,13 @@ async def _dispatch_via_kanban(
     mark_interactive_relay_root(root.id)
     asyncio.create_task(kick_root(root.id))
 
-    # 同步等待根任务进终态（统一预算，不按业务画像特判）
-    waited = 0.0
-    final: Optional[AIAgentTask] = None
-    while waited < _KANBAN_INLINE_WAIT_TIMEOUT_SEC:
-        await asyncio.sleep(_KANBAN_INLINE_POLL_INTERVAL_SEC)
-        waited += _KANBAN_INLINE_POLL_INTERVAL_SEC
-        fresh = await AIAgentTask.get_by_id(root.id)
-        if fresh is None:
-            return f"⚠️ Kanban 任务记录消失（task_id={root.id[:8]}）；可能被并发删除，请到 webconsole 看任务列表。"
-        if fresh.status in ("completed", "failed", "cancelled", "waiting_approval"):
-            final = fresh
-            break
+    # 同步等待根任务进终态：与 check_delegation 共用 await_delegation，
+    # 「内联等 5s」因此只是同一入口的默认参数，不再是独立轮询路径。
+    waited = _KANBAN_INLINE_WAIT_TIMEOUT_SEC
+    deleg = await await_delegation(delegation_handle(root.id), wait_sec=_KANBAN_INLINE_WAIT_TIMEOUT_SEC)
+    if deleg is None:
+        return f"⚠️ Kanban 任务记录消失（task_id={root.id}）；可能被并发删除，请到 webconsole 看任务列表。"
+    final: Optional[AIAgentTask] = await AIAgentTask.get_by_id(root.id) if deleg.is_terminal else None
 
     if final is None:
         # 超时：deferred 回灌；严禁主人格对群报「还在跑/任务编号/等会儿」
@@ -675,14 +687,17 @@ async def _dispatch_via_kanban(
                     "请只输出 <SILENCE>，勿向用户说话、勿重复 create_subagent。"
                 )
         else:
+            # 给模型**能被工具消费**的单一句柄（INV-5）：旧版只印 8 字符前缀，
+            # 而 list_persisted_outputs 是 SQL 等值查询 → 模型怎么查都是空。
             return (
                 f"⏳ 子任务后台执行中（已同步等 {int(waited)}s，将自动回灌）。"
-                f"task#{root.ordinal} / {root.id[:8]} / {pid}。\n"
+                f"task#{root.ordinal} / {pid} / 句柄 {delegation_handle(root.id)}\n"
                 "**硬门**：本 tool_return 不是终局结论。"
                 "你必须只输出 <SILENCE>（或空），"
                 "**禁止**对用户说「还在写/还没好/等会儿/任务编号/眯一会儿」；"
-                "禁止再 create_subagent 同任务；禁止查进度刷屏。"
-                "框架完成后会注入交付包，那时再短句+出图。"
+                "禁止再 create_subagent 同任务。\n"
+                "用户之后追问进度时，用 check_delegation(上面那个句柄) 查真实状态"
+                "（句柄只进工具参数，绝不写进给用户看的台词）。"
             )
 
     # 抓 artifact（最新一份用作产物展示）
