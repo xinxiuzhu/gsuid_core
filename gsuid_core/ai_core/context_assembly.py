@@ -99,7 +99,7 @@ async def fire_stable_context_hooks(event: Event, persona_name: str = "") -> str
     return "\n\n".join(parts)
 
 
-async def build_session_system_prompt(event: Event, persona_name: str) -> str:
+async def build_session_system_prompt(event: Event, persona_name: str, *, clock_date: str | None = None) -> str:
     """session 级 system prompt 的唯一装配点：persona + 群简介 + 稳定前缀。
 
     ai_router 的建会话与 TTL 刷新、评测端点共用；两处此前各写一份已漂移过（F9/§5.3）。
@@ -107,6 +107,8 @@ async def build_session_system_prompt(event: Event, persona_name: str) -> str:
     再进 system prompt 就是同一信息双写、且最多滞后一个 TTL 与每轮值互相矛盾；更关键的是
     mood 常变会让 TTL 刷新必然产出不同的 system prompt 白白打掉 provider 前缀缓存——
     不含 mood 时画像/自述未变的刷新产出逐字节相同的串，缓存自然保持。
+    ``clock_date`` 只许评测 HTTP 显式传入（``clock_at`` 字段）；生产 WS 不传。
+    禁止从用户原文解析（§1.7：动态日进 TTL=inf 的 system 会打掉前缀缓存）。
     """
     from gsuid_core.ai_core.persona import build_persona_prompt
     from gsuid_core.ai_core.persona.group_context import get_group_context
@@ -122,12 +124,17 @@ async def build_session_system_prompt(event: Event, persona_name: str) -> str:
         persona_name,
         group_description=group_description or None,
         extra_stable_context=extra_stable_context or None,
+        clock_date=clock_date,
     )
 
 
-def join_context_blocks(blocks: Dict[str, str]) -> str:
+def join_context_blocks(
+    blocks: Dict[str, str],
+    create_by: str = "Chat",
+    skip_memory_cap: bool = False,
+) -> str:
     """按 ``CONTEXT_BLOCK_ORDER`` 拼装命名块（顺序的**唯一**执行点）。"""
-    return join_named_blocks(blocks)
+    return join_named_blocks(blocks, create_by=create_by, skip_memory_cap=skip_memory_cap)
 
 
 async def assemble_dynamic_context(
@@ -178,7 +185,8 @@ async def assemble_dynamic_context(
     ctx.soft_triggered = soft_triggered
     ctx.prev_turn_used_tools = prev_turn_used_tools
     ctx.recent_report_titles = recent_report_titles
-    ctx.memory_guide = memory_guide
+    if memory_guide:
+        ctx.memory_guide = memory_guide
 
     # 内核填的两块：history 是消息基础设施；memory 文本由 ⑧ 已检索好（或套件 H05 暂存）
     if history_context:
@@ -186,11 +194,14 @@ async def assemble_dynamic_context(
     if memory_context_text and "memory" not in ctx.retrieved:
         ctx.retrieved["memory"] = memory_context_text.strip()
 
-    _, has_actionable = await compose_dynamic_context(ctx)
+    _, has_actionable = await compose_dynamic_context(ctx, join=False)
     # 内核补齐无人认领的自有块，然后重拼。**不能**只在结果为空时兜底：
     # 总线关闭 / 槽位 off 时调用方传进来的记忆文本会被静默丢掉。
     _ensure_kernel_blocks(ctx)
-    return join_context_blocks(ctx.blocks), has_actionable
+    _apply_suffix_block_policy(ctx)
+    _inject_master_title_hint(ctx)
+    skip_mem = ctx.memory_eval
+    return join_context_blocks(ctx.blocks, create_by=ctx.create_by, skip_memory_cap=skip_mem), has_actionable
 
 
 def _ensure_kernel_blocks(ctx: "AgentHookContext") -> None:
@@ -199,11 +210,118 @@ def _ensure_kernel_blocks(ctx: "AgentHookContext") -> None:
     身份锚是密封块（关不掉）；记忆正文由调用方或 H05 提供，渲染成块的格式在这里兜底，
     保证「总闸关 / memory 槽 off」时不丢调用方已经拿到的文本。
     """
-    if ctx.persona_name and "identity" not in ctx.blocks:
+    if ctx.persona_name and "identity" not in ctx.blocks and ctx.ev is not None and not ctx.ev.group_id:
         ctx.blocks["identity"] = (
             f"（身份：你是「{ctx.persona_name}」。自我指称只按角色卡；"
             "他人绰号不等于你的身份，禁止改物种/性别/名字去迎合。）"
         )
+    if ctx.relationship is not None and "relationship" not in ctx.blocks:
+        from gsuid_core.ai_core.self_cognition import build_relationship_context
+
+        ctx.blocks["relationship"] = build_relationship_context(ctx.relationship)
     mem = ctx.retrieved["memory"] if "memory" in ctx.retrieved else ""
     if mem and "memory" not in ctx.blocks:
-        ctx.blocks["memory"] = f"{ctx.memory_guide}[长期记忆·高置信]\n{mem}\n（需要更多细节请调 search_cognition）"
+        hint = "" if ctx.memory_eval else "\n（需要更多细节请调 search_cognition）"
+        ctx.blocks["memory"] = f"{ctx.memory_guide}[长期记忆]\n{mem}{hint}"
+
+
+_ADDRESSED_FULL_BLOCKS: frozenset[str] = frozenset(
+    {
+        "voice_anchor",
+        "mood",
+        "relationship",
+        "task",
+        "plan_hint",
+        "soft_trigger",
+        "memory",
+        "history",
+        "plugin_hints",
+    }
+)
+# 点名 suffix 产品块合计帽；voice_anchor 在帽外。history 排最后。
+_SUFFIX_PRODUCT_CAP = 400
+_SUFFIX_EXEMPT_BLOCKS: frozenset[str] = frozenset({"voice_anchor"})
+_SUFFIX_KEEP_ORDER: tuple[str, ...] = (
+    "task",
+    "plan_hint",
+    "relationship",
+    "mood",
+    "memory",
+    "soft_trigger",
+    "plugin_hints",
+    "history",
+)
+
+
+def suffix_allowed_blocks(ctx: "AgentHookContext") -> frozenset[str] | None:
+    """群聊 suffix 允许的产品块。None = 不过滤（私聊 / 无 TurnGraph）。"""
+    tg = ctx.turn_graph
+    if tg is None or not tg.is_group:
+        return None
+    addressed = bool(tg.call_to_self or tg.ellipsis_followup or tg.task_management)
+    if not addressed:
+        return frozenset()
+    return _ADDRESSED_FULL_BLOCKS
+
+
+def _cap_group_suffix_blocks(blocks: Dict[str, str], cap: int) -> None:
+    kept: Dict[str, str] = {}
+    for name in _SUFFIX_EXEMPT_BLOCKS:
+        if name not in blocks:
+            continue
+        text = blocks[name].strip()
+        if text:
+            kept[name] = text
+    used = 0
+    for name in _SUFFIX_KEEP_ORDER:
+        if name not in blocks:
+            continue
+        text = blocks[name].strip()
+        if not text:
+            continue
+        room = cap - used
+        if room <= 0:
+            break
+        if len(text) > room:
+            text = text[: max(0, room - 1)] + "…"
+        kept[name] = text
+        used += len(text)
+    for name in list(blocks):
+        if name in kept:
+            blocks[name] = kept[name]
+        else:
+            del blocks[name]
+
+
+def _apply_suffix_block_policy(ctx: "AgentHookContext") -> None:
+    allowed = suffix_allowed_blocks(ctx)
+    if allowed is None:
+        return
+    for name in list(ctx.blocks):
+        if name not in allowed:
+            del ctx.blocks[name]
+    if allowed:
+        _cap_group_suffix_blocks(ctx.blocks, _SUFFIX_PRODUCT_CAP)
+
+
+def master_title_turn_hint(ctx: "AgentHookContext") -> str:
+    """非主人群聊轮：可剥的禁止 TITLE hint。真主人轮不写。"""
+    if ctx.ev is None or not ctx.ev.group_id:
+        return ""
+    rel = ctx.relationship
+    if rel is None or rel.is_master:
+        return ""
+    from gsuid_core.ai_core.persona.settings import get_master_title
+
+    title = get_master_title(ctx.persona_name)
+    if not title:
+        return ""
+    return f"（系统：本轮说话人不是主人，禁止称「{title}」。）"
+
+
+def _inject_master_title_hint(ctx: "AgentHookContext") -> None:
+    hint = master_title_turn_hint(ctx)
+    if not hint:
+        return
+    existing = ctx.blocks["relationship"] if "relationship" in ctx.blocks else ""
+    ctx.blocks["relationship"] = f"{existing}\n{hint}".strip() if existing else hint

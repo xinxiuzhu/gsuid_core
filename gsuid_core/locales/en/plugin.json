@@ -1,4 +1,5 @@
 {
+  "log.plugin.uninstall_meta_warn": "Uninstalling meta plugin {plugin_name}; other plugins may depend on it",
   "log.plugin.command_chain_start": "[Detect Startup Tool] Command chain: {command_chain}",
   "log.plugin.command_start": "[Detect Startup Tool] Final command: {command}",
   "log.plugin.event_info": "[刷新插件列表] 列表新增插件 {i}",
@@ -39,6 +40,9 @@
   "log.plugin.gscore_cleanup_agent_hooks_tools": "[GsCore] Cleaned {hooks} agent hooks and {tools} AI tools for {plugin_name}",
   "log.plugin.gscore_cleanup_global_registration_start": "[GsCore] Starting cleanup of global registration state for plugin {plugin_name}...",
   "log.plugin.gscore_fail_agent_hooks": "[GsCore] Failed to clean agent hooks / kit slots for {plugin_name}: {e}",
+  "log.plugin.gscore_fail_help_cache": "[GsCore] Exception while cleaning help cache and registration for plugin {plugin_name}: {e}",
+  "log.plugin.gscore_fail_plugin_pages": "[GsCore] Exception while clearing Web page registry for plugin {plugin_name}: {e}",
+  "log.plugin.gscore_plugin_pages_unregistered": "[GsCore] Unregistered {removed_pages} Web pages for plugin {plugin_name}",
   "log.plugin.gscore_fail_lifecycle_hooks": "[GsCore] Exception while clearing lifecycle Hooks for plugin {plugin_name}: {e}",
   "log.plugin.gscore_fail_running_startup_hook": "[GsCore] Exception while running startup Hook {p0} for plugin {plugin_name}: {res}",
   "log.plugin.gscore_fail_web_routes": "[GsCore] Exception while clearing web routes for plugin {plugin_name}: {e}",

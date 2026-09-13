@@ -148,7 +148,7 @@ def test_tool_channel_angle_and_ooc_order() -> None:
 
 
 def test_ooc_main_defers_with_forced_hit(monkeypatch: Any) -> None:
-    """不依赖 live config：强制 check_ooc 命中后 main 须 defer。"""
+    """不依赖 live config：强制 check_ooc 命中后 main 须 defer + 系统提醒。"""
     from gsuid_core.ai_core import output_firewall as of
     from gsuid_core.ai_core.output_gate import GateDecision, pre_send_gate
 
@@ -161,16 +161,57 @@ def test_ooc_main_defers_with_forced_hit(monkeypatch: Any) -> None:
     monkeypatch.setattr(
         of,
         "check_ooc",
-        lambda text, tier="roleplay", user_text="", exposed_tool_names=(): _Hit("model_name", ["minimax"]),
+        lambda text, tier="roleplay", user_text="", exposed_tool_names=(): _Hit("model_identity", ["minimax"]),
     )
     monkeypatch.setattr(of, "build_rewrite_warning", lambda hit: f"warn:{hit.category}")
 
-    extra: dict = {}
+    extra: dict = {"turn_id": "t-main"}
     r = pre_send_gate("MiniMax呀", extra, user_text="你是什么模型", channel="main")
     assert r.decision is GateDecision.REWRITE
     assert r.policy == "ooc"
     assert r.defer_ooc is True
+    assert r.feedback
     assert r.ooc_hit is not None
+    # 未注入提醒前，同一句再走 main 仍打回（不是二次发送放行）
+    r2 = pre_send_gate("MiniMax呀", extra, user_text="你是什么模型", channel="main")
+    assert r2.decision is GateDecision.REWRITE
+    assert r2.defer_ooc is True
+
+
+def test_ooc_main_allows_after_reminder_injected(monkeypatch: Any) -> None:
+    """系统提醒送达后，主路径下一句视为模型自判，放行。"""
+    from gsuid_core.ai_core import output_firewall as of
+    from gsuid_core.ai_core.output_gate import GateDecision, pre_send_gate, mark_ooc_reminded
+
+    @dataclass
+    class _Hit:
+        category: str
+        matched: list[str]
+
+    monkeypatch.setattr(of, "is_enabled", lambda: True)
+    monkeypatch.setattr(
+        of,
+        "check_ooc",
+        lambda text, tier="roleplay", user_text="", exposed_tool_names=(): _Hit("model_identity", ["claude"]),
+    )
+    extra: dict = {"turn_id": "t-judge"}
+    first = pre_send_gate("Claude 是 Anthropic 出的", extra, channel="main")
+    assert first.decision is GateDecision.REWRITE
+    mark_ooc_reminded(extra)
+    judged = pre_send_gate("Claude 是 Anthropic 出的", extra, channel="main")
+    assert judged.decision is GateDecision.ALLOW
+    # 工具通道仍不二次放行
+    tool = pre_send_gate("Claude 是 Anthropic 出的", extra, channel="tool")
+    assert tool.decision is GateDecision.REWRITE
+
+
+def test_ooc_warning_is_advisory_not_forced_strip() -> None:
+    from gsuid_core.ai_core.output_firewall import OOC_JUDGE_MARKER, FirewallHit, build_rewrite_warning
+
+    w = build_rewrite_warning(FirewallHit(category="model_identity", matched=["claude"]))
+    assert OOC_JUDGE_MARKER in w
+    assert "自己判断" in w
+    assert "去掉任何模型名" not in w
 
 
 def test_tool_gate_feedback_compat() -> None:

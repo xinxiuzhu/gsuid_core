@@ -6,6 +6,7 @@ description: >
   "能力代理/代理画像"、"怎么为触发器添加AI功能"、"几个触发器的差别在哪"、"数据库和配置项怎么添加"
   "如何把数据库表挂到网页控制台"、"PIL/pytakumi/playwright 哪个用哪个"、
   "插件怎么挂自己的 HTTP 接口"、"插件怎么注册 FastAPI 路由"、
+  "插件怎么挂前端页面"、"register_plugin_page"、"插件页 iframe"、
   "怎么扩展 RAG 嵌入后端"、"注册自定义 Embedding Provider"时触发此 SKILL。
   对所有 GsCore Bot 插件开发任务都应优先读取此 SKILL。
 
@@ -29,11 +30,11 @@ description: >
 
 | 章节 | 主题 | 链接 |
 |------|------|------|
-| 一 | 插件基础结构（目录、命名、入口三件套、Plugins vs SV、pyproject、资源路径） | [references/01-plugin-basics.md](./references/01-plugin-basics.md) |
+| 一 | 插件基础结构（目录、命名、入口三件套、Plugins vs SV、pyproject、资源路径、**meta plugin**、**ruff / .vscode**） | [references/01-plugin-basics.md](./references/01-plugin-basics.md) |
 | 二 | SV 与触发器（SV 实例、八种触发器语义对比、装饰器通用参数、签名规范） | [references/02-sv-and-triggers.md](./references/02-sv-and-triggers.md) |
 | 三 | 消息收发（Event 属性、bot.send 各种形态、send_option、多步会话） | [references/03-messaging.md](./references/03-messaging.md) |
 | 四 | 配置管理（CONFIG_DEFAULT、StringConfig、所有配置类型） | [references/04-config-management.md](./references/04-config-management.md) |
-| 五 | 数据库操作（SQLModel 基类、`@with_session`、`async_maker`、注册到 Web 控制台、`exec_list` 自动迁移） | [references/05-database.md](./references/05-database.md) |
+| 五 | 数据库操作（SQLModel 基类、`@with_session` / `@with_read_session`、`async_maker`、注册到 Web 控制台、`exec_list` 自动迁移） | [references/05-database.md](./references/05-database.md) |
 | 六 | 定时任务与订阅（APScheduler、`gs_subscribe` 全套 API） | [references/06-scheduler-and-subscribe.md](./references/06-scheduler-and-subscribe.md) |
 | 七 | 启动 / 关闭 / Bot 上线钩子（4 类钩子的区别与适用场景） | [references/07-lifecycle-hooks.md](./references/07-lifecycle-hooks.md) |
 | 八 | 帮助系统注册（`register_help`、`get_new_help`、`register_status`） | [references/08-help-system.md](./references/08-help-system.md) |
@@ -50,13 +51,14 @@ description: >
 | 十九 | 为插件挂 FastAPI 后端接口（共享 app、鉴权、CRUD、命名规范、反模式） | [references/19-fastapi-plugin-api.md](./references/19-fastapi-plugin-api.md) |
 | 二十 | 嵌入 Provider 注册表（插件扩展 RAG 嵌入后端：懒 import、工厂模式、降级策略） | [references/20-embedding-provider-registry.md](./references/20-embedding-provider-registry.md) |
 | 二十一 | AI 集成：在插件 repo 内管理 AI Skill（`ai_skill` 注册目录式 `SKILL.md` + 脚本/资源） | [references/21-ai-skill-registration.md](./references/21-ai-skill-registration.md) |
+| 二十二 | 为插件挂 Web 控制台页面（`register_plugin_page` + `PluginAPI` + 页面 i18n + Hub iframe） | [references/22-plugin-pages.md](./references/22-plugin-pages.md) |
 
 ## 推荐开发流程（按需跳转）
 
 1. **新建插件**：先看 [一、插件基础结构](./references/01-plugin-basics.md) 确定目录与命名，参考 [十五、完整插件示例](./references/15-full-plugin-example.md) 起步。
 2. **加命令**：看 [二、SV 与触发器](./references/02-sv-and-triggers.md) 选合适触发器，按 [三、消息收发](./references/03-messaging.md) 写发送 / 多步会话；要监听进群/退群/戳一戳用 `on_meta`（[§2.6](./references/02-sv-and-triggers.md#26-on_meta监听平台元事件进群--退群--戳一戳)），要撤回/禁言看 [§3.5](./references/03-messaging.md#35-撤回消息wait_recall--unsend与禁言ban)。
 3. **加配置**：看 [四、配置管理](./references/04-config-management.md) 定义 `CONFIG_DEFAULT` 与 `StringConfig`。
-4. **加数据库表**：看 [五、数据库操作](./references/05-database.md)；要可视化后台看 §5.5，要给已部署用户补字段看 §5.7。
+4. **加数据库表**：看 [五、数据库操作](./references/05-database.md)；纯 SELECT 用 `@with_read_session`，写入仍用 `@with_session`；要可视化后台看 §5.5，要给已部署用户补字段看 §5.7。
 5. **加定时推送**：看 [六、定时任务与订阅](./references/06-scheduler-and-subscribe.md) 的 `gs_subscribe` 强制规范。
 6. **加启动逻辑**：在 [七、生命周期钩子](./references/07-lifecycle-hooks.md) 选合适的钩子。
 7. **加帮助 / 状态**：看 [八、帮助系统注册](./references/08-help-system.md)。
@@ -69,14 +71,17 @@ description: >
    - 业务专业代理 → [十四、能力代理画像](./references/14-ai-capability-profile.md)
    - 随插件分发 Markdown「技能」（SKILL.md + 脚本/资源，模型 `list_skills`/`run_skill_script` 调用）→ [二十一、AI Skill 注册](./references/21-ai-skill-registration.md)
    - **批量改造已有触发器支持 AI** → [十八、to_ai 批量改造工作流](./references/18-ai-trigger-migration.md)
-10. **挂自己的 HTTP 后端接口**：看 [十九、FastAPI 插件 API](./references/19-fastapi-plugin-api.md)——复用 `gsuid_core.webconsole.app_app.app`，3 行加一个接口。
+10. **挂自己的 HTTP 后端接口**：看 [十九、FastAPI 插件 API](./references/19-fastapi-plugin-api.md)——复用 `gsuid_core.webconsole.app_app.app`，3 行加一个接口；要同时挂 **前端页** 用 [二十二、插件 Web 页面](./references/22-plugin-pages.md) 的 `register_plugin_page` + `PluginAPI`。
 11. **扩展 RAG 嵌入后端**：看 [二十、嵌入 Provider 注册表](./references/20-embedding-provider-registry.md)——用 `register_embedding_provider` 注册 `sentence_transformers` / `llama.cpp embedding` 等自定义 Provider，懒 import + 工厂模式，自动出现在 WebConsole 下拉选项。
-12. **遇到 API 缓存 / 限流 / 字体 / 错误码 / 推主人 / 批量播报** 等问题：直接看 [十六、常用工具模块速查](./references/16-common-utilities.md)。
-13. **写完代码**：用 [十七、代码规范红线](./references/17-code-redlines.md) 自查（try/except、cast、type:ignore、getattr 兜底、Any、同步阻塞函数全部禁止）。
+12. **定制 MCP Server**（Bearer 鉴权 / 工具导出过滤 / Event 会话补全）：看 [gscore-ai-core-api §11.1.7](../gscore-ai-core-api/references/11-mcp-image-search-and-meme.md#117-mcp-server-插件扩展点)。
+13. **遇到 API 缓存 / 限流 / 字体 / 错误码 / 推主人 / 批量播报** 等问题：直接看 [十六、常用工具模块速查](./references/16-common-utilities.md)。
+14. **写完代码**：用 [十七、代码规范红线](./references/17-code-redlines.md) 自查（try/except、cast、type:ignore、getattr 兜底、Any、同步阻塞函数全部禁止）。
 
 ## 关键概念速记（先看这一段再决定读哪一章）
 
 - **嵌套加载**：`外层 __init__.py` + `外层 __nest__.py`（空文件） + `内层 __init__.py` 声明 `Plugins(...)` + `内层 __full__.py`（空文件）。详见 [一、插件基础结构 §1.2](./references/01-plugin-basics.md#12-入口三件套)。
+- **基础设施插件（meta plugin）**：`[tool.gsuid] kind = "meta"` + 内层 `api/`。别人硬依赖 `from gscore_mail.api import send`；软依赖先 `import_api("gscore_mail")` 再同样 import。不要 try/except，不要改 Core 去声明对方的类型。详见 [§1.6](./references/01-plugin-basics.md#16-基础设施插件meta-plugin)。
+- **每个插件自带 Ruff / `.vscode`**：插件常被单独打开，读不到 Core 根配置。根目录放 `ruff.toml` + `.vscode/extensions.json` + `.vscode/settings.json`（`extraPaths` 指到 Core 仓库根）。详见 [§1.7](./references/01-plugin-basics.md#17-插件仓库的-ruff--vs-code-配置)。
 - **Plugins vs SV**：插件级 vs 服务模块级；`SV` 自动从调用栈推断归属。详见 [§1.3](./references/01-plugin-basics.md#13-plugins-vs-sv-的层级关系)。
 - **触发器选择**：`on_command`（推荐默认）vs `on_prefix`（强制带参）vs `on_fullmatch`（精确匹配）vs `on_keyword`（污染消息流，慎用）vs `on_regex`（复杂结构）vs `on_file` / `on_message`（特殊）。详见 [§2.2](./references/02-sv-and-triggers.md#22-触发器语义速查)。
 - **监听平台事件用 `on_meta`**：标准元事件**仅三种**——`user_join_group` / `user_exit_group` / `poke`，`data` 字段跨平台统一（适配器侧已归一），可放心监听；其他事件不做适配。触发器内用 `ev.get_meta(key)` 读字段；与命令路径**双向隔离**。详见 [§2.6](./references/02-sv-and-triggers.md#26-on_meta监听平台元事件进群--退群--戳一戳)。
@@ -85,12 +90,15 @@ description: >
 - **插件工具要被跨措辞召回**：填 **`covers`（数据域）** + **`aliases`（领域·同义问法）**，勿只靠 docstring。详见 [§11.5](./references/11-ai-tools-decorator.md#115-covers--aliases跨措辞召回2026-08)。
 - **主动推送必须用 `gs_subscribe`**：不要 `for bot in gss.active_bot.items(): await bot.target_send(...)` 硬塞群号。详见 [§6.2](./references/06-scheduler-and-subscribe.md#62-主动推送强制规范)。
 - **数据库 Schema 变更用 `exec_list`**：放在 `on_core_start_before` 阶段执行。详见 [§5.7](./references/05-database.md#57-为已定义的表添加新列)。
+- **只读查询用 `@with_read_session`**：纯 SELECT 走独立读槽（SQLite WAL）；写入 / 读后写仍用 `@with_session`。详见 [§5.3](./references/05-database.md#53-with_session--with_read_session)。
+- **MCP Server 插件钩子**：`register_mcp_token_verifier` / `register_mcp_event_enricher` / `register_mcp_export_filter`，在插件 `__init__.py` 顶层注册。详见 [gscore-ai-core-api §11.1.7](../gscore-ai-core-api/references/11-mcp-image-search-and-meme.md#117-mcp-server-插件扩展点)。
 - **唯一允许 `try/except` 的地方**：`_ai_return_xxx()` 辅助函数。详见 [§17.3](./references/17-code-redlines.md#173-ai_return-辅助函数的特殊说明)。
 - **图片渲染优先级**：PIL（首选）→ pytakumi（推荐）→ playwright（兜底）。详见 [§9.1](./references/09-image-rendering.md#91-三档渲染方案优先级从高到低)。
 - **能力代理用 `AgentNode` + `register_agent_node`**：交付边界默认框架叠加；出图派 `render_agent`；业务强制「插件工具 > web」。详见 [§14](./references/14-ai-capability-profile.md)。
 - **`to_ai` 改造三层**：触发器层 `to_ai="..."` + 数据/渲染层 `ai_return()` + 业务画像 `CapabilityAgentProfile`；详见 [§18.1](./references/18-ai-trigger-migration.md#181-背景你要做的事) 与 [§18.3 Step 0.4](./references/18-ai-trigger-migration.md#step-04-判断是否需要注册-capability-agent-画像)。
 - **`ai_return` 注入点 = 数据已拿到 / 图片未生成**：必须在数据层函数里，不能只在触发器层。详见 [§18.3 Step 3](./references/18-ai-trigger-migration.md#step-3逐层分析调用链找出数据层注入-ai_return)。
 - **插件 FastAPI = 共享 app + `Depends(require_auth)`**：从 `gsuid_core.webconsole.app_app import app` 即可挂自己的 `/api/<插件名>/...` 路由；详见 [§19.2](./references/19-fastapi-plugin-api.md#192-最简示例3-行代码加一个-get-接口) 与 [§19.3](./references/19-fastapi-plugin-api.md#193-加鉴权推荐-复用-require_auth)。
+- **插件前端页 = `register_plugin_page` + `web/` 静态目录**：Hub `/plugins` 右侧按钮打开 iframe；页面 i18n 放 `web/locales/{zh-CN,en-US,ja-JP}.json`，引入 `/plugin-pages/_sdk/gshub-plugin.js`。API 用 `PluginAPI()` 前缀 `/api/<plugin_id>`。详见 [§22](./references/22-plugin-pages.md)。
 - **嵌入 Provider 注册 = 懒 import + 工厂模式**：插件 `__init__.py` 顶层调用 `register_embedding_provider` 注册 `EmbeddingProviderEntry`，重依赖只能在 `factory` 内部 import；注册时序保证早于消费；配置指向的 Provider 不可用时框架自动降级回 `local` 并记录 error，不会导致 AI 核心整体不可用。详见 [§20](./references/20-embedding-provider-registry.md)。
 - **AI Skill 随插件走 = `ai_skill(目录)`**：插件 `__init__.py` 顶层一行 `ai_skill(Path(__file__).parent / "skills")` 即把 repo 内 `skills/<name>/SKILL.md`（+ 脚本/资源）注册为运行时技能，无需挪进 `data/ai_core/skills/`；webconsole 内标记 `source="plugin"` 且只读。注意「运行时 Skill」≠「`.agents/skills` 开发文档 skill」。详见 [§21](./references/21-ai-skill-registration.md)。
 
@@ -98,6 +106,7 @@ description: >
 
 - 触发器 → AI 迁移工作流：[§18、to_ai 批量改造](./references/18-ai-trigger-migration.md)
 - 插件挂后端 API：[§19、FastAPI 插件 API](./references/19-fastapi-plugin-api.md)
+- 插件挂前端页：[§22、插件 Web 页面](./references/22-plugin-pages.md)
 - 嵌入 Provider 注册：[§20、嵌入 Provider 注册表](./references/20-embedding-provider-registry.md)
 
 ## 关联文档（同仓库其他位置）
@@ -105,5 +114,5 @@ description: >
 - AI Agent 总架构：[`docs/AI_AGENT_ARCHITECTURE.md`](../../../docs/AI_AGENT_ARCHITECTURE.md)
 - AI 触发流程 / 框架开发：[`.agents/skills/gscore-development/SKILL.md`](../gscore-development/SKILL.md)
 - AGENTS.md（代码红线）：仓库根目录 [`AGENTS.md`](../../../AGENTS.md)
-- AI Core API（给插件用）：[`docs/ai_core_api_for_plugins.md`](../../../docs/ai_core_api_for_plugins.md)
+- AI Core API（给插件用）：[gscore-ai-core-api](../gscore-ai-core-api/SKILL.md)；MCP Server 钩子见 [§11.1.7](../gscore-ai-core-api/references/11-mcp-image-search-and-meme.md#117-mcp-server-插件扩展点)
 - WebConsole 后端 API 设计：[`gsuid_core/webconsole/docs/README.md`](../../../gsuid_core/webconsole/docs/README.md)

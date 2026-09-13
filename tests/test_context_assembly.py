@@ -24,6 +24,25 @@ def test_both_entries_consume_shared_assembly() -> None:
 
     assert "async def run_interactive_turn(" in handle_ai, "一轮编排必须收在 run_interactive_turn"
     assert "run_interactive_turn(" in endpoint, "评测入口必须走 run_interactive_turn，不许另开一口"
+    assert 'else "Chat"' in endpoint, "非判分评测须 create_by=Chat，才能装配 search_cognition"
+    assert "memory_eval=_memory_eval" in endpoint, "LongMem 转储只认 memory_eval，不许走 TEST"
+    guide_at = endpoint.index("_MEMORY_EVAL_GUIDE")
+    guide = endpoint[guide_at : guide_at + 4200]
+    assert "【核心事实】" in guide
+    assert "【相关对话片段】" in guide
+    assert "【本题证据会话】" not in guide
+    assert "UPDATES" in guide
+    assert "ALL injected facts" in guide
+    assert "Garden herbs" not in guide
+    assembly = _src("gsuid_core/ai_core/context_assembly.py")
+    assert "parse_injected_clock" not in assembly
+    assert "parse_injected_clock" not in endpoint
+    assert "parse_clock_at" in endpoint
+    assert "req.clock_at" in endpoint
+    loop = _src("gsuid_core/ai_core/agent_run/loop.py")
+    assert 'create_by in _MAIN_PERSONA_CREATE_BY and st.return_mode != "return"' in loop
+    assert "http_dynamic_tools(" in endpoint
+    assert "dynamic_tools=http_dynamic_tools(" in endpoint
     assert "dual_route_retrieve(" not in endpoint, "评测不得自己检索"
     assert "classifier_service" not in endpoint, "评测不得自己分类"
     assert "settle_turn(" not in endpoint, "评测不得自己结算"
@@ -79,7 +98,9 @@ def test_dynamic_context_ordering_contract() -> None:
     # 短状态（关系行等）可在历史前；历史 → 记忆 → 软触发 的相对顺序锁死
     assert i_hist >= 0 and i_mem > i_hist, "长期记忆须在历史之后"
     assert i_soft > i_mem, "软触发提示须在记忆之后"
-    assert "[guide]" in full and full.find("[guide]") < i_mem + len("[长期记忆")
+    i_guide = full.find("[guide]")
+    assert i_guide > i_mem, "评测指南须跟在记忆正文后，避免 800 字预算把目录卡截掉"
+    assert i_soft > i_guide
     assert full.endswith(SOFT_TRIGGER_NOTE), "软触发提示必须最后"
     print("[OK] 动态上下文顺序契约")
 
@@ -99,8 +120,10 @@ def test_block_order_is_single_source() -> None:
         "voice_anchor",
         "identity",
         "history",
+        "group_context",
         "memory",
         "task",
+        "plan_hint",
         "chitchat_style",
         "transaction_priority",
         "report_titles",
@@ -122,6 +145,53 @@ def test_block_order_is_single_source() -> None:
     assert '"".join(parts)' in voice_src
     assert '"\\n\\n".join(parts)' not in voice_src
     print("[OK] 块顺序单源")
+
+
+def test_addressed_suffix_keeps_voice_anchor_outside_product_cap() -> None:
+    from gsuid_core.ai_core.hooks.models import AgentHookContext
+    from gsuid_core.ai_core.hooks.points import AgentHookPoint
+    from gsuid_core.ai_core.context_assembly import (
+        _SUFFIX_PRODUCT_CAP,
+        suffix_allowed_blocks,
+        _apply_suffix_block_policy,
+    )
+    from gsuid_core.ai_core.interaction_scaffold import TurnGraph
+
+    tg = TurnGraph(
+        user_type="group",
+        message_text="hi",
+        persona_name="p",
+        is_tome=True,
+        primary_speaker="u1",
+        call_to_self=True,
+    )
+    ctx = AgentHookContext(point=AgentHookPoint.COMPOSE_CONTEXT, turn_graph=tg, cheap_gate="full")
+    allowed = suffix_allowed_blocks(ctx)
+    assert allowed is not None
+    assert "voice_anchor" in allowed
+    voice = "（口吻：短）"
+    ctx.blocks = {
+        "voice_anchor": voice,
+        "task": "任务块",
+        "relationship": "R" * 80,
+        "memory": "M" * 80,
+        "history": "H" * 500,
+    }
+    _apply_suffix_block_policy(ctx)
+    assert ctx.blocks["voice_anchor"] == voice
+    assert ctx.blocks["task"] == "任务块"
+    product = sum(len(v) for k, v in ctx.blocks.items() if k != "voice_anchor")
+    assert product <= _SUFFIX_PRODUCT_CAP
+    idle = TurnGraph(
+        user_type="group",
+        message_text="hi",
+        persona_name="p",
+        is_tome=False,
+        primary_speaker="u1",
+        call_to_self=False,
+    )
+    idle_ctx = AgentHookContext(point=AgentHookPoint.COMPOSE_CONTEXT, turn_graph=idle, cheap_gate="full")
+    assert suffix_allowed_blocks(idle_ctx) == frozenset()
 
 
 if __name__ == "__main__":

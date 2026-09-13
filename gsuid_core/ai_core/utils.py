@@ -68,6 +68,11 @@ _PROTOCOL_TAG_RE = re.compile(
 _PROTOCOL_CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
 _BARE_SILENCE_RE = re.compile(r"^\s*silence\s*$", re.IGNORECASE)
 _PROTOCOL_EMPTYISH_RE = re.compile(r"^[\s\-–—.,，。！？!?、；;：:\u3000·•…]*$")
+# 截断残片：ILENCE> / SILENCE> / <SILENCE（完整标签仍走协议剥离）
+_SILENCE_FRAGMENT_RE = re.compile(
+    r"^\s*(?:ilence>|silence>?|<silence/?)\s*$",
+    re.IGNORECASE,
+)
 
 
 def remainder_after_protocol_tags(text: str) -> str:
@@ -97,12 +102,73 @@ def is_silence_marker(text: str) -> bool:
         return False
     if _BARE_SILENCE_RE.match(raw) is not None:
         return True
+    if _SILENCE_FRAGMENT_RE.match(raw) is not None:
+        return True
     leftover = remainder_after_protocol_tags(raw).strip()
     if leftover == raw:
         return False
     if not leftover:
         return True
     return _PROTOCOL_EMPTYISH_RE.match(leftover) is not None
+
+
+_PROTOCOL_TAG_NAMES: tuple[str, ...] = ("silence", "end_turn", "no_tool_call")
+_PROTOCOL_COMPLETE_COMPACT: tuple[str, ...] = (
+    *(form for name in _PROTOCOL_TAG_NAMES for form in (f"<{name}>", f"<{name}/>", f"</{name}>", f"</{name}/>")),
+    "[silence]",
+)
+
+
+def _is_protocol_hold(text: str) -> bool:
+    """完整标签的真前缀才 hold。单独 ``[`` / ``<``、名字后跟正文都不是。"""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    compact = re.sub(r"\s+", "", raw).lower()
+    if len(compact) < 2:
+        return False
+    if compact in _PROTOCOL_COMPLETE_COMPACT:
+        return False
+    return any(tag.startswith(compact) for tag in _PROTOCOL_COMPLETE_COMPACT)
+
+
+def split_protocol_hold(buf: str, *, force: bool = False) -> tuple[str, str]:
+    """从流式缓冲切出可见文本；完整协议标签丢掉，未闭合开标签留 hold。
+
+    ``force=True``（流结束）时未闭合协议开标签也丢掉，避免 ``<SILENCE`` 漏成正文。
+    """
+    if not buf:
+        return "", ""
+    # 未闭合 <SILENCE 是 hold 前缀，不能当残片丢掉，否则下一分片 `>` 会漏出去
+    if is_silence_marker(buf) and not _is_protocol_hold(buf):
+        return "", ""
+    spans = [(m.start(), m.end()) for m in _PROTOCOL_CODE_SPAN_RE.finditer(buf)]
+    hold_at: int | None = None
+    for i, ch in enumerate(buf):
+        if ch not in "<[":
+            continue
+        if any(start <= i < end for start, end in spans):
+            continue
+        rest = buf[i:]
+        if _PROTOCOL_TAG_RE.match(rest) is not None or _is_protocol_hold(rest) or is_silence_marker(rest):
+            hold_at = i
+            break
+    if hold_at is None:
+        return buf, ""
+    visible = buf[:hold_at]
+    rest = buf[hold_at:]
+    matched = _PROTOCOL_TAG_RE.match(rest)
+    if matched is not None:
+        more_vis, hold = split_protocol_hold(rest[matched.end() :], force=force)
+        return visible + more_vis, hold
+    if is_silence_marker(rest) and not _is_protocol_hold(rest):
+        return visible, ""
+    if force and _is_protocol_hold(rest):
+        return visible, ""
+    if not _is_protocol_hold(rest):
+        more_vis, hold = split_protocol_hold(rest[1:], force=force)
+        return visible + rest[:1] + more_vis, hold
+    return visible, rest
 
 
 # run 失败返回值协议：生产端(gs_agent)与全部消费端(handle_ai/executor/sanitize)引用
@@ -112,6 +178,26 @@ ERROR_CONTENT_REJECTED = "内容被模型安全策略拒绝"
 ERROR_TIMEOUT_TEXT = "请求超时"
 NO_RESULT_TEXT = "Agent 执行完成，但未返回有效结果"
 
+_CONTROL_BLOCK_RE = re.compile(r"<control\b[^>]*>.*?</control>", re.DOTALL | re.IGNORECASE)
+_MAX_ITER_LEAK_RE = re.compile(r"⚠️\s*已达最大思考轮数[^\n]*(?:\n中间产物[^\n]*)?")
+_INTERNAL_CHANNEL_RE = re.compile(
+    r"（这条是内部通道，不向用户解释。）|"
+    r"本段是框架内部通道，不是群友发言：不要向用户解释、道歉或复述本段。"
+)
+
+
+def strip_framework_user_leaks(text: str) -> str:
+    """剥进用户可见正文的控制信封 / 超轮数 / 内部通道。空则调用方当沉默。"""
+    if not text:
+        return text
+    out = _CONTROL_BLOCK_RE.sub("", text)
+    out = _MAX_ITER_LEAK_RE.sub("", out)
+    out = _INTERNAL_CHANNEL_RE.sub("", out)
+    if NO_RESULT_TEXT in out:
+        out = out.replace(NO_RESULT_TEXT, "")
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    return "\n".join(lines).strip()
+
 
 def has_model_visible_content(ev: Event) -> bool:
     """该消息是否含模型可见内容——判据与 prepare_content_payload 的模态清单同源。
@@ -120,7 +206,7 @@ def has_model_visible_content(ev: Event) -> bool:
     """
     if ev.text and ev.text.strip():
         return True
-    return bool(ev.image_id_list or ev.audio_id or ev.audio_id_list or ev.file or ev.node)
+    return bool(ev.image_id_list or ev.audio_id or ev.audio_id_list or ev.video_id_list or ev.file or ev.node)
 
 
 # 工具调用标记残留正则（弱模型 / 兼容网关把工具调用当普通文本输出）， 详见 _strip_tool_call_artifacts 的 docstring。
@@ -464,21 +550,32 @@ async def handle_tool_result(
     return res_str
 
 
+def _file_to_data_uri(path: str) -> str:
+    with open(path, "rb") as fh:
+        data = fh.read()
+    mime = _guess_image_mime(path)
+    return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+
+
 def _normalize_image_url(raw: str) -> str:
     """将各种图片格式统一转为可消费的 URL（HTTP 或 DataURI）
 
     Args:
-        raw: 原始图片标识，支持 http/https URL、base64:// 前缀、data:image/ 前缀、裸 base64
+        raw: 原始图片标识，支持 http/https URL、本地文件路径、
+            base64:// 前缀、data:image/ 前缀、裸 base64
 
     Returns:
         标准化的图片 URL
     """
-    if raw.startswith(("http", "https")):
+    if raw.startswith(("http://", "https://")):
         return raw
     if raw.startswith("base64://"):
-        return f"data:image/png;base64,{raw[10:]}"
+        return f"data:image/png;base64,{raw.removeprefix('base64://')}"
     if raw.startswith("data:image/"):
         return raw
+    # 只对带图片后缀的短路径读盘，避免对裸 base64 做 isfile
+    if len(raw) <= 4096 and raw.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")) and os.path.isfile(raw):
+        return _file_to_data_uri(raw)
     return f"data:image/png;base64,{raw}"
 
 
@@ -508,16 +605,23 @@ async def materialize_image_url(raw: str, *, strict: bool = False) -> str:
     - http(s) URL：下载 → ``data:<mime>;base64,<...>``；下载失败时回退原 URL
       （不致命，行为不差于改动前）。
       当 ``strict=True`` 时下载失败会抛出异常而非静默回退，供调用方显式处理。
+    - 本地文件路径：读字节 → ``data:<mime>;base64,<...>``；读失败时同上。
     - base64:// / data:image/ / 裸 base64：交给 :func:`_normalize_image_url`
       处理即可，本就不会过期，无需下载。
 
     Args:
         raw: 原始图片标识。
-        strict: 是否严格模式。为 True 时下载失败抛出 RuntimeError，
-                为 False（默认）时下载失败回退原始 URL。
+        strict: 是否严格模式。为 True 时下载/读盘失败抛出 RuntimeError，
+                为 False（默认）时失败回退原始标识。
     """
     if not raw.startswith(("http://", "https://")):
-        return _normalize_image_url(raw)
+        try:
+            return _normalize_image_url(raw)
+        except OSError as e:
+            if strict:
+                raise RuntimeError(i18n_t("本地图片读取失败，无法物化为 base64: {p0} ({e})", p0=raw[:120], e=e)) from e
+            logger.warning(i18n_t("log.ai.gscoreai_convert_local_image_fail", e=e))
+            return raw
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -620,6 +724,8 @@ def _build_relationship_description(
 async def prepare_content_payload(
     ev: Event,
     task_level: Literal["high", "low"] = "high",
+    *,
+    quoted_tome: bool = False,
 ) -> Tuple[Sequence[UserContent], "GuardFlags"]:
     """
     准备消息内容列表给AI看, 包含文本、图片ID、文件内容、事件对象
@@ -659,11 +765,16 @@ async def prepare_content_payload(
 
     # @状态：只在被@时才注入（潜在-01: 修正 is_at_me → is_tome）。
     # 标注文案唯一定义在 interaction_scaffold（C-3 寻址门按字面匹配它，别在此写字面量）
-    from gsuid_core.ai_core.interaction_scaffold import DIRECT_MARKER, AT_OTHER_MARKER
+    from gsuid_core.ai_core.interaction_scaffold import (
+        DIRECT_MARKER,
+        AT_OTHER_MARKER,
+        QUOTE_TOME_MARKER,
+    )
 
     is_at_me = getattr(ev, "is_tome", False) or (ev.user_type == "direct")
     if is_at_me:
-        current_turn_header += f"{DIRECT_MARKER}\n"
+        # 引用 bot 仍是 is_tome，但不要写成「直接找你」逼模型必回。
+        current_turn_header += f"{QUOTE_TOME_MARKER if quoted_tome else DIRECT_MARKER}\n"
 
     current_turn_header += "--- 消息 ---\n"
 
@@ -683,6 +794,16 @@ async def prepare_content_payload(
 
     if ev.reply:
         text += f"\n--- 引用消息 ---\n{ev.reply}\n"
+        from gsuid_core.ai_core.outbound import resolve_quote
+
+        hit = await resolve_quote(ev)
+        if hit is not None:
+            text += f"{hit.line}\n"
+    from gsuid_core.ai_core.outbound import ownership_hint
+
+    own = await ownership_hint(ev)
+    if own:
+        text += f"{own}\n"
 
     if ev.node is not None:
         from gsuid_core.models import format_node_preview
@@ -709,6 +830,19 @@ async def prepare_content_payload(
 
     for i in getattr(ev, "audio_id_list", []):
         text += f"\n--- 用户上传音频ID: {i} ---\n"
+
+    # 视频始终惰性：只透传 ID。未声明 video 时不指引 read_video（工具也不会挂）
+    if ev.video_id_list:
+        from gsuid_core.ai_core.configs.models import get_model_config_for_task
+
+        _support = get_model_config_for_task(task_level).get_config("model_support").data
+        if "video" in _support:
+            text += "\n--- 用户发送了视频(未展开, 需要查看内容时调用 read_video(视频ID)) ---"
+            for i in ev.video_id_list:
+                text += f"\n视频ID: {i}"
+            text += "\n"
+        else:
+            text += "\n--- 用户发送了视频(当前模型无法查看视频内容) ---\n"
 
     # @Bot 自己在入库层已转成 is_tome（见 handler.msg_process），at_list 里只会有
     # 别的用户——显式标注，防止模型把"@某人+提问"误读成在叫自己。
@@ -805,9 +939,6 @@ def _strip_persona_markdown(text: str) -> str:
     if _looks_like_tool_table(text):
         return text
     text = re.sub(r"\*{1,3}([^*\n]+)\*{1,3}", r"\1", text)  # **x** / *x* → x
-    # 整行舞台旁白：整行仅一个 （…） 且括号内 ≥4 字（小说式动作/神态描写），连换行一起删。
-    # 阈值 4 放过 （笑）（误）（脸红） 这类真·口语 tone，只清"（眼睛弯成月牙）"式叙事旁白。
-    text = re.sub(r"(?m)^[ \t]*[（(][^（）()]{4,}[）)][ \t]*\n?", "", text)
     text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.M)  # 标题
     text = re.sub(r"^\s{0,3}[-*>]\s+", "", text, flags=re.M)  # 列表 / 引用
     return text
@@ -1215,8 +1346,7 @@ async def send_chat_result(
     - <meme: 情绪> 标记（可带反引号）→ 触发表情包发送（需传入 ev）
     - extra_metadata：透传到 ``Bot.send`` 的 ``extra_metadata``，最终落到
       ``message_history`` 记录上（如主动消息的 ``proactive=True / source / reason``）
-    - ooc_check：出戏防火墙开关。gs_agent 的"重说"产物已走过一次反馈闭环，
-      传 False 放行（§D.4：提醒一次后放行，误杀只值一次重生成）
+    - ooc_check：出戏防火墙开关。gs_agent 自判产物已走过系统提醒，传 False 放行
     """
     if not text:
         return
@@ -1229,12 +1359,15 @@ async def send_chat_result(
     _speech = remainder_after_protocol_tags(_trimmed).strip()
     if not _speech:
         return
+    _speech = strip_framework_user_leaks(_speech)
+    if not _speech:
+        return
     text = _speech
 
     # 拦截 LLM API 错误消息（429/超时等），角色化替换后下发
     if _ERROR_OUTPUT_RE.search(text):
         logger.warning(i18n_t("log.ai.send_chat_result_intercepted_fail", text=text[:100]))
-        text = "唔…脑子转不动了…等下再说…zzz…"
+        text = "脑子转不动了，等下再说。"
 
     # 最终边界守卫：剥离泄漏到文本里的工具调用标记残留（详见 _strip_tool_call_artifacts）
     # MiniMax 的 ]<]minimax[>[，详见
@@ -1285,11 +1418,11 @@ async def send_chat_result(
     clean_text = re.sub(r"[ \t]{2,}", " ", clean_text)
     clean_text = re.sub(r"^[，。！？\s]+|[，。！？\s]+$", "", clean_text)
 
-    # 出戏防火墙末端兜底（§D.4）：无重说通道的调用方（proactive / 兜底总结等）命中即替换；
-    # gs_agent 主循环自带"提醒→重说→放行"闭环，重说产物以 ooc_check=False 经过此处。
+    # 无提醒通道（proactive 等）命中即替换；主循环自判产物走 ooc_check=False。
     _ooc_replaced = False
     if (clean_text or report_blocks) and ooc_check:
-        from gsuid_core.ai_core.output_firewall import PERSONA_FALLBACK_TEXT, check_ooc, is_enabled
+        from gsuid_core.ai_core.output_firewall import check_ooc, is_enabled, fallback_ooc_text
+        from gsuid_core.ai_core.persona.settings import persona_name_from_event
 
         if is_enabled():
             # 短答门需要来话上下文：身份追问下的超短直答才算泄露（见 check_ooc docstring）
@@ -1303,7 +1436,7 @@ async def send_chat_result(
                         p1=_hit.matched,
                     )
                 )
-                clean_text = PERSONA_FALLBACK_TEXT
+                clean_text = fallback_ooc_text(persona_name_from_event(ev))
                 _ooc_replaced = True
             # report 块与台词同权过末端防火墙：制品通道不能成为资金红线/出戏红线的 旁路（评审修复 F3），
             if report_blocks:
@@ -1618,6 +1751,37 @@ def _truncate_history_keep_prefix(
     return history
 
 
+def _extractive_middle_summary(dropped: Sequence[ModelMessage]) -> str:
+    """被裁中段的抽取摘要。LLM 蒸馏失败时的摊还重写材料。"""
+    bits: list[str] = []
+    used = 0
+    for msg in dropped:
+        chunk = ""
+        if isinstance(msg, ModelResponse):
+            for part in msg.parts:
+                if isinstance(part, TextPart) and part.content.strip():
+                    chunk = part.content.strip()[:80]
+                    break
+        elif isinstance(msg, ModelRequest):
+            for part in msg.parts:
+                if isinstance(part, UserPromptPart) and isinstance(part.content, str):
+                    body = part.content.strip()
+                    if _is_framework_prompt_content(body):
+                        continue
+                    chunk = body[:80]
+                    break
+        if not chunk:
+            continue
+        bits.append(chunk)
+        used += len(chunk)
+        if used >= 400:
+            break
+    if not bits:
+        return ""
+    body = " / ".join(bits)[:400]
+    return f"（更早对话摘要：{body}）"
+
+
 def compact_session_history(
     history: List[ModelMessage],
     max_history: int,
@@ -1913,41 +2077,139 @@ def _compact_report_blocks_in_history(
     return replaced
 
 
+_DELIVERY_INSTR = ("create_subagent", "send_message_by_ai", "禁止", "你是主人格", "长文尚未", "出图委派")
+
+
+def lean_delivery_frame(full: str) -> str:
+    """交付包入史瘦身：任务号 + 句柄 + 主题。不取说明书行。"""
+    s = (full or "").strip()
+    if not s:
+        return ""
+    ordinal = "?"
+    m_ord = re.search(r"任务#(\d+)", s)
+    if m_ord is not None:
+        ordinal = m_ord.group(1)
+    handles = re.findall(r"res_[0-9a-fA-F]{3,}", s)
+    handle = handles[0] if handles else "-"
+    topic = ""
+    m_title = re.search(r"任务#\d+「([^」]+)」", s)
+    if m_title is not None:
+        topic = m_title.group(1).strip()[:40]
+    if not topic:
+        for line in s.splitlines():
+            t = line.strip()
+            if re.match(r"res_[0-9a-fA-F]{3,}\s*\|", t):
+                bits = [p.strip() for p in t.split("|")]
+                if len(bits) >= 3 and bits[-1]:
+                    topic = bits[-1][:40]
+                    break
+    if not topic:
+        for line in s.splitlines():
+            t = line.strip()
+            if not t or t.startswith("[框架") or t.startswith("【子任务"):
+                continue
+            if t.startswith("产物") or t.startswith("💡") or t.startswith("你是主人格"):
+                continue
+            if any(h in t for h in _DELIVERY_INSTR):
+                continue
+            topic = t[:40]
+            break
+    tail = f"，{topic}" if topic else ""
+    return f"[框架·任务完成] 任务#{ordinal} 完成，句柄 {handle}{tail}"
+
+
+def _is_delivery_frame(content: str) -> bool:
+    s = content.lstrip()
+    return s.startswith("[框架·任务完成]") or s.startswith("【子任务交付")
+
+
+_EPHEMERAL_SYSTEM_PREFIXES: tuple[str, ...] = (
+    "（系统：",
+    "（系统提示：",
+    "（系统校验",
+)
+
+
+def _peel_ephemeral_system_lines(content: str) -> str:
+    """入史前剥（系统：）类 per-turn 提示，避免污染后续轮。"""
+    kept: list[str] = []
+    for ln in content.splitlines():
+        s = ln.strip()
+        if s.startswith(_EPHEMERAL_SYSTEM_PREFIXES):
+            continue
+        kept.append(ln)
+    return "\n".join(kept).rstrip("\n")
+
+
+def _hint_matches_strip(content: str, strip_hint_texts: Tuple[str, ...]) -> bool:
+    return any(content == h or (bool(h) and content.startswith(h)) for h in strip_hint_texts)
+
+
+def _relean_user_prompt_part(
+    part: UserPromptPart,
+    lean_content: Union[str, List[UserContent]],
+    strip_hint_texts: Tuple[str, ...],
+) -> UserPromptPart | None:
+    content = part.content
+    if isinstance(content, str):
+        if _is_framework_prompt_content(content):
+            if _is_delivery_frame(content):
+                lean = lean_content if isinstance(lean_content, str) and lean_content else lean_delivery_frame(content)
+                if lean:
+                    return UserPromptPart(content=lean)
+            return None
+        if _hint_matches_strip(content, strip_hint_texts):
+            return None
+        peeled = _peel_ephemeral_system_lines(content)
+        if not peeled.strip():
+            return None
+        if peeled != content:
+            return UserPromptPart(content=peeled)
+        return part
+    new_items: list[UserContent] = []
+    changed = False
+    for item in content:
+        if not isinstance(item, str):
+            new_items.append(item)
+            continue
+        if _is_framework_prompt_content(item) and not _is_delivery_frame(item):
+            changed = True
+            continue
+        if _hint_matches_strip(item, strip_hint_texts):
+            changed = True
+            continue
+        peeled = _peel_ephemeral_system_lines(item)
+        if not peeled.strip():
+            changed = True
+            continue
+        if peeled != item:
+            changed = True
+        new_items.append(peeled)
+    if not new_items:
+        return None
+    if changed:
+        return UserPromptPart(content=new_items)
+    return part
+
+
 def _relean_user_turn(
     new_messages: Sequence[ModelMessage],
     lean_content: Union[str, List[UserContent]],
     strip_hint_texts: Tuple[str, ...] = (),
 ) -> None:
-    """把本轮 new_messages 里的用户输入 turn 换成精简版（剥离 rag_context）。
-
-    每轮 ``final_user_message`` 含 [历史对话]/记忆/群语境等 rag_context，若原样
-    ``extend`` 进 self.history，会在 max_history 窗口内逐轮累积同类快照——既膨胀
-    input，又冲淡缓存。存历史时只保留用户真实发言（当前轮仍给模型看完整上下文）。
-    改第一条 UserPromptPart（工具往返的 ToolReturnPart 不动）；``strip_hint_texts``
-    是框架 run 中途注入的提示常量（如 C-4 墙钟 nudge，挂在**后续** ModelRequest 上、
-    首条替换够不着）——按内容精确匹配从持久历史里剥掉，防提示噪声跨轮累积。
-    框架注入 / 系统校验句同样剥除，不进 B 轨长记。
-    """
-    leaned = False
+    """剥校验注入；交付帧改成一行入史，其它框架块丢弃。"""
     for msg in new_messages:
         if not isinstance(msg, ModelRequest):
             continue
         kept_parts = []
         for part in msg.parts:
             if isinstance(part, UserPromptPart):
-                if isinstance(part.content, str) and _is_framework_prompt_content(part.content):
-                    continue
-                if not leaned:
-                    part.content = lean_content
-                    leaned = True
-                elif isinstance(part.content, str) and any(
-                    part.content == h or (bool(h) and part.content.startswith(h)) for h in strip_hint_texts
-                ):
-                    # 精确匹配（墙钟 nudge）或前缀匹配（尖括号守卫长警告）
-                    continue
+                kept = _relean_user_prompt_part(part, lean_content, strip_hint_texts)
+                if kept is not None:
+                    kept_parts.append(kept)
+                continue
             kept_parts.append(part)
-        if len(kept_parts) != len(msg.parts):
-            msg.parts = kept_parts
+        msg.parts = kept_parts
 
 
 # 现役控制面走 <control> 信封（按类型判定身份）；本表只兜遗留文案。
@@ -1985,6 +2247,79 @@ def _normalize_thinking_tags(thinking_tags: tuple[str, str]) -> tuple[str, str]:
     if end and not end.startswith("<"):
         end = f"</{end}>"
     return (start, end)
+
+
+class ThinkTagSplitter:
+    """把流式 TextPartDelta 里的 ``<think>…</think>`` 拆成 (可见文本, 思考增量)。
+
+    标签可能跨 chunk 切开，所以要保留半截前缀。未闭合的思考不进可见文本。
+    """
+
+    __slots__ = ("start", "end", "in_think", "hold")
+
+    def __init__(self, start: str = "<think>", end: str = "</think>") -> None:
+        start, end = _normalize_thinking_tags((start, end))
+        self.start = start
+        self.end = end
+        self.in_think = False
+        self.hold = ""
+
+    def reset(self) -> None:
+        self.in_think = False
+        self.hold = ""
+
+    def feed(self, piece: str) -> tuple[str, str]:
+        if not piece:
+            return "", ""
+        s = self.hold + piece
+        self.hold = ""
+        visible: list[str] = []
+        thought: list[str] = []
+        i = 0
+        while i < len(s):
+            token = self.end if self.in_think else self.start
+            j = s.find(token, i)
+            if j < 0:
+                cut = _partial_token_suffix(s, i, token)
+                chunk = s[i:] if cut < 0 else s[i:cut]
+                if self.in_think:
+                    thought.append(chunk)
+                else:
+                    visible.append(chunk)
+                if cut >= 0:
+                    self.hold = s[cut:]
+                break
+            chunk = s[i:j]
+            if self.in_think:
+                thought.append(chunk)
+                self.in_think = False
+            else:
+                visible.append(chunk)
+                self.in_think = True
+            i = j + len(token)
+        return "".join(visible), "".join(thought)
+
+    def flush(self) -> tuple[str, str]:
+        leftover = self.hold
+        self.hold = ""
+        if not leftover:
+            return "", ""
+        if self.in_think:
+            return "", leftover
+        # 半截起始标签不是正文（与未闭合思考一致，不进气泡）
+        if self.start.startswith(leftover):
+            return "", ""
+        return leftover, ""
+
+
+def _partial_token_suffix(s: str, start: int, token: str) -> int:
+    """``s[start:]`` 若以 ``token`` 的真前缀结尾，返回截断下标，否则 -1。"""
+    tail = s[start:]
+    max_k = min(len(tail), len(token) - 1)
+    for k in range(max_k, 0, -1):
+        if token.startswith(tail[-k:]):
+            return len(s) - k
+    return -1
 
 
 def _dedupe_thinking_parts(parts: Sequence[ModelResponsePart]) -> List[ModelResponsePart]:
@@ -2040,8 +2375,8 @@ def _split_embedded_thinking(
                 think, content = content[:end_index], content[end_index + len(end_tag) :]
                 result.append(ThinkingPart(content=think))
             else:
-                # 缺少闭合标签：丢弃 <think> 起始标签，剩余内容按文本处理
-                result.append(TextPart(content=content))
+                # 缺少闭合标签：与 ThinkTagSplitter 一致，未闭合内容当思考
+                result.append(ThinkingPart(content=content))
                 content = ""
             start_index = content.find(start_tag)
         if content:
@@ -2107,22 +2442,24 @@ def _is_retryable_client_error(e: BaseException) -> bool:
     return isinstance(e, ModelHTTPError) and _is_non_retryable_model_error(e) and not _is_content_rejected(e)
 
 
-def sanitize_error_for_user(result_text: str) -> str:
+def sanitize_error_for_user(result_text: str, persona_name: str | None = None) -> str:
     """把 ``执行出错: <内部细节>`` 转成不泄漏内部细节的用户可见短文案。
 
     原始错误串含 provider body / model_name / tool_call_id 等内部信息，直接发进
     群聊既难看又泄漏实现；完整细节已由 log_error 落日志，用户侧只需要知道失败了。
     """
+    from gsuid_core.ai_core.persona.settings import get_persona_setting
+
     if result_text == NO_RESULT_TEXT:
-        return "这条消息我处理失败了，稍后再试一次吧"
+        return get_persona_setting(persona_name, "error_generic")
     if not result_text.startswith(ERROR_RESULT_PREFIX):
         return result_text
-    # 文案不得是整行（…）形态：_strip_persona_markdown 会把整行括号当舞台旁白删除（评审修复 F2）
+    # 用角色短句，不用整行（…）当失败文案（人设可能把括号当可见心声）
     if ERROR_CONTENT_REJECTED in result_text:
-        return "这条消息触发了内容安全策略，我没法处理"
+        return get_persona_setting(persona_name, "error_content_policy")
     if ERROR_TIMEOUT_TEXT in result_text:
-        return "刚才网络太慢处理超时了，稍后再试试吧"
-    return "这条消息我处理失败了，稍后再试一次吧"
+        return get_persona_setting(persona_name, "error_timeout")
+    return get_persona_setting(persona_name, "error_generic")
 
 
 # Agent 失败类型分类标签 —— 仅供 notify_master_of_agent_error 私聊主人时使用

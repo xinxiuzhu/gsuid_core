@@ -225,7 +225,7 @@ Persona 与能力代理同构为一个 `AgentNode`（统一注册表 + persona �
 |---|---|
 | `persona.py` | `Persona` 主类（懒加载 / 文件路径管理）。 |
 | `processor.py` | **`build_persona_prompt(name, mood_key=None, group_description=None)`**：把 persona md + mood + group_description 组装成 system_prompt。 |
-| `prompts.py` | `SYSTEM_CONSTRAINTS` / `TOOL_ORCHESTRATION_*` / 人设模板；含**对外单一表面**与**进行中任务**纪律。 |
+| `prompts.py` | `SYSTEM_CONSTRAINTS` / `TOOL_ORCHESTRATION_*` / 人设模板；含**对外单一表面**与**长任务/在途**纪律。 |
 | `resource.py` | `load_persona / extract_compact_persona`（Heartbeat 决策阶段用压缩版 persona 节省 token）。 |
 | `mood.py` | 情绪状态机（per `mood_key` 隔离）。 |
 | `config.py` | `persona_config_manager`：每个 persona 一份 config.json，含 `ai_mode / inspect_interval / scope / target_groups / tool_packs / tool_names` 等。 |
@@ -280,7 +280,7 @@ Persona 与能力代理同构为一个 `AgentNode`（统一注册表 + persona �
 | `budget/` | 用量预算规则 + `budget_manager` 闸门（交互/自主 scope）。 |
 | `approval/` | 统一审批中心（`AIApprovalRequest` + submit/resolve）。 |
 | `command_exec/` | 主人 shell 审批执行链（policy / runner / audit）。 |
-| `multimodal/` | ASR / 文档 / 视频帧 / Gemini Files 等。 |
+| `multimodal/` | ASR / 文档 / 视频帧 / Gemini Files / OpenAI file 视频 等。 |
 | `image_understand/` | 图片理解入口（可被 run 内嵌调用）。 |
 
 ### `database/` — ai_core 自有 ORM 模型
@@ -344,13 +344,15 @@ Persona 与能力代理同构为一个 `AgentNode`（统一注册表 + persona �
 
 | 文件 | 用途 |
 |---|---|
-| `web_search/search.py` | 顶层调度：主用 + 多源策略（`none` / `error_switch` / `auto_balance`）。默认主用 **Tavily**；异常**或空结果**换源。 |
-| `web_search/tavily_search.py` | Tavily（默认主用；Key 失败抛错）。 |
+| `web_search/search.py` | 顶层调度：主用 + 多源策略（`none` / `error_switch` / `auto_balance`）。默认主用 **AnySearch**（可匿名）；异常**或空结果**换源。 |
+| `web_search/tavily_search.py` | Tavily（需 Key；失败抛错）。 |
 | `web_search/jina_search.py` | Jina 搜索 `s.jina.ai`（需 API Key）。 |
 | `web_search/exa_search.py` | Exa；Key 失败抛错以便切换。 |
+| `web_search/anysearch_search.py` | AnySearch `POST /v1/search`（Key 可选，匿名有每日免费额度）。 |
+| `web_search/firecrawl_search.py` | Firecrawl 官方 SDK `AsyncFirecrawl.search`（Key 可选，keyless 免费档按 IP 限流）。 |
 | `web_fetch/__init__.py` | URL 抓取：默认 **Jina** `r.jina.ai`（Key 可选）+ 备用 **local** 直连；空正文/错误换源。 |
 
-配置：`ai_config` 的 `websearch_*` / `webfetch_*`；`tavily_config.json` / `jina_config.json` / `exa_config.json` / `web_fetch_config.json`。**热读，改配置无需重启。**
+配置：`ai_config` 的 `websearch_*` / `webfetch_*`；`tavily_config.json` / `jina_config.json` / `exa_config.json` / `anysearch_config.json` / `firecrawl_config.json` / `web_fetch_config.json`。**热读，改配置无需重启。**
 内置工具：`web_search_tool` / `web_fetch_tool` 外层 `timeout=100`。控制台：`/ai-config` → 网络搜索服务 / 网页抓取服务。
 
 ---

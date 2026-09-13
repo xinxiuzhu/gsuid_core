@@ -94,8 +94,8 @@ def test_artifact_format_pagination() -> None:
     assert "offset=10" in page2
 
 
-def test_relean_drops_framework_user_parts() -> None:
-    """框架注入 UserPrompt 不得进 B 轨（避免被当成群友发言）。"""
+def test_relean_leans_delivery_frame() -> None:
+    """交付帧入史瘦成一行，不把长卡当群友发言。"""
     from pydantic_ai.messages import ModelRequest, UserPromptPart
 
     from gsuid_core.ai_core.utils import _relean_user_turn
@@ -104,8 +104,28 @@ def test_relean_drops_framework_user_parts() -> None:
         ModelRequest(parts=[UserPromptPart(content="[框架·任务完成]\n【子任务交付】任务#1 已完成。\n产物 res_abc")])
     ]
     _relean_user_turn(msgs, lean_content="")
-    # 整段被剥掉 → parts 空
-    assert len(msgs[0].parts) == 0
+    assert len(msgs[0].parts) == 1
+    body = str(msgs[0].parts[0].content)
+    assert "任务#1" in body
+    assert "res_abc" in body
+    assert "【子任务交付】" not in body
+
+
+def test_lean_delivery_keeps_handle_and_ordinal() -> None:
+    from gsuid_core.ai_core.utils import lean_delivery_frame
+
+    full = (
+        "[框架·任务完成]\n【子任务交付·需你亲自完成收尾】任务#12「简报」已完成。\n"
+        "你是主人格：角色短句给结论；有图则 send_message_by_ai(image_id=)；\n"
+        '长文尚未出图 → create_subagent(agent_profile="render_agent", task=句柄+版式)；\n'
+        "禁止把句柄写进对用户台词。\n"
+        "产物句柄卡：\nres_deadbeef1234 | image/png | 对照图A"
+    )
+    lean = lean_delivery_frame(full)
+    assert "任务#12" in lean
+    assert "res_deadbeef1234" in lean
+    assert "create_subagent" not in lean
+    assert "禁止" not in lean
 
 
 def test_relean_keeps_real_user_and_strips_nudge() -> None:
@@ -123,4 +143,31 @@ def test_relean_keeps_real_user_and_strips_nudge() -> None:
     ]
     _relean_user_turn(msgs, lean_content="[用户发言]\n你好")
     assert len(msgs[0].parts) == 1
-    assert msgs[0].parts[0].content == "[用户发言]\n你好"
+    assert msgs[0].parts[0].content == "[用户发言]\n你好\n\n[历史对话] 很长…"
+
+
+def test_relean_peels_ephemeral_system_lines() -> None:
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    from gsuid_core.ai_core.utils import _relean_user_turn
+
+    msgs = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    content=(
+                        "[用户发言]\n你好呀\n"
+                        "（系统：本轮说话人不是主人，禁止称「主人」。）\n"
+                        "（系统：本轮未点名：不要调用发现/调度/回想；默认 <SILENCE>。）"
+                    )
+                )
+            ]
+        )
+    ]
+    _relean_user_turn(msgs, lean_content="[用户发言]\n你好呀")
+    assert len(msgs[0].parts) == 1
+    body = str(msgs[0].parts[0].content)
+    assert "你好呀" in body
+    assert "禁止称" not in body
+    assert "未点名" not in body
+    assert "（系统：" not in body

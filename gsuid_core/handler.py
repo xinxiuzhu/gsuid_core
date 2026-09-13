@@ -38,6 +38,29 @@ from gsuid_core.utils.plugins_config.gs_config import (
 command_start = core_config.get_config("command_start")
 enable_empty = core_config.get_config("enable_empty_start")
 
+_SEEN_WS_BRIDGES: Dict[Tuple[str, str], set[str]] = {}
+_WARNED_WS_BRIDGES: set[Tuple[str, str]] = set()
+
+
+def _warn_duplicate_ws_bridge(event: Event) -> None:
+    """同一 bot_self_id + 群出现 ≥2 个 WS_BOT_ID 时告警（双适配器会拆 session）。"""
+    if not event.group_id or not event.bot_self_id or not event.WS_BOT_ID:
+        return
+    key = (str(event.bot_self_id), str(event.group_id))
+    seen = _SEEN_WS_BRIDGES.setdefault(key, set())
+    seen.add(str(event.WS_BOT_ID))
+    if len(seen) < 2 or key in _WARNED_WS_BRIDGES:
+        return
+    _WARNED_WS_BRIDGES.add(key)
+    logger.warning(
+        t(
+            "log.handler.duplicate_ws_bridge",
+            bot_self_id=event.bot_self_id,
+            group_id=event.group_id,
+            ws_ids=",".join(sorted(seen)),
+        )
+    )
+
 
 _command_start: List[str]
 if command_start and enable_empty:
@@ -262,6 +285,7 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
     msg.user_pm = user_pm = await get_user_pml(msg)
     event = await msg_process(msg)
     event.WS_BOT_ID = ws.bot_id
+    _warn_duplicate_ws_bridge(event)
     if show_receive:
         logger.info(t("log.handler.event_received"), event_payload=event)
 
@@ -487,7 +511,7 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
         message = await trigger.get_command(_event)
         _event.task_id = str(uuid4())
         bot = Bot(ws, _event)
-        await count_data(event, trigger)
+        # on_message 被动监听，不记命令统计（keyword 常为 uuid4，会污染看板）
         logger.trace(t("log.handler.cmd_on_message"), command=message)
         coro = trigger.func(bot, message)
         func_name = getattr(coro, "__qualname__", str(coro))
@@ -626,6 +650,17 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
                     trigger_type = "followup"
 
             if not should_respond:
+                from gsuid_core.config import core_config
+
+                msg_text = event.raw_text or ""
+                aliases = core_config.get_config("framework_aliases")
+                alias_list = [str(a) for a in aliases] if isinstance(aliases, list) else []
+                if alias_list and any(a and a in msg_text for a in alias_list):
+                    should_respond = True
+                    soft_triggered = True
+                    trigger_type = "followup"
+
+            if not should_respond:
                 return
 
             from gsuid_core.ai_core.startup import is_ai_core_ready, is_ai_core_initializing
@@ -721,6 +756,10 @@ async def msg_process(msg: MessageReceive) -> Event:
             if _msg.data:
                 event.audio_id = RM.register_audio(_msg.data)
                 event.audio_id_list.append(event.audio_id)
+        elif _msg.type == "video":
+            if _msg.data:
+                event.video_id = RM.register_video(_msg.data)
+                event.video_id_list.append(event.video_id)
         elif _msg.type == "reply":
             event.reply = _msg.data
         elif _msg.type == "reply_id" and _msg.data is not None:
@@ -756,6 +795,9 @@ async def msg_process(msg: MessageReceive) -> Event:
 
 
 async def count_data(event: Event, trigger: Trigger):
+    # on_message 每条消息必触发；计入命令会污染看板 / core信息
+    if trigger.type == "message":
+        return
     local_val = get_platform_val(event.real_bot_id, event.bot_self_id)
     local_val["command"] += 1
     if event.group_id:

@@ -56,7 +56,7 @@ description: >
 |------|------|------|
 | 一 | 架构与模块全景（`ai_core/` 目录结构、核心组件关系、消息→AI 的总链路） | [references/01-architecture-and-modules.md](./references/01-architecture-and-modules.md) |
 | 二 | 启动时序与生命周期钩子（`core.py::main`、两阶段 hook、`init_ai_core` 顺序、关闭钩子、AI 总开关、Web 服务启动） | [references/02-startup-lifecycle.md](./references/02-startup-lifecycle.md) |
-| 三 | 插件加载与配置系统（发现/分类/依赖合并安装/`cached_import`、`CoreConfig`/`PluginConfigStore`/`SV` 配置、配置热重载矩阵） | [references/03-plugin-loading-and-config.md](./references/03-plugin-loading-and-config.md) |
+| 三 | 插件加载与配置系统（发现/分类/**meta plugin 两阶段 import**/依赖合并安装/`cached_import`、`CoreConfig`/`PluginConfigStore`/`SV` 配置、配置热重载矩阵） | [references/03-plugin-loading-and-config.md](./references/03-plugin-loading-and-config.md) |
 | 四 | 事件处理与触发器流转（`handle_event` 13 步、触发器匹配、命令 vs AI 分流、AI 触发条件、长度/并发防护） | [references/04-event-trigger-flow.md](./references/04-event-trigger-flow.md) |
 | 五 | Bot 三类（`_Bot` 底层 / `Bot` 高层 / `MockBot` AI 代理、连接管理与 5 分钟重连复用、发送队列串行化） | [references/05-bot-classes.md](./references/05-bot-classes.md) |
 | 六 | AI Session 路由与 Persona（`ai_router`、**前缀缓存红线 / 保头裁中段**、Persona 热重载） | [references/06-ai-session-and-persona.md](./references/06-ai-session-and-persona.md) |
@@ -87,12 +87,13 @@ description: >
 - **保底池由 category 决定**：`self`+`buildin` 无条件加载进主 Agent，无硬编码名单；`common`/`media`/`by_trigger`/`mcp` 走向量检索按需加载；`default` 是子 Agent 专属。再叠加 Reranker 精排、`find_tools` 渐进暴露（非闲聊轮）、`visible_when` 条件隐藏。详见 [§07](./references/07-tool-registry-and-agent.md)。
 - **工具能被召回的前提是完整检索面**：`retrieval_text` = name + docstring + **covers** + **aliases**。docstring 写错位置 → `__doc__` 空 → 永远召不回。详见 [§7.3](./references/07-tool-registry-and-agent.md)、[§12.22e](./references/12-developer-pitfalls.md)。
 - **前缀缓存红线**：system 会话内不改串；history **保头裁中段**；系统契约只 append UserPromptPart。详见 [§6.7.1](./references/06-ai-session-and-persona.md)、[§12.7](./references/12-developer-pitfalls.md)、[`AGENTS.md` §1.7](../../../AGENTS.md)。
+- **人格 / 能力锁定红线**：框架不得写死某个角色的口癖，也不得把游戏/股票等垂直词表写进分类器或路由。口癖从人格卡解析；垂直能力由插件 `covers`/`aliases` 自描述。详见 [`AGENTS.md` §1.9](../../../AGENTS.md)、[§12.22](./references/12-developer-pitfalls.md)。
 - **「实体 → 插件」的路由不能交给嵌入**（L0 实体路由，2026-07-15）：「玄翎秧秧属于鸣潮」是**世界知识不是文本相似度**，实测跨插件路由准确率仅 ~50%。`entity_index.py` 用插件注册的别名/实体做**确定性查表**定插件，嵌入只负责"插件内选哪个工具"。Pool Recall 74.9%→99.7%。详见 [§7.3b](./references/07-tool-registry-and-agent.md)。
 - **记忆的 flush 是唯一落库时机，缓冲区在进程内存**：只有"攒满 80 条 / 满 2 小时"两个出口时，一段对话要在内存里躺两小时，core 一重启就永久消失（实测生产真实流量 Episode 数曾为 **0**）。现由 `idle_flush_seconds`（对话静默即落库）兜住。详见 [§9.4](./references/09-memory-system.md)、[§12.22f](./references/12-developer-pitfalls.md)。
 - **私聊的记忆 scope 是 `user_global:` 不是 `group:`**：`observe()`/`dual_route_retrieve()` 按 `GROUP if group_id else USER_GLOBAL` 分支，**私聊必须传 `group_id=None`**。调用点写 `event.group_id or event.user_id` 会让私聊掉进幻影 `group:{user_id}`，偏好记忆（只存 USER_GLOBAL）因此永远为空。详见 [§9.2](./references/09-memory-system.md)。
 - **记忆与发言决策正交**：即使 Persona 纯静默，Observer 仍在后台积累记忆。摄入门控 100% 纯规则零 LLM。`IngestionWorker` 现已回归**主事件循环后台 task**（独立线程双循环曾击穿 Proactor 导致 WS 全断，已废弃）。详见 [§09](./references/09-memory-system.md)、[§12](./references/12-developer-pitfalls.md)。
 - **配置写入即时持久化 + 多数热重载**：`StringConfig.set_config` 改内存后立即 `write_config` 落盘，大多数 AI 配置"下次消息处理即生效"；`inspect_interval` 是例外（需重启该 persona 的巡检 job，代码已自动 stop+start）。详见 [§03](./references/03-plugin-loading-and-config.md)。
-- **SQLModel 不写 `__tablename__`**：表名 = 类名全小写。数据库方法写在模型类里、用 `@with_session`。Schema 变更走 `on_core_start_before` 的 `exec_list`/`trans_adapter`。详见 [§11](./references/11-statistics-webconsole-database.md)。
+- **SQLModel 不写 `__tablename__`**：表名 = 类名全小写。数据库方法写在模型类里、用 `@with_session`（写）/ `@with_read_session`（纯 SELECT）。Schema 变更走 `on_core_start_before` 的 `exec_list`/`trans_adapter`。详见 [§11](./references/11-statistics-webconsole-database.md)。
 - **上下文装配单源 + 交互脚手架（2026-07-12 起）**：system prompt 与每轮动态注入的唯一装配点是 `ai_core/context_assembly.py`（生产 `handle_ai` 与评测端点同源消费，禁止在入口手工拼接）；`ai_core/interaction_scaffold.py` 是 C-1~C-3 交互脚手架（省略跟进/漂移预算/寻址前置门），判据只许结构/语言学范畴、长度类判定必须过 `extract_message_body`。详见 [§06](./references/06-ai-session-and-persona.md) 6.7 与 [§12](./references/12-developer-pitfalls.md) 12.22d。
 - **统一输出闸门（2026-08）**：`pre_send_gate` 顺序 **尖括号 → OOC**；主路径与 `send_message_by_ai` 共用 `GateBag`；`<br>` / `<bubble/>` 非法；呈现层只做 `send_chat_result`。详见 [§7.12](./references/07-tool-registry-and-agent.md)、[§12.22](./references/12-developer-pitfalls.md)、生命周期文档 §10.4–§10.6。
 - **出图主路径 `render_agent`**：`create_subagent(agent_profile="render_agent")`；`render_*` 在 media，主人格 exclusive 剥离。详见 [§7](./references/07-tool-registry-and-agent.md)、[`TAKUMI_HTML_GUIDE.md`](../../../docs/TAKUMI_HTML_GUIDE.md)。

@@ -16,6 +16,8 @@ def test_exclusive_tools_exclude_task_basics_shared() -> None:
     exclusive = _capability_exclusive_tool_names()
     # 空环境（无插件专属工具）下 exclusive 可能为空；有 code_agent 时也不应含 task_basics
     assert exclusive.isdisjoint(basics)
+    assert "read_handle" in basics
+    assert "list_persisted_outputs" in basics
 
 
 def test_roster_lists_node_ids_not_invented_names() -> None:
@@ -118,3 +120,71 @@ def test_exclusive_tools_blocked_from_progressive_path() -> None:
     rt = RetrievableToolset(exclude_names={"find_tools"} | set(exclusive))
     assert exclusive <= rt._exclude or not exclusive
     assert exclusive <= ctx.blocked_tool_names or not exclusive
+
+
+def test_visibility_user_hint_does_not_lie_about_manage() -> None:
+    from gsuid_core.ai_core.buildin_tools.visibility import visibility_user_hint
+
+    unnamed = visibility_user_hint(
+        is_group=True,
+        call_to_self=False,
+        followup_detected=False,
+        create_ok=False,
+    )
+    assert unnamed == ""
+    assert "管理已有" not in unnamed
+    manage = visibility_user_hint(
+        is_group=True,
+        call_to_self=True,
+        followup_detected=False,
+        create_ok=False,
+    )
+    assert "管理已有" in manage
+    clear = visibility_user_hint(
+        is_group=True,
+        call_to_self=True,
+        followup_detected=False,
+        create_ok=True,
+    )
+    assert clear == ""
+
+
+def test_group_recall_tools_are_not_hard_gated() -> None:
+    """发现/委派/回想不按点名硬拒；群聊寻址交给模型。"""
+    from pathlib import Path
+
+    files = (
+        Path("gsuid_core/ai_core/buildin_tools/dynamic_tool_discovery.py"),
+        Path("gsuid_core/ai_core/buildin_tools/subagent.py"),
+        Path("gsuid_core/ai_core/buildin_tools/rag_search.py"),
+        Path("gsuid_core/ai_core/buildin_tools/visibility.py"),
+    )
+    for path in files:
+        src = path.read_text(encoding="utf-8")
+        assert "check_group_recall" not in src, path
+        assert "本轮未点名：不要调用发现/委派/回想" not in src, path
+
+
+def test_find_tools_match_is_unidirectional() -> None:
+    from pathlib import Path
+
+    from gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery import _need_matches_tool_text
+
+    src = Path("gsuid_core/ai_core/buildin_tools/dynamic_tool_discovery.py").read_text(encoding="utf-8")
+    assert "offered_names_in_hit_domains" not in src
+    assert "n in hay or hay in n" not in src
+    assert _need_matches_tool_text("网页搜索", "tool 网页搜索 docs", [])
+    assert _need_matches_tool_text("帮我网页搜索一下", "other", ["网页搜索"])
+    assert not _need_matches_tool_text("帮我分析很长的需求描述xyz", "分析", [])
+    assert _need_matches_tool_text("帮我查北京天气", "other", ["北京天气"])
+    hay = "查询用户本人在鸣潮「全息矩阵」（矩阵叠兵 / 终焉矩阵）的挑战记录"
+    assert _need_matches_tool_text("查询鸣潮矩阵叠兵个人战绩记录和分数", hay, [])
+
+
+def test_capability_agent_loop_folds_tool_return() -> None:
+    from pathlib import Path
+
+    src = Path("gsuid_core/ai_core/agent_run/loop.py").read_text(encoding="utf-8")
+    assert 'self.create_by in _MAIN_PERSONA_CREATE_BY or self.create_by == "CapabilityAgent"' in src
+    assert "needs_task_ack_turn" in src
+    assert "tools_warrant_task_ack" in src

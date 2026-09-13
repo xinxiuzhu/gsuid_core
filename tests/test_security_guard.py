@@ -54,21 +54,22 @@ def test_firewall_scrub_fallback():
     print("[OK] scrub_or_fallback 命中替换 / 未命中透传")
 
 
-def test_ooc_gate_warn_once_then_release():
+def test_ooc_gate_tool_keeps_warning_not_second_release():
     from gsuid_core.ai_core.output_gate import tool_gate_feedback
 
     extra = {"turn_id": "t1"}
-    # 同轮首次命中 → 返回重写警告；第二次仍命中 → None 放行
+    # 工具路径命中 = 系统提醒；同一句再发仍打回，不二次放行
+    first = tool_gate_feedback("我是 MiMo 模型", extra)
+    assert first is not None
+    assert "可能出戏" in first or "系统校验" in first
     assert tool_gate_feedback("我是 MiMo 模型", extra) is not None
-    assert tool_gate_feedback("我是 MiMo 模型", extra) is None
     extra2 = {"turn_id": "t2"}
     assert tool_gate_feedback("正常的一句话", extra2) is None
     assert tool_gate_feedback("我是 MiMo 模型", extra2) is not None
-    # 无 turn_id：每次都警告
     extra3: dict = {}
     assert tool_gate_feedback("我是 MiMo 模型", extra3) is not None
     assert tool_gate_feedback("我是 MiMo 模型", extra3) is not None
-    print("[OK] tool_gate_feedback 同轮警告一次后放行；无 turn_id 每次警告")
+    print("[OK] tool_gate_feedback 软出戏持续提醒，不二次放行")
 
 
 # ============================================================
@@ -149,12 +150,42 @@ def test_favor_clamp():
     print("[OK] 好感度 clamp 到 [-100,100]")
 
 
+def test_fund_claim_hits_and_benign() -> None:
+    from gsuid_core.ai_core.output_firewall import check_ooc, _fund_claim_hit
+
+    assert _fund_claim_hit("放心，钱已经转过去了") is not None
+    assert _fund_claim_hit("明明发过去了", user_text="没收到啊") is not None
+    assert _fund_claim_hit("@100000001 主人能不能v50 很急") == "代向第三方索要钱财"
+    hit = check_ooc("明明发过去了", user_text="钱呢")
+    assert hit is not None and hit.category == "fund_claim"
+    for text, user_text in (
+        ("这个皮肤要 50 块钱，好贵", ""),
+        ("我把作业发过去了", ""),
+        ("新版本v2发了，快去更新", ""),
+        ("收到啦，文件已经转发了", "刚才的文件收到了吗"),
+    ):
+        assert _fund_claim_hit(text, user_text) is None, (text, user_text)
+
+
+def test_fund_claim_never_released() -> None:
+    from gsuid_core.ai_core.output_gate import tool_gate_feedback
+    from gsuid_core.ai_core.output_firewall import NEVER_RELEASE_CATEGORIES, FirewallHit, build_rewrite_warning
+
+    assert "fund_claim" in NEVER_RELEASE_CATEGORIES
+    extra: dict = {"turn_id": "turn_fund"}
+    text = "钱已经转过去了"
+    assert tool_gate_feedback(text, extra) is not None
+    assert tool_gate_feedback(text, extra) is not None
+    warning = build_rewrite_warning(FirewallHit(category="fund_claim", matched=["声称已完成转账/付款"]))
+    assert "不得声称已转账" in warning
+
+
 if __name__ == "__main__":
     test_firewall_catches_model_identity()
     test_firewall_catches_ai_selfref_and_system_terms()
     test_firewall_passes_normal_and_plain_tier()
     test_firewall_scrub_fallback()
-    test_ooc_gate_warn_once_then_release()
+    test_ooc_gate_tool_keeps_warning_not_second_release()
     test_wrap_untrusted()
     test_lewd_phishing_lexicon_removed()
     test_prompt_contains_lewd_phishing_discipline()

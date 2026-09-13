@@ -42,18 +42,11 @@ LegacyDispatcherSource = Literal["heartbeat", "task"]
 
 
 def _resolve_active_bot(event: Event) -> Optional["_Bot"]:
-    """从 ``gss.active_bot`` 解析底层 ``_Bot``，与 inspector 兜底逻辑同构。
-
-    优先 ``event.WS_BOT_ID``（最准确）；若 active_bot 完全为空则返回 None。
-    """
+    """只按 ``event.WS_BOT_ID`` 解析底层 ``_Bot``；缺失则返回 None。"""
     from gsuid_core.gss import gss
 
     if event.WS_BOT_ID and event.WS_BOT_ID in gss.active_bot:
         return gss.active_bot[event.WS_BOT_ID]
-
-    # 兜底：取任意一个可用 _Bot（与 inspector._get_bot_for_session 同样的最末兜底）
-    if gss.active_bot:
-        return next(iter(gss.active_bot.values()))
     return None
 
 
@@ -197,26 +190,43 @@ async def emit_proactive_message(
         "proactive_source": source,
         "trigger_reason": trigger_reason,
     }
-    # 主动出口也过 OOC：Kanban 转译等旁路不得把工具名/句柄念给用户
-    from gsuid_core.ai_core.output_firewall import (
-        PERSONA_FALLBACK_TEXT,
-        check_ooc,
-        is_enabled,
-    )
+    from gsuid_core.ai_core.output_gate import GateDecision, pre_send_gate
+    from gsuid_core.ai_core.output_firewall import fallback_ooc_text
+    from gsuid_core.ai_core.persona.settings import persona_name_from_event
 
+    pname = persona_name_from_event(event)
     out_msg = message
-    if is_enabled() and out_msg:
-        _hit = check_ooc(out_msg, user_text="")
-        if _hit is not None:
+    if out_msg:
+        _bag: Dict[str, object] = {}
+        if pname:
+            _bag["persona_name"] = pname
+        _gr = pre_send_gate(out_msg, _bag, user_text="", channel="main")
+        if _gr.decision is GateDecision.FUSE:
+            logger.warning(t("log.ai.firewall_result_hit_ooc_red", p0="fuse", p1="proactive"))
+            return False
+        if _gr.decision is GateDecision.REWRITE:
             logger.warning(
                 t(
                     "log.ai.firewall_result_hit_ooc_red",
-                    p0=_hit.category,
-                    p1=_hit.matched,
+                    p0=_gr.policy,
+                    p1=(_gr.ooc_hit.matched if _gr.ooc_hit is not None else ""),
                 )
             )
-            out_msg = PERSONA_FALLBACK_TEXT
+            out_msg = fallback_ooc_text(pname)
+        elif _gr.decision is GateDecision.FALLBACK:
+            out_msg = _gr.send_text or fallback_ooc_text(pname)
     await send_chat_result(bot, out_msg, ev=event, extra_metadata=extra_metadata)
+    from gsuid_core.ai_core.outbound import record_outbound
+
+    await record_outbound(
+        ev=event,
+        session_id=event.session_id or "",
+        text=out_msg,
+        image_id="",
+        topic="",
+        target_user=str(event.user_id) if event.user_id else "",
+        target_name="",
+    )
 
     # 4) 同步到用户主 session（pydantic_ai 历史 + session_logger）
     await _sync_to_main_session(

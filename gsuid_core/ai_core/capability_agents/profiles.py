@@ -165,7 +165,7 @@ _RESEARCH_PROMPT = """你负责外部检索与综合分析，交付可复核的 
 
 _RENDER_BOUNDARY = """【交付边界】
 - 允许：`render_html_to_image` / `render_card` / `render_markdown_to_image`
-  （成功后**只登记 artifact / 返回句柄**，禁止对用户会话直发）。
+  （`render_*` 成功即已登记产物，无需再 `artifact_put`；禁止对用户会话直发）。
 - **默认只出 1 张图**：事实包**尽量全文上图**（分区竖长图），只调用一次渲染工具。
 - 禁止为「好看」删掉数字/表格/依据/风险段；禁止搜索；禁止编造 task/artifact 外数字。
 - 事实包内的 **https 配图 URL** 可用 `<img src>` 写入 HTML（引擎自动下载嵌图）；
@@ -210,6 +210,7 @@ _RENDER_PROMPT = """你负责把**已给定**事实包渲成**一张**可阅读�
 ## 图表（数据可视化硬要求）
 渲染引擎无 JS，echarts/canvas 不可用；要画**真图表**用声明式原语工具：
 `render_chart_spec` → 返回 `<svg>…</svg>` 片段，嵌进 HTML 再 `render_html_to_image`。
+引擎会把 SVG `<text>` 提升为 HTML 覆盖层；禁止用纯文字墙代替图表。
 
 ### 编码规则（防信息误解，硬）
 - 多实体 × 多指标对比：**必须**传 `series=[{name, data:[{label,value}]}]`，
@@ -228,6 +229,7 @@ _RENDER_PROMPT = """你负责把**已给定**事实包渲成**一张**可阅读�
   **禁止**用纯 CSS 色条 / `.track` 扁条冒充折线或柱图。
 - 事实包含数值序列却只排成文字表格 = 未完成可视化。
 - 图表与文字混排：svg 放卡片内、配标题与一句解读；禁止整页只有一张裸图。
+  引擎会按栏宽缩放 SVG（去掉固定 px 宽），2 栏里不要再套一层更大的固定宽容器。
 
 ## 明暗主题与色板（必选其一；**按内容换皮，禁止每次同款暗蓝长图**）
 硬约束只有一条：**整页不透明 + 文字与底对比足够**。
@@ -1004,7 +1006,6 @@ def register_builtin_profiles() -> None:
                 "render_card",
                 "render_markdown_to_image",
                 "artifact_get",
-                "artifact_put",
                 "artifact_list",
                 "_get_current_date",
             ],

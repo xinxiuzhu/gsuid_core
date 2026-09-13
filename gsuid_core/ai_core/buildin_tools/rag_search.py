@@ -13,15 +13,18 @@ from gsuid_core.ai_core.rag import search_images
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.cognition import (
-    ALL_KINDS,
+    MEMORY_KINDS,
     CogKind,
     CogScope,
     kinds_from_names,
     search_cognition as federated_search,
+    resolve_recall_kinds,
+    strip_speaker_from_query,
 )
 from gsuid_core.ai_core.cognition.facade import render_cognition_block
-from gsuid_core.ai_core.buildin_tools.visibility import visible_to_capability_only
-from gsuid_core.ai_core.buildin_tools.cognition_write import attach_article as attach_article
+from gsuid_core.ai_core.buildin_tools.visibility import (
+    visible_to_capability_only,
+)
 
 # 本轮已检索过的 query（run 级，存 ToolContext.extra；ToolContext 每轮新建，轮末自然丢弃）
 _SEEN_QUERIES_KEY = "cognition.seen_queries"
@@ -46,32 +49,49 @@ def _scope_from_ctx(ctx: RunContext[ToolContext], include_skill_doc: bool = Fals
     **私聊 group_id 必须是 None**：回退成 user_id 只会去查一个空的幻影
     ``group:{user_id}``，召回恒为 0。这条口径必须与 handle_ai 主链路一致。
     """
+    from gsuid_core.bot import Bot
+    from gsuid_core.models import Event
     from gsuid_core.ai_core.memory.config import memory_config
+    from gsuid_core.ai_core.turn_pipeline import parse_clock_at
 
     ev = ctx.deps.ev
     bot = ctx.deps.bot
+    self_id = ""
+    if isinstance(bot, Bot):
+        self_id = str(bot.bot_self_id)
+    elif isinstance(ev, Event):
+        self_id = str(ev.bot_self_id)
+    extra = ctx.deps.extra
+    clock = None
+    if "turn_clock" in extra and isinstance(extra["turn_clock"], str):
+        clock = parse_clock_at(extra["turn_clock"])
     return CogScope(
         user_id=str(ev.user_id) if ev is not None and ev.user_id else "",
         bot_id=bot.bot_id if bot is not None else "",
+        bot_self_id=self_id,
         group_id=str(ev.group_id) if ev is not None and ev.group_id else None,
         include_skill_doc=include_skill_doc,
         # 语义性开关在唯一的配置层给默认值，不在函数签名里给
         enable_system2=memory_config.enable_system2,
         enable_user_global=memory_config.enable_user_global_memory,
+        clock_at=clock,
     )
 
 
-@ai_tools(category="buildin", capability_domain="回想")
+@ai_tools(
+    category="buildin",
+    capability_domain="回想",
+)
 async def search_cognition(
     ctx: RunContext[ToolContext],
     query: str,
     kinds: Optional[str] = None,
-    limit: int = 12,
+    limit: int = 24,
 ) -> str:
     """回想**我已经知道的事**：长期记忆、用户偏好、知识库、以前查过的材料、任务产物。
 
     **不查实时 / 外部数据**：网页与专域实时信息一律用 `web_search_tool` /
-    `web_fetch_tool` / 专域数据工具。本工具查不到外面的东西，换 query 重试也查不到。
+    `web_fetch_tool` / 专域数据工具。本工具查不到外面的东西。
 
     命中公共概念时，回执会带**路径卡**（挂在上面的文章目录 + 本环境事实）。
     问到某一栏且能唯一选定时，同一次返回该篇全文（≤6000 字，超出用 read_handle）。
@@ -80,28 +100,32 @@ async def search_cognition(
     什么时候用：
     - 用户问到过去的事（"上周/上次/之前我们聊过…""你说过的那个…"），当前上下文没答案时；
     - 需要"已有材料"（专业知识、说明文档、稳定资料、以前搜过的长文）时；
-    - 想确认"我对某人了解多少 / 有没有答应过什么"时。
+    - 想确认"我对某人了解多少 / 有没有答应过什么"时；
+    - 问已有记忆：query 带上问题里的专名/数字/约束；
+    - 办眼前的事需要说话人身上的事实、当前消息和上文都没写：query 写「说话人ID + 要填的槽」，
+      不要把本次外部题目的词拼进去；填槽后再 web_search / 专域工具。
 
-    无命中的含义是**没存过**，不是"要再搜一次"——换个说法重复调用只会浪费一轮。
-    找不到就换工具（`web_search_tool` 查外部、`find_tools` 找专域工具）或直接说不知道。
+    同一 query 重搜结果相同；**换槽位词**（专名/日期/清单项）再搜会召回不同片段。
+    无命中只表示本 query 没排上，不等于没存过。外部数据用 `web_search_tool`，专域用 `find_tools`。
+    同一属性多个 as_of 是更新，只答最晚一条。计数/清单跨多段会话，本页未齐时用命中专名再搜。
 
     Args:
         ctx: 工具执行上下文
-        query: 自然语言查询，如"上周聊过的旅行计划""出图规范"
-        kinds: 可选，逗号分隔的类型过滤，缩小范围更准：
-            episode/entity/fact/preference/knowledge/tool_output/artifact/
-            record/image/meme。留空=全查（含近窗群聊、业务记录、图片、表情）。
-        limit: 返回条数上限，默认 12
+        query: 自然语言查询。问已有记忆时带上专名与约束；办眼前的事填槽时
+            写「说话人ID + 要填的槽」，不要把外部题目的词拼进去。
+        kinds: 可选，逗号分隔的类型过滤。留空=记忆+知识+落盘；
+            query 含当前说话人 ID 时查 episode/entity/fact/preference（不含近窗/知识库）。
+            图片/表情/出站/业务记录须显式打开。
+        limit: 返回条数上限，默认 24
 
     Returns:
         路径卡（若命中枢纽）+ 选定全文 + 统一命中列表。无命中时只回一行。
     """
-    selected = kinds_from_names(set(kinds.split(","))) if kinds else ALL_KINDS
-    if not selected:
-        selected = ALL_KINDS
     scope = _scope_from_ctx(ctx)
     if not scope.user_id:
         return "⚠️ 无用户上下文，拒绝检索（防跨用户泄漏）。"
+    selected = kinds_from_names(set(kinds.split(","))) if kinds else frozenset()
+    selected = resolve_recall_kinds(selected, query=query, user_id=scope.user_id)
 
     # 认知层只读，同一 query 重搜必然同结果；不挡会连打到 thrash 熔断。
     seen = _seen_queries(ctx)
@@ -115,14 +139,33 @@ async def search_cognition(
             "要外部数据请用 web_search_tool，要全文请用 read_handle，或直接据已有信息作答。）"
         )
 
-    hits = await federated_search(query, kinds=selected, scope=scope, limit=max(1, min(limit, 30)))
+    search_q = strip_speaker_from_query(query, scope.user_id)
+    from gsuid_core.ai_core.memory.retrieval.lexical import strip_clock_lines
+
+    search_q = strip_clock_lines(search_q) or search_q
+
+    lim = max(1, min(limit, 48))
+    hits = await federated_search(
+        search_q,
+        kinds=selected,
+        scope=scope,
+        limit=lim,
+    )
     from gsuid_core.ai_core.cognition.hub import expand_hub, render_expand_result
 
-    expansion = await expand_hub(query, hits, scope=scope)
+    # 说话人面不含知识库：query 词面去挂公共枢纽会把「morning coffee」打成角色卡。
+    mem_n = sum(1 for h in hits if h.kind in MEMORY_KINDS)
+    if CogKind.KNOWLEDGE in selected and mem_n < 8:
+        expansion = await expand_hub(query, hits, scope=scope)
+    else:
+        expansion = None
     from gsuid_core.ai_core.content_guard import wrap_untrusted
 
-    hits_block = render_cognition_block(query, hits)
-    card = render_expand_result(query, expansion)
+    trusted = [h for h in hits if h.kind is CogKind.OUTBOUND]
+    others = [h for h in hits if h.kind is not CogKind.OUTBOUND]
+    trusted_block = render_cognition_block(query, trusted, header="出站（可信）") if trusted else ""
+    hits_block = render_cognition_block(query, others, hint_query=search_q)
+    card = render_expand_result(query, expansion) if expansion is not None else ""
     if not hits and not card:
         seen[key] = "无命中"
     elif card and hits:
@@ -131,11 +174,16 @@ async def search_cognition(
         seen[key] = "路径卡"
     else:
         seen[key] = f"命中 {len(hits)} 条"
-    if card and not hits:
-        return card
+    parts: list[str] = []
     if card:
-        return f"{card}\n\n{wrap_untrusted('memory_recall', hits_block)}"
-    return hits_block if not hits else wrap_untrusted("memory_recall", hits_block)
+        parts.append(card)
+    if trusted_block:
+        parts.append(trusted_block)
+    if others:
+        parts.append(wrap_untrusted("memory_recall", hits_block))
+    elif not trusted and not card:
+        parts.append(hits_block)
+    return "\n\n".join(parts) if parts else hits_block
 
 
 @ai_tools(category="common", visible_when=visible_to_capability_only)

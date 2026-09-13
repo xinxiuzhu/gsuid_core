@@ -155,8 +155,8 @@ def test_mask_mapping_salt_field():
 
 
 def test_build_config_item_returns_plaintext_secret():
-    from gsuid_core.utils.plugins_config.models import GsStrConfig
     from gsuid_core.webconsole.plugins_api import _build_config_item
+    from gsuid_core.utils.plugins_config.models import GsStrConfig
 
     secret = GsStrConfig(title="k", desc="d", data="sk-abcdefgh", secret=True)
     item = _build_config_item(secret, "custom_name")
@@ -226,11 +226,14 @@ def test_meme_folder_rejects_traversal():
         get_folder_path("../../data")
 
 
-def test_require_admin_role():
+def test_require_admin_role(monkeypatch: pytest.MonkeyPatch) -> None:
+    import asyncio
+
     from fastapi import HTTPException
 
     from gsuid_core.webconsole.web_api import session_role, require_admin
     from gsuid_core.webconsole.session_store import SessionRecord
+    from gsuid_core.utils.database.auth_models import WebUser
 
     def _rec(role: str) -> SessionRecord:
         return {
@@ -244,16 +247,29 @@ def test_require_admin_role():
     user = _rec("user")
     assert session_role(admin) == "admin"
     assert session_role(user) == "user"
-    assert require_admin(admin) is admin
-    with pytest.raises(HTTPException) as ei:
-        require_admin(user)
-    assert ei.value.status_code == 403
+    current_user = WebUser(email="a@b.c", role="admin")
+
+    async def get_user_by_email(*, email: str) -> WebUser:
+        assert email == current_user.email
+        return current_user
+
+    monkeypatch.setattr(WebUser, "get_user_by_email", get_user_by_email)
+
+    async def run() -> None:
+        assert await require_admin(admin) is admin
+        assert await require_admin(user) is user
+        current_user.role = "user"
+        with pytest.raises(HTTPException) as ei:
+            await require_admin(admin)
+        assert ei.value.status_code == 403
+
+    asyncio.run(run())
 
 
 def test_require_admin_header_rejects_missing_bearer():
     from fastapi import HTTPException
 
-    from gsuid_core.webconsole.web_api import require_admin_header, require_auth_header
+    from gsuid_core.webconsole.web_api import require_auth_header, require_admin_header
 
     with pytest.raises(HTTPException) as missing_auth:
         require_auth_header(None)

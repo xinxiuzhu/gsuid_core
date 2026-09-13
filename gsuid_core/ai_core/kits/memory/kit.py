@@ -9,6 +9,9 @@
 
 记忆子系统的 bring-up 归 ``startup._INIT_STEPS``（它要排在 RAG 之后拿 Embedding），
 本套件不带 ``init_step``（否则同一个初始化每次启动跑两遍）。
+
+LongMem 证据转储不在本文件：见 ``eval_protocol.py``，仅 ``memory_eval`` 时懒加载。
+评测 ``create_by`` 必须是 Chat；TEST 会改装配/闸门，不能当评测入口。
 """
 
 import re
@@ -23,6 +26,7 @@ from gsuid_core.ai_core.kits.registry import register_agent_kit
 
 if TYPE_CHECKING:
     from gsuid_core.ai_core.cognition import CogScope
+    from gsuid_core.ai_core.memory.retrieval.dual_route import MemoryContext
 
 # C4 寒暄门控：回指 / 实体 / 任务引用词，命中则强制检索
 _FORCE_RETRIEVE_RE = re.compile(
@@ -34,6 +38,96 @@ _EMOTION_RETRIEVE_RE = re.compile(r"(难过|崩溃|沉船|破防|开心死|伤�
 _ENTITY_HINT_RE = re.compile(r"([A-Za-z]{3,}|[「『\"“].+|[一-鿿]{6,})")
 # 「短寒暄」的长度上限，与关系温度的 meaningful 判据同源
 _CHITCHAT_SHORT_LEN = 12
+
+
+def _format_memory_catalog(mem: "MemoryContext", _query: str = "") -> str:
+    """标题目录卡：偏好极性 + episode 标题 + 边摘要，不灌 dual_route 正文。"""
+    from gsuid_core.ai_core.memory.retrieval.lexical import query_overlaps_text
+
+    lines = ["[记忆目录]"]
+    shown = 0
+    cap = 6
+
+    def _add(text: str) -> bool:
+        nonlocal shown
+        body = text.replace("\n", " ").strip()
+        if not body:
+            return True
+        shown += 1
+        lines.append(f"{shown}. {body[:64]}")
+        return shown < cap
+
+    matched_prefs: List[str] = []
+    unmatched_prefs: List[str] = []
+    for pref in mem.preferences:
+        rule = pref["preference_rule"].replace("\n", " ").strip()
+        if not rule:
+            continue
+        pol = pref["polarity"]
+        tag = "勿" if pol == "dont" else ("须" if pol == "do" else "")
+        corr = "纠正过" if pref["is_correction"] else ""
+        mark = "/".join(part for part in (tag, corr) if part)
+        item = f"[{mark}] {rule}" if mark else rule
+        if _query and not query_overlaps_text(_query, rule):
+            unmatched_prefs.append(item)
+        else:
+            matched_prefs.append(item)
+    for item in matched_prefs:
+        if not _add(item):
+            break
+    if shown < cap:
+        for ep in mem.episodes:
+            if not _add(ep["content"]):
+                break
+    if shown < cap:
+        for item in unmatched_prefs:
+            if not _add(item):
+                break
+    if shown < cap:
+        for edge in mem.edges:
+            fact = edge["fact"].replace("\n", " ").strip()
+            if not fact:
+                continue
+            if not _add(fact.split("。", 1)[0]):
+                break
+    if shown == 0:
+        return ""
+    lines.append("（详情 search_cognition / read_handle）")
+    return "\n".join(lines)
+
+
+def retrieve_query_for_search(query: str) -> str:
+    """检索用 query：剥墙钟行和 eval「当前时间」前缀。"""
+    from gsuid_core.ai_core.interaction_scaffold import extract_message_body
+    from gsuid_core.ai_core.memory.retrieval.lexical import strip_clock_lines
+
+    body = strip_clock_lines(extract_message_body(query))
+    return body or query.strip()
+
+
+def format_retrieved_memory(ctx: AgentHookContext, mem: "MemoryContext") -> str:
+    """Chat 默认目录卡；``memory_eval`` 用生产 ``to_prompt_text``（同一 dual_route 命中）。"""
+    if not ctx.memory_eval:
+        return _format_memory_catalog(mem, retrieve_query_for_search(ctx.query))
+    from gsuid_core.ai_core.kits.memory.eval_protocol import format_eval_memory
+
+    return format_eval_memory(mem, retrieve_query_for_search(ctx.query))
+
+
+def should_prefetch_memory(ctx: AgentHookContext) -> bool:
+    """闲聊/旁观/实时查数不预灌。点名办事才给目录卡。"""
+    from gsuid_core.ai_core.interaction_scaffold import looks_like_live_lookup
+
+    if looks_like_live_lookup(ctx.query):
+        return False
+    tg = ctx.turn_graph
+    if tg is None or not tg.is_group:
+        return True
+    if not tg.call_to_self and not tg.needs_task_tools:
+        return False
+    if (ctx.intent or "") == "闲聊" and not tg.needs_task_tools:
+        return False
+    return True
 
 
 def should_retrieve(query: str, intent: str, user_id: str) -> bool:
@@ -90,9 +184,12 @@ def cog_scope_from_ctx(ctx: AgentHookContext) -> "CogScope":
     return CogScope(
         user_id=ctx.user_id,
         bot_id=ctx.bot_id,
+        bot_self_id=ctx.bot_self_id,
         group_id=ctx.group_id,
         enable_system2=enable_system2,
         enable_user_global=memory_config.enable_user_global_memory,
+        memory_eval=ctx.memory_eval,
+        clock_at=ctx.clock_at,
     )
 
 
@@ -120,7 +217,9 @@ class MemoryKit(AgentKit):
     def register(self) -> None:
         on_agent_hook(AgentHookPoint.ON_INBOUND, priority=110, kit_id=self.kit_id, timeout_ms=500)(self.observe)
         on_agent_hook(AgentHookPoint.AFTER_SESSION, priority=150, kit_id=self.kit_id)(self.observe_active_session)
-        on_agent_hook(AgentHookPoint.RETRIEVE_CONTEXT, priority=110, kit_id=self.kit_id)(self.retrieve)
+        on_agent_hook(AgentHookPoint.RETRIEVE_CONTEXT, priority=110, kit_id=self.kit_id, timeout_ms=15_000)(
+            self.retrieve
+        )
         on_agent_hook(AgentHookPoint.COMPOSE_CONTEXT, priority=150, kit_id=self.kit_id)(self.inject)
         on_agent_hook(AgentHookPoint.ON_TOOL_CALL, priority=110, kit_id=self.kit_id)(self.trace_tool)
 
@@ -153,6 +252,7 @@ class MemoryKit(AgentKit):
                 bot_self_id=str(ev.bot_self_id),
                 observer_blacklist=memory_config.observer_blacklist,
                 message_type="group_msg" if ctx.group_id else "private_msg",
+                bot_id=str(ev.bot_id),
             )
         # 默认关闭：仅当「图片记忆」与「被动感知」同时勾选才静默读图入记忆，
         # 避免后台对每张群图都发起一次视觉模型调用（Token + 日志噪声）。
@@ -187,39 +287,64 @@ class MemoryKit(AgentKit):
             bot_self_id=str(ev.bot_self_id),
             observer_blacklist=memory_config.observer_blacklist,
             message_type="group_msg" if ctx.group_id else "private_msg",
+            bot_id=str(ev.bot_id),
         )
 
     async def retrieve(self, ctx: AgentHookContext) -> None:
-        """H05 贵检索窗：寒暄门控、scope、偏好能力域全在套件内部决定。"""
+        """H05：旁观不预灌；Chat 给目录卡；仅 memory_eval 灌证据会话。"""
         from gsuid_core.ai_core.memory.config import memory_config
-        from gsuid_core.ai_core.cognition.facade import inject_memory_slice
         from gsuid_core.ai_core.configs.ai_config import ai_config
+        from gsuid_core.ai_core.memory.retrieval.dual_route import dual_route_retrieve
 
         if not ai_config.get_config("enable_memory").data or not memory_config.enable_retrieval:
             return
-        if not should_retrieve(ctx.query, ctx.intent or "", ctx.user_id):
+        if not should_prefetch_memory(ctx):
+            return
+        search_q = retrieve_query_for_search(ctx.query)
+        if not should_retrieve(search_q, ctx.intent or "", ctx.user_id):
             logger.debug(t("log.ai.memory_skip_hit_small_talk_gate"))
             return
 
-        # 偏好注入是**能力域过滤**不是整轮开关：闲聊轮传空 list（检索侧只留
-        # general/纠错），而不是 None（= 不过滤，全量注入）。
         pref_contexts: List[str] = []
         if ctx.intent != "闲聊":
-            domains: Set[str] = set(relevant_preference_contexts(ctx.query))
+            domains: Set[str] = set(relevant_preference_contexts(search_q))
             domains.update(ctx.assembled_domains)
             pref_contexts = list(domains)
-
-        priority: Set[str] = set(ctx.priority_speakers)
-        text = await inject_memory_slice(
-            ctx.query,
-            scope=cog_scope_from_ctx(ctx),
-            priority_speakers=priority,
-            # §7 第三方隐私拦截：敏感事实仅当事人在场才注入
-            current_speaker_ids={ctx.user_id} if ctx.user_id else set(),
+        scope = cog_scope_from_ctx(ctx)
+        top_k = int(memory_config.retrieval_top_k)
+        mem = await dual_route_retrieve(
+            search_q,
+            ctx.user_id,
+            enable_system2=scope.enable_system2,
+            group_id=scope.group_id,
+            top_k=top_k,
+            enable_user_global=scope.enable_user_global,
+            inject_preferences=True,
             preference_contexts=pref_contexts,
+            bot_id=scope.bot_id,
+            bot_self_id=scope.bot_self_id,
+            include_self=True,
         )
-        if text.strip():
-            ctx.stash_retrieved("memory", text.strip())
+        if ctx.memory_eval:
+            from gsuid_core.ai_core.kits.memory.eval_protocol import (
+                boost_retrieved_memory,
+                _eval_full_scope_enabled,
+            )
+
+            if _eval_full_scope_enabled():
+                import asyncio
+
+                mem.seed_ids = [e["id"] for e in mem.episodes[:12]]
+                try:
+                    await asyncio.wait_for(
+                        boost_retrieved_memory(mem, search_q, ctx.user_id, ctx.group_id),
+                        timeout=25.0,
+                    )
+                except TimeoutError as e:
+                    logger.warning(t("log.ai.memory_compute_preference_related_fail", e=e))
+        text = format_retrieved_memory(ctx, mem)
+        if text:
+            ctx.stash_retrieved("memory", text)
             logger.debug(t("log.ai.memory_retrieved_context_characters", p0=len(text)))
             from gsuid_core.ai_core.statistics import statistics_manager
 
@@ -258,8 +383,6 @@ class MemoryKit(AgentKit):
         )
         if not hits:
             return
-        # 只把过了相对分下限的条目算作「已检索」的高置信部分；弱相关在渲染里
-        # 折成一句「另有 N 条弱相关」，不贴高置信标签。
         block = render_cognition_block(ctx.query, hits, header="已检索·目录")
         ctx.stash_retrieved("cognition_prefetch", block)
         logger.info(t("log.ai.cognition_prefetch", intent=intent or "-", n=len(hits)))
@@ -269,15 +392,67 @@ class MemoryKit(AgentKit):
         parts: List[str] = []
         text = ctx.retrieved["memory"] if "memory" in ctx.retrieved else ""
         if text:
-            guide = ctx.memory_guide or ""
-            parts.append(f"{guide}[长期记忆·高置信]\n{text}")
+            if ctx.memory_eval:
+                from gsuid_core.ai_core.kits.memory.eval_protocol import inject_eval_memory_parts
+
+                parts.extend(inject_eval_memory_parts(text, ctx.memory_guide or ""))
+            else:
+                parts.append(f"[长期记忆]\n{text}")
+                guide = ctx.memory_guide or ""
+                if guide:
+                    parts.append(guide)
         prefetch = ctx.retrieved["cognition_prefetch"] if "cognition_prefetch" in ctx.retrieved else ""
         if prefetch:
             parts.append(prefetch)
+        meme_block = await self._meme_preinject(ctx)
+        if meme_block:
+            parts.append(meme_block)
         if not parts:
             return
-        parts.append("（需要更多细节请调 search_cognition / read_handle）")
+        if not ctx.memory_eval:
+            parts.append("（需要更多细节请调 search_cognition / read_handle）")
         ctx.set_context_block("memory", "\n".join(parts))
+
+    async def _meme_preinject(self, ctx: AgentHookContext) -> str:
+        """装配期梗触发词精确匹配，最多 2 条。"""
+        from gsuid_core.ai_core.meme.database_model import AiMemeKnowledge
+
+        if not ctx.query.strip():
+            return ""
+        scope_key = f"group:{ctx.group_id}" if ctx.group_id else ""
+        try:
+            rows = await AiMemeKnowledge.match_terms(
+                ctx.query,
+                bot_id=ctx.bot_id,
+                scope_key=scope_key,
+                limit=2,
+            )
+        except Exception as e:
+            logger.debug(t("log.ai.meme_preinject_skip", e=e))
+            return ""
+        if not rows:
+            return ""
+        blocked: set[str] = set()
+        if ctx.persona_name:
+            from gsuid_core.ai_core.memory.group_profile import collect_persona_surfaces
+
+            blocked = {s.casefold() for s in collect_persona_surfaces(ctx.persona_name)}
+        lines = ["[群聊黑话]"]
+        hit_ids: list[int] = []
+        for row in rows:
+            term = (row.term or "").strip()
+            if term.casefold() in blocked:
+                continue
+            meaning = (row.meaning or "")[:80]
+            src = row.source or "未知"
+            lines.append(f'"{term}"：{meaning}（来源：{src}）')
+            if row.id is not None:
+                hit_ids.append(int(row.id))
+        if len(lines) == 1:
+            return ""
+        for hid in hit_ids:
+            await AiMemeKnowledge.bump_hit(hid)
+        return "\n".join(lines)
 
     async def trace_tool(self, ctx: AgentHookContext) -> None:
         """工具调用轨迹入记忆（供偏好蒸馏作背景，判「刚纠正完」）。"""
@@ -286,7 +461,8 @@ class MemoryKit(AgentKit):
 
         if not ctx.tool_name or not ctx.user_id or not memory_config.enable_preference_memory:
             return
-        record_tool_call(ctx.user_id, ctx.tool_name, ctx.tool_args)
+        bot_id = ctx.ev.bot_id if ctx.ev is not None else ""
+        record_tool_call(ctx.user_id, ctx.tool_name, ctx.tool_args, bot_id=bot_id)
 
 
 KIT = register_agent_kit(

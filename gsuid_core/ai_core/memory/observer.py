@@ -16,7 +16,7 @@ LOW 只写 Episode（由 IngestionWorker 据此分流）。
 
 import re
 import queue as sync_queue
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 from datetime import datetime, timezone
 from collections import deque
 from dataclasses import dataclass
@@ -24,6 +24,9 @@ from dataclasses import dataclass
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.ai_core.memory.config import memory_config
+
+if TYPE_CHECKING:
+    from gsuid_core.ai_core.memory.retrieval.types import Episode
 
 # 评测侧时间戳格式表：ISO8601 / Unix / LongMemEval / BEAM-10M，全部失败兜底 None。
 # 与 eval/BEAM_10M/run_beam_eval.py:parse_time_anchor 对齐，保证两侧可互换。
@@ -138,6 +141,52 @@ _BEHAVIOR_DIRECTED_RE = re.compile(
 )
 
 
+# 必须出现「梗/黑话」，避免「意思是/出自」误伤日常句。
+_MEME_EXPLAIN_RE = re.compile(
+    r"(是.{0,16}梗|的梗|梗的意思|.{0,12}是个梗|这是.{0,16}(梗|黑话))",
+)
+_MEME_LEARN_RE = re.compile(
+    r"[「『\"“]([^」』\"”]{2,20})[」』\"”]\s*(?:是|就是)(.+?)(?:的梗|梗)"
+    r"|([^」』\"”\s]{2,12})是(.+?)的梗",
+)
+
+
+def detect_meme_explain_intent(content: str) -> bool:
+    """群友在解释梗/黑话（零 LLM）。命中则 HIGH 快路径便于写入梗词典。"""
+    return bool(_MEME_EXPLAIN_RE.search(content or ""))
+
+
+def parse_meme_explain(content: str) -> tuple[str, str] | None:
+    m = _MEME_LEARN_RE.search(content or "")
+    if m is None:
+        return None
+    term = (m.group(1) or m.group(3) or "").strip()
+    meaning = (m.group(2) or m.group(4) or "").strip()[:300]
+    if len(term) < 2 or len(meaning) < 2:
+        return None
+    return term, meaning
+
+
+# 短句自报位置：「我在广州噢」「我住在杭州」。活动句（开会/上班）不算地点。
+_LOCATION_LIVE_RE = re.compile(r"我(现在)?(住在|家在)[一-鿿]{2,8}")
+_LOCATION_CITY_RE = re.compile(r"我(现在)?在[一-鿿]{2,4}市")
+_LOCATION_PARTICLE_RE = re.compile(r"我(现在)?在[一-鿿]{2,3}[噢哦]")
+_LOCATION_BARE_RE = re.compile(r"^我(现在)?在[一-鿿]{2,3}$")
+_LOCATION_ACTIVITY_RE = re.compile(r"我(现在)?在(开会|上班|加班|吃饭|睡觉|忙着|开车|洗澡|上课|出门|路上|忙)")
+
+
+def detect_location_self_report(content: str) -> bool:
+    """短句自报所在地（零 LLM）。命中则 HIGH + 优先 flush，否则要等静默三分钟才落库。"""
+    s = (content or "").strip()
+    if not s or len(s) > 20:
+        return False
+    if _LOCATION_ACTIVITY_RE.search(s):
+        return False
+    if _LOCATION_LIVE_RE.search(s) or _LOCATION_CITY_RE.search(s) or _LOCATION_PARTICLE_RE.search(s):
+        return True
+    return _LOCATION_BARE_RE.fullmatch(s) is not None
+
+
 def detect_correction_intent(content: str) -> bool:
     """纯规则探测一条消息是否含"纠正/偏好/规则要求"意图（零 LLM，召回预过滤）。
 
@@ -163,6 +212,52 @@ _ENTITY_HINT_RE = re.compile(r"([A-Za-z]{3,}|[「『\"“].+[」』\"”]|[一-�
 
 # 短句寒暄阈值：低于此长度且无任何 HIGH 信号才降级为 LOW
 _LOW_TIER_MAX_LEN = 10
+
+# 未落库缓冲并入检索时最多带几条，避免把整段闲聊目录卡撑满
+_PENDING_EPISODE_CAP = 8
+
+
+def _schedule_meme_knowledge_write(bot_id: str, group_id: str | None, term: str, meaning: str) -> None:
+    """群友解释写入梗词典（后台，不挡 observe）。``bot_id`` 是平台 ID，与检索侧一致。"""
+    if not bot_id:
+        return
+    import asyncio
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+
+    async def _write() -> None:
+        from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+        from gsuid_core.ai_core.cognition.types import CogKind
+        from gsuid_core.ai_core.cognition.remember import MemoryWrite, remember
+        from gsuid_core.ai_core.meme.database_model import AiMemeKnowledge
+
+        scope_key = make_scope_key(ScopeType.GROUP, group_id) if group_id else ""
+        row = await AiMemeKnowledge.upsert_term(
+            bot_id=bot_id or "default",
+            term=term,
+            meaning=meaning,
+            origin="",
+            usage="",
+            scope_key=scope_key,
+            confidence=0.9,
+            source="群友解释",
+        )
+        await remember(
+            MemoryWrite(
+                kind=CogKind.MEME_KNOWLEDGE,
+                ref=str(row.id),
+                scope_key=scope_key or f"self:{bot_id}",
+                owner_user_id="",
+                title=term,
+                summary=meaning[:120],
+                source="群友解释",
+            )
+        )
+
+    loop.create_task(_write())
 
 
 @dataclass
@@ -206,7 +301,7 @@ def _classify_value_tier(content: str, gate_mode: str = "宽松") -> str:
     - ``均衡``：无强信号 / 情绪 / 实体特征的消息一律 LOW（不再因"够长"而 HIGH）。
     - ``严格``：仅含强信号或情绪词的消息为 HIGH，其余（含仅有实体特征的）一律 LOW。
     """
-    if _HIGH_SIGNAL_RE.search(content) or _EMOTION_RE.search(content):
+    if _HIGH_SIGNAL_RE.search(content) or _EMOTION_RE.search(content) or detect_location_self_report(content):
         return "HIGH"
     # 至此：无强信号、无情绪词
     if gate_mode == "严格":
@@ -295,6 +390,7 @@ async def observe(
     timestamp: Optional[datetime] = None,
     *,
     force_scope_key: Optional[str] = None,
+    bot_id: str = "",
 ) -> None:
     """向观察队列投递一条消息记录。
 
@@ -344,6 +440,11 @@ async def observe(
         if memory_config.enable_preference_memory and detect_correction_intent(content):
             is_correction = True
             value_tier = "HIGH"
+        elif detect_meme_explain_intent(content):
+            value_tier = "HIGH"
+            parsed = parse_meme_explain(content)
+            if parsed is not None:
+                _schedule_meme_knowledge_write(bot_id, group_id, parsed[0], parsed[1])
 
     record = ObservationRecord(
         raw_content=content,
@@ -374,20 +475,80 @@ async def observe(
         except sync_queue.Empty:
             # 极端并发：get 与 put 之间被其它线程抢先；放弃本条
             logger.warning(t("log.memory.observation_queue_race"))
-    # 纠错即时写快路径（受 enable_preference_memory 前置）：命中纠错的 scope 走优先 flush
-    # （带 debounce），让数分钟内的"下一次"请求即可召回纠错偏好，而非等 batch 大窗。
-    if is_correction and memory_config.preference_immediate_flush:
+    # 纠错 / 私聊自报位置：对话进行中不 idle-flush，检索靠 pending 合并。
+    want_priority = is_correction and memory_config.preference_immediate_flush
+    if not want_priority and not is_self_speech and not group_id:
+        if detect_location_self_report(content):
+            want_priority = True
+    if want_priority:
         try:
-            from gsuid_core.ai_core.memory.startup import get_ingestion_worker
+            from gsuid_core.ai_core.memory.startup import get_ingestion_worker_or_none
 
-            worker = get_ingestion_worker()
+            worker = get_ingestion_worker_or_none()
             if worker is not None:
                 worker.request_priority_flush(scope_key)
         except (ImportError, AttributeError, RuntimeError) as e:
-            # worker 未启动 / API 变更 / 事件循环未就绪
             logger.debug(t("log.memory.trigger_immediate_flush_correction", e=e))
 
 
 def get_observation_queue() -> sync_queue.Queue:
     """供 IngestionWorker 获取队列引用（线程安全的 queue.Queue）"""
     return _observation_queue
+
+
+def snapshot_pending_records(scope_keys: Sequence[str]) -> list[ObservationRecord]:
+    """入队尚未 flush 的观察记录（队列 + worker 缓冲）。检索侧用来补「刚说过还没落库」。"""
+    wanted = frozenset(scope_keys)
+    if not wanted:
+        return []
+    found: list[ObservationRecord] = []
+    seen: set[tuple[str, str, datetime, str]] = set()
+
+    def _take(rec: object) -> None:
+        if not isinstance(rec, ObservationRecord) or rec.scope_key not in wanted:
+            return
+        key = (rec.scope_key, rec.speaker_id, rec.timestamp, rec.raw_content)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(rec)
+
+    with _observation_queue.mutex:
+        for rec in _observation_queue.queue:
+            _take(rec)
+    from gsuid_core.ai_core.memory.startup import peek_ingestion_buffers
+
+    for rec in peek_ingestion_buffers(wanted):
+        _take(rec)
+    found.sort(key=lambda r: r.timestamp)
+    return found
+
+
+def pending_episodes_for_scopes(scope_keys: Sequence[str], *, cap: int = _PENDING_EPISODE_CAP) -> list["Episode"]:
+    """把未落库观察转成 Episode 形，供 dual_route 在 Rerank 之后前置合并。"""
+    from gsuid_core.ai_core.memory.retrieval.types import Episode
+
+    records = snapshot_pending_records(scope_keys)
+    if not records:
+        return []
+    # 只并 HIGH/纠正：闲聊 LOW 占满 cap 会把刚说的地点挤出目录卡。
+    kept = [rec for rec in records if rec.value_tier == "HIGH" or rec.is_correction]
+    chosen = kept[-cap:]
+    episodes: list[Episode] = []
+    for rec in chosen:
+        content = rec.raw_content.strip()
+        if not content:
+            continue
+        ts = rec.timestamp
+        valid_at = ts.isoformat() if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc).isoformat()
+        eid = f"pending:{rec.scope_key}:{int(ts.timestamp() * 1000)}:{len(content)}"
+        episodes.append(
+            {
+                "id": eid,
+                "content": content,
+                "valid_at": valid_at,
+                "scope_key": rec.scope_key,
+                "embedding": [],
+            }
+        )
+    return episodes

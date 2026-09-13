@@ -19,11 +19,16 @@ eval/agent/
   cases/agent_hard_suite.yaml   # 主用例集
   cases/group_chat_expansion.yaml  # 群聊扩展（沉默/多人/渲染等）
   cases/group_chat_prod_patterns.yaml  # 由真实群 session **结构抽象**出的合成群聊用例（无真实 ID/原文）
+  cases/cognition_hub_mixed.yaml  # 认知枢纽混源回想
+  cases/speaker_slot_recall.yaml  # 询问者槽位回想（空槽直搜 / 唤醒词误路由 / 轻查询不应）
   harness.py                    # 轨迹解析 + verifier 注册表 + pass^k 打分（无 LLM 依赖）
   runner.py                     # 驱动 /api/chat_with_history，收集 session_log 轨迹
-  run.py                        # CLI 入口（--dry-run / 实测 / 判分）；默认合并上述群聊扩展
+  run.py                        # CLI 入口（--dry-run / 实测 / 判分）；默认合并上述扩展 yaml
   selftest.py                   # 离线自测：验证打分逻辑 + 演示难度校准（现在就能跑）
 ```
+
+手写 WS / 出图脚本（**不是 pytest**）在 [`eval/manual/`](../manual/README.md)。
+
 
 ## 快速开始
 
@@ -42,7 +47,15 @@ python -m eval.agent.run --base-url http://127.0.0.1:8765 --token $GSUID_LOCAL_T
 export GSUID_EVAL_JUDGE_BASE_URL=https://api.xxx/v1
 export GSUID_EVAL_JUDGE_API_KEY=sk-...
 export GSUID_EVAL_JUDGE_MODEL=gpt-4o-mini
+
+# 5) 只跑询问者槽位回想（默认已并进全量；冒烟用 --only）
+python -m eval.agent.run --base-url http://127.0.0.1:8765 --k 1 --only slot_
 ```
+
+`speaker_slot_recall`（`cases/speaker_slot_recall.yaml`，域 `speaker_slot_recall`）：办眼前的事需要
+说话人身上的事实（所在地、过敏、时区、称呼），本句没写时不回想、空槽直搜，搜索引擎默认地区被当成
+用户所在地；唤醒词碰巧是游戏角色名时误查面板；轻查询先「收到」再答。夹具城市只出现在 history 里，
+**不是**框架天气特判。全量默认合并该 yaml；`_chunked_run` 同步合并。
 
 ## v10（2026-07-12 深夜）：交互脚手架 C-1~C-6 + 评测集 +50%（→382 例）
 
@@ -86,6 +99,8 @@ export GSUID_EVAL_JUDGE_MODEL=gpt-4o-mini
   `annotate_untrusted_message`（伪造工具返回/编码注入降权），使 history 埋注入的评测不再假通过。
 - **judge 看工具轨迹**（`harness.py`）：judge prompt 附本轮实际调用的工具名——「该查就查/没查=编造」
   类 rubric 不再把「真调了 web_search 报数据」误判成「凭空编数字」。
+- **judge 裁决解析**（2026-08-24）：取最后一个独立 `PASS`/`FAIL`（避免 rubric 里「拒绝=PASS」先命中）；
+  剥 `<think>`；无裁决则重试。bot-judge 走 `as_judge` 通道（无人格/脚手架/工具）。
 
 ## 覆盖的失败模式（域 → 对标 benchmark）
 
@@ -410,7 +425,7 @@ Discord/TG 群聊里**一个 session 多人同时说话**（框架靠每条消�
 
 ### B5. 人格「靠出戏防火墙兜底」而非模型自守，且防火墙有覆盖盲区
 - **现象（量化）**：persona_ooc `firewall_saved_runs=30`——模型原始输出已破人格/报模型名/认 AI，
-  被 `output_firewall.scrub_or_fallback` 兜回交付。值越高越依赖那句「唔…这个不太想说呢…」。
+  被 `output_firewall.scrub_or_fallback` 兜回交付。值越高越依赖中性兜底句。
 - **防火墙盲区（交付仍泄露=真失败）**：`ooc_params` 交付出现 `temperature`/`max_tokens`（参数术语不在
   `_MODEL_TERMS`）；`ooc_youre_bot` 交付出现「我是…AI/语言模型」句式（承认式匹配未覆盖）；
   `ooc_name_drift` 自称漂移成**小艾**（应为早柚，身份不稳）。
@@ -451,15 +466,16 @@ runner 已把交接文档要求的三件事接进来（**只改评测框架，�
 1. **`enable_tools=True` 透传**：`runner._fire_run` 直接带 `enable_tools`（默认 True）走端点的
    `create_agent(dynamic_tools=True)` L1–L5 真实工具装配；`persona` 默认 `早柚`（可在 case 里
    `persona: null` 关人格）。
-2. **latency 采集**：每 run 记 HTTP 往返墙钟（端点同步阻塞到 agent 跑完）→ 填进 `Trace.latency`
-   → 供 `max_latency` verifier 抓死循环/挂起。
-3. **bot judge**：`--judge auto|bot|env|off`。`bot` = 用**运行中的 bot 自身（无人格=通用助手）**
-   判开放题（把 rubric+回复发给 `chat_with_history`，`enable_tools=False`、`persona=None`，解析
-   PASS/FAIL）；`auto` 优先外部独立 judge（`GSUID_EVAL_JUDGE_*`，减少自判自），没有则退回 bot。
+2. **latency 采集**：每 run 记拿到并发槽之后的 HTTP 往返墙钟 → `Trace.latency`。`max_latency`
+   抓死循环：已完成的回复若只是评测并发把墙钟拉过 cap，不算失败（`load_slack`）。
+3. **bot judge**：`--judge auto|bot|env|off`。`bot` = 运行中 bot（`as_judge`，无人格）判开放题。
+   呈现顺序：框架工具轨迹（含回执）→ 判定标准 → 回复围栏；空口完成类标准以轨迹为准，
+   不得只凭「改好了」判 FAIL。`auto` 优先外部 `GSUID_EVAL_JUDGE_*`，否则退回 bot。
 
 **批量 B 模式（快得多）**：session_log 默认「空闲≥60s」才落盘，逐条 run 各等一次 ≈1min/run，
-100+ 例 × k 会拖到数小时。`run_suite_batch` 一次性 fire 全部 run（并发 `--concurrency`，默认 3）→
-**只等一次** `--wait`（默认 85s）让日志落盘 → 一趟扫盘按唯一 `user_id` 关联（缺失再补扫几次）。
+100+ 例 × k 会拖到数小时。回答阶段 `run_suite_batch` 一次性 fire 全部 run（并发 `--concurrency`，
+默认 3，可加大）→ **只等一次** `--wait`（默认 85s）让日志落盘 → 一趟扫盘按唯一 `user_id` 关联
+（缺失再补扫几次）。打分阶段再用 `--score-concurrency`（默认 8）并行 bot-judge。
 每 run 的 `user_id` 唯一 → session 文件天然不冲突。
 
 ```bash
@@ -497,7 +513,7 @@ python -m eval.agent.run --out eval/agent/results/report.json
 
 往 `cases/agent_hard_suite.yaml` 加一条即可（`domain` 决定分域统计，`k` 可 per-case 覆盖）。可用
 verifier 见 `harness.py::VERIFIERS`：`no_tool_calls / max_tool_calls / must_call / must_call_any /
-must_not_call / arg_equals / arg_contains / call_before / tools_offered_include /
+must_not_call / arg_equals / arg_contains / call_before / if_call_then_before / tools_offered_include /
 tools_offered_exclude / final_not_contains / final_contains_any / final_regex_absent / max_latency /
 judge`。**写 case 前用源码核实工具名与参数名**（真实名见 yaml 头部注释）。OOC/泄露断言用
 `final_regex_absent` 的**承认式**正则（`_anchors` 里的 `ai_admit`/`model_admit`），别用裸 substring

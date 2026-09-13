@@ -1,6 +1,10 @@
 import asyncio
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock
+from importlib.util import module_from_spec, spec_from_file_location
+
+import pytest
 
 from gsuid_core.models import Event
 from gsuid_core.ai_core.models import ToolContext
@@ -38,7 +42,20 @@ def _ctx(bot, ev: Event, run_id: str = "run-1") -> SimpleNamespace:
     )
 
 
-def test_poke_user_is_a_structured_slim_group_tool() -> None:
+def test_poke_user_is_a_structured_slim_group_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    from gsuid_core.ai_core import register
+    from gsuid_core.ai_core.models import ToolBase
+    from gsuid_core.ai_core.configs.ai_config import ai_config
+
+    # 装饰器在导入时读取总开关；测试不依赖用户配置，也不污染全局注册表。
+    registry: dict[str, dict[str, ToolBase]] = {}
+    monkeypatch.setattr(register, "_TOOL_REGISTRY", registry)
+    monkeypatch.setattr(ai_config.get_config("enable"), "data", True)
+    module_name = "gsuid_core.ai_core.buildin_tools.poke_user"
+    module_path = Path(__file__).resolve().parents[1] / "gsuid_core/ai_core/buildin_tools/poke_user.py"
+    spec = spec_from_file_location(module_name, module_path)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(module_from_spec(spec))
     tool_base = find_tool_base("poke_user")
 
     assert tool_base is not None

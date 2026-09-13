@@ -1,7 +1,7 @@
 """``gscore.planning_context``：长任务文案 + ``has_actionable`` 抬档。
 
-``has_actionable`` 会把 CheapGate 从 light 抬回 full（避免轻量回丢掉 Kanban），
-所以它是**套件写、内核读**的一个控制位，走 ``set_has_actionable`` 能力票。
+``has_actionable`` 会把 CheapGate 从低好感静音抬回 full（避免丢掉在途 Kanban），
+所以它是**套件写、内核读**的控制位。H03 只写旗（CheapGate 在 H05 前）；H06 再灌长任务文案。
 
 长任务编排的 bring-up 归 ``startup._INIT_STEPS``，本套件不带 ``init_step``（否则同一个
 初始化每次启动跑两遍）。
@@ -14,19 +14,39 @@ from gsuid_core.ai_core.kits.registry import register_agent_kit
 
 class PlanningContextKit(AgentKit):
     def register(self) -> None:
+        on_agent_hook(AgentHookPoint.CLASSIFY, priority=80, kit_id=self.kit_id)(self.mark_actionable)
         on_agent_hook(AgentHookPoint.COMPOSE_CONTEXT, priority=160, kit_id=self.kit_id)(self.inject)
 
+    async def mark_actionable(self, ctx: AgentHookContext) -> None:
+        """H03：只写旗，给第一道 CheapGate。文案仍走 H06。"""
+        await self._flag_actionable(ctx)
+
+    async def _flag_actionable(self, ctx: AgentHookContext) -> None:
+        if not ctx.user_id or ctx.has_actionable:
+            return
+        from gsuid_core.ai_core.planning.context import has_actionable_task
+
+        if await has_actionable_task(ctx.user_id, current_group_id=ctx.group_id):
+            ctx.set_has_actionable(True)
+
     async def inject(self, ctx: AgentHookContext) -> None:
-        from gsuid_core.ai_core.planning.context import build_task_context, has_actionable_task
+        from gsuid_core.ai_core.planning.context import build_task_context
 
         if not ctx.user_id:
             return
+        await self._flag_actionable(ctx)
         text = await build_task_context(ctx.user_id, current_group_id=ctx.group_id)
-        if await has_actionable_task(ctx.user_id, current_group_id=ctx.group_id):
-            ctx.set_has_actionable(True)
         if text:
             # 他群任务已在 build_task_context 内脱敏
             ctx.set_context_block("task", text)
+        from gsuid_core.ai_core.pocket_planner import compose_plan_hint, should_plan_first
+        from gsuid_core.ai_core.capability_agents.evaluator import get_recent_evaluation
+
+        # 近 1h 评估且与本句目标重叠才算延续；有在途任务不等于本句要规划。
+        recent_eval = bool(ctx.user_id and get_recent_evaluation(ctx.user_id, ctx.query) is not None)
+        if should_plan_first(ctx.query, recent_eval=recent_eval):
+            hint = await compose_plan_hint(ctx.query, ctx.user_id)
+            ctx.set_context_block("plan_hint", hint)
 
 
 KIT = register_agent_kit(

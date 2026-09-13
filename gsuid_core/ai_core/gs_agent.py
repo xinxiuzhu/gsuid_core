@@ -9,6 +9,7 @@ import uuid
 import base64
 import asyncio
 from typing import Any, List, Tuple, Union, Literal, TypeVar, Callable, Optional, Sequence, overload
+from datetime import datetime
 
 import httpx
 from pydantic_ai import Agent
@@ -53,6 +54,7 @@ from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.rag.tools import (
     ToolList,
 )
+from gsuid_core.ai_core.prefix_probe import PrefixSnapshot
 from gsuid_core.ai_core.configs.models import (
     AnyModel,
     get_model_for_task,
@@ -120,9 +122,11 @@ from gsuid_core.ai_core.agent_run.support import (  # noqa: E402
     _correction_nudge_markers,
     _format_capability_roster,
     _tool_return_looks_failed,
+    usage_limit_return_payload,
     _tool_return_is_async_pending,
     _pool_overlaps_capability_agent,
     _tool_call_targets_render_agent,
+    _tool_return_is_effectual_write,
     _capability_exclusive_tool_names,
     _matched_delegation_only_profile,
     _update_thrash_streak_for_response,
@@ -162,6 +166,8 @@ _ = (
     _pool_overlaps_capability_agent,
     _tool_call_targets_render_agent,
     _tool_return_is_async_pending,
+    _tool_return_is_effectual_write,
+    usage_limit_return_payload,
     _tool_return_looks_failed,
     _update_thrash_streak_for_response,
     reset_budget_scope_context,
@@ -276,6 +282,10 @@ class GsCoreAIAgent(RunOnceMixin):
         _max_history: int = max_history if max_history is not None else ai_config.get_config("agent_max_history").data
         _max_tokens: int = max_tokens if max_tokens is not None else ai_config.get_config("agent_max_tokens").data
         self.history: List[ModelMessage] = []
+        self._prefix_snapshot: Optional["PrefixSnapshot"] = None
+        self._session_toolset_frozen: Optional[List[str]] = None
+        self._session_toolset_tags: Optional[frozenset[str]] = None
+        self._session_appended_tools: List[str] = []
         self.max_history = _max_history
         self.system_prompt = system_prompt
         # 稳定前缀构建时刻：ai_router 按 TTL 原地刷新 system_prompt（O-3 慢变上下文防僵化）
@@ -287,6 +297,8 @@ class GsCoreAIAgent(RunOnceMixin):
         self._cancel_generation = asyncio.Event()
         # 当前锁内是否在跑框架回灌：与真人消息互不 supersede，只排队
         self._running_framework: bool = False
+        # iter 进行中禁止 compact 换掉 self.history（与 pydantic-ai 共用同一 list）
+        self._history_iter_active: bool = False
         # 4.7 supersede 交接语已删：在途根任务由 build_task_context 每轮从库注入。
         self.max_tokens = _max_tokens
         self.max_iterations = max_iterations  # 自定义迭代次数限制，None时使用配置默认值
@@ -299,6 +311,9 @@ class GsCoreAIAgent(RunOnceMixin):
         self.task_level: Literal["high", "low"] = task_level  # 任务级别，用于选择对应的模型配置
 
         self.create_by = create_by
+        # 本 run 出站模式 / 用量分类；run() 入口写入，纠正轮读同一份
+        self._outbound_stream: bool = False
+        self._stats_chat_type: str = ""
         # 能力代理 node_id（仅 CapabilityAgent）；契约/日志用，勿靠 session 子串猜
         self.capability_node_id: str = (capability_node_id or "").strip()
         # 未显式给 session_id 的来源（能力评估 / meme 打标 / 记忆摄入·检索等后台 LLM
@@ -315,6 +330,8 @@ class GsCoreAIAgent(RunOnceMixin):
         # 五层自动装配（dynamic 能力族）开关：True=每轮装配并与显式 tools 合并；
         # False=永不装配；None=沿用旧门（create_by ∈ _AGENTIC_CREATE_BY 且未传 tools）。
         self.dynamic_tools: Optional[bool] = dynamic_tools
+        # 本轮显式时钟（评测 HTTP clock_at）。生产 WS 为 None，检索回落墙上时钟。
+        self.turn_clock: Optional[datetime] = None
         # 预算归属 scope：(group_id, user_id, bot_id)。ev 缺失的自主入口经 bind_budget_scope
         # 显式绑定，使 Token 记入对应 Session 额度并受闸门约束；None=未绑定，回退 contextvar。
         self._budget_scope: Optional[Tuple[str, str, str]] = None
@@ -341,6 +358,7 @@ class GsCoreAIAgent(RunOnceMixin):
         self._last_attempt_image_sent: bool = False
         self._last_attempt_pending_async: bool = False
         self._last_attempt_has_status_tool: bool = False
+        self._last_attempt_thinking: str = ""
         # C-2 漂移预算的上轮计数：只在计数**增加**时注入提醒，防一次 push 滞留
         # recent 窗口导致后续每轮重复唠叨（会话级状态，正是"预算"的容器）。
         self._last_drift_push_count: int = 0
@@ -377,10 +395,16 @@ class GsCoreAIAgent(RunOnceMixin):
         """
         return bool(self._run_sent_texts)
 
+    @property
+    def last_run_visible_texts(self) -> tuple[str, ...]:
+        """本轮已出站的可见台词（插入序）。评测 HTTP 在 SILENCE 返回时拼回这条。"""
+        return tuple(self._run_sent_texts)
+
     def _emit_trace(self, kind: TraceKind, text: str) -> None:
         """把模型思考 / 工具调用轨迹推给观察者（``on_trace``）。
 
         ``kind="tool"`` 的 text 形如 ``"<工具名>|<参数JSON>"``。
+        ``kind="thinking_delta"`` 为流式思考增量；``tool_result`` 为工具返回。
 
         宿主可据此把"Agent 在想什么、调了什么工具"实时呈现给用户
         （例如前端「思考过程」折叠块），而不必去翻 session log 文件。
@@ -420,8 +444,7 @@ class GsCoreAIAgent(RunOnceMixin):
            主 Agent 不会"对自己刚说过的话失忆"。
         2. 同步在 session_logger 记一条 `proactive_emission` entry，前端可按
            source 分桶展示。
-        3. 调用 extract_history()，复用 `_drop_orphan_tool_results` 兜底，
-           防止裸 TextPart 触发 pydantic_ai message_history 自洽性问题。
+        3. 非 iter 中才 compact；iter 内只追加，避免与 pydantic-ai 分叉。
 
         参考：plans/proactive_message_session_unification_20260529.md §3.5
         """
@@ -445,7 +468,10 @@ class GsCoreAIAgent(RunOnceMixin):
         - system_prompt 会话内只建一次、只追加契约到 user 侧（见 loop UserPromptPart）；
         - history 头部字节跨 compact 不变（``compact_session_history`` / keep_prefix）；
         - 禁止把角色锚点等消息插回头部（会整体平移前缀）。
+        iter 中途换 list 会让下一跳 ModelRequest 与缓存分叉，禁止。
         """
+        if self._history_iter_active:
+            return
         before: int = len(self.history)
         self.history, did_truncate = compact_session_history(
             self.history,
@@ -527,6 +553,58 @@ class GsCoreAIAgent(RunOnceMixin):
             return True
         return isinstance(item, BinaryContent) and str(item.media_type or "").startswith("video/")
 
+    @staticmethod
+    def _is_native_video_part(item: UserContent) -> bool:
+        """已转成可直投模型的视频 file（不含图片 BinaryContent）。"""
+        if isinstance(item, BinaryContent):
+            return str(item.media_type or "").startswith("video/")
+        if isinstance(item, UploadedFile):
+            return str(item.media_type or "").startswith("video/")
+        return False
+
+    def _routed_provider(self) -> str:
+        """本轮实际模型的 provider，不用任务主配置（failover 后会不同）。"""
+        from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+        from pydantic_ai.models.anthropic import AnthropicModel
+
+        from gsuid_core.ai_core.configs.models import (
+            get_provider_for_task,
+            parse_provider_config_name,
+        )
+
+        name = self._active_config_name or self.model_config_name
+        if name:
+            return parse_provider_config_name(name)[0]
+        model = self.model
+        if isinstance(model, (OpenAIChatModel, OpenAIResponsesModel)):
+            return "openai"
+        if isinstance(model, AnthropicModel):
+            return "anthropic"
+        if model is not None:
+            return "gemini"
+        return get_provider_for_task(self.task_level)
+
+    def _routed_model_support(self, fallback: str | list[str]) -> str | list[str]:
+        """本轮实际配置的 model_support；无配置文件时用调用方传入值。"""
+        from gsuid_core.ai_core.configs.models import get_model_config_by_full_name
+
+        name = self._active_config_name or self.model_config_name
+        if not name:
+            return fallback
+        data = get_model_config_by_full_name(name).get_config("model_support").data
+        if isinstance(data, list):
+            return [str(x) for x in data]
+        if isinstance(data, str):
+            return data
+        return fallback
+
+    def _model_declares_video(self) -> bool:
+        """当前路由配置是否声明 video。无配置文件时偏可见（True）。"""
+        name = self._active_config_name or self.model_config_name
+        if not name:
+            return True
+        return "video" in self._routed_model_support("")
+
     async def _video_item_to_bytes(self, item: UserContent) -> tuple[bytes, str]:
         """视频内容项 → (字节, mime)。"""
         if isinstance(item, BinaryContent):
@@ -534,40 +612,61 @@ class GsCoreAIAgent(RunOnceMixin):
         assert isinstance(item, VideoUrl)
         return await fetch_video_bytes(item.url)
 
+    async def _frames_from_video_bytes(self, data: bytes, mime: str, video_idx: int) -> list[UserContent]:
+        from gsuid_core.ai_core.multimodal.frame_extract import extract_frames_ffmpeg
+
+        video_format = mime.split("/")[-1] or "mp4"
+        frames = await extract_frames_ffmpeg(data, video_format=video_format, interval_seconds=2.0)
+        result: list[UserContent] = [
+            f"--- 视频{video_idx} 抽帧（每 2 秒 1 帧，共 {len(frames)} 帧，按时间顺序排列）---"
+        ]
+        for frame in frames:
+            b64 = base64.b64encode(frame).decode("ascii")
+            result.append(ImageUrl(url=f"data:image/jpeg;base64,{b64}"))
+        logger.info(
+            i18n_t(
+                "log.agent.video_frame_sampled_images",
+                p0=video_idx,
+                p1=len(frames),
+            )
+        )
+        return result
+
     async def _prepare_video_content(
         self,
         content_list: list[UserContent],
-        model_support: str,
+        model_support: str | list[str],
     ) -> list[UserContent]:
-        """视频内容项的三分支兼容处理（在图片分支**之前**执行）。
+        """视频内容项转换（在图片分支**之前**执行）。
 
-        pydantic_ai 的 OpenAI/Anthropic 模型不接受 VideoUrl——若原样留在
-        message_history 里，请求时直接抛错且每轮重发都会复现。因此视频项必须
-        在入历史前就地转换为该 provider 可消费的形式：
-
-        - **gemini + 支持 video**：经 Gemini File API 上传到 Google 服务器，
-          转为 ``UploadedFile(file_id=<file_uri>, provider_name="google-gla")``
-          按引用传递（文件在 Google 侧保留 48h，超长会话中过期后重发会报错）；
-          已是 Files API URI 的 VideoUrl 直接转引用，不重复上传。
-        - **非 gemini + 支持 video（且支持 image）**：本地 ffmpeg 每 2 秒抽一帧，
-          转成 ImageUrl(base64 DataURI) 列表塞进 messages（帧数上限见
-          ``frame_extract.DEFAULT_MAX_FRAMES``，超限等距采样）。
-        - **不支持 video**：替换为文本占位说明，模型至少知道"这里有个视频"。
-
-        任一视频处理失败只影响该视频（替换为失败说明文本），不阻断整条消息。
+        IM 视频不要喂 VideoUrl（Gemini 只认 YouTube / Files URI）。字节按实际
+        路由模型投递：gemini Files API、openai ``type=file``、否则抽帧或文本占位。
+        ``/v1/files`` 缺失时禁止无界 base64。
         """
         if not any(self._is_video_item(item) for item in content_list):
             return content_list
 
-        from gsuid_core.ai_core.configs.models import get_provider_for_task
+        from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
+
         from gsuid_core.ai_core.multimodal.gemini_files import (
             is_gemini_file_uri,
             upload_media_for_task,
         )
+        from gsuid_core.ai_core.multimodal.openai_files import (
+            video_delivery_mode,
+            video_bytes_to_openai_content,
+            openai_files_client_from_model,
+        )
 
-        provider = get_provider_for_task(self.task_level)
+        model_support = self._routed_model_support(model_support)
+        provider = self._routed_provider()
         supports_video = "video" in model_support
         supports_image = "image" in model_support
+        mode = video_delivery_mode(
+            supports_video=supports_video,
+            supports_image=supports_image,
+            provider=provider,
+        )
 
         result: list[UserContent] = []
         video_idx = 0
@@ -577,17 +676,19 @@ class GsCoreAIAgent(RunOnceMixin):
                 continue
             video_idx += 1
 
-            if not supports_video:
-                logger.warning(i18n_t("log.agent.declare_video_analysis_capability"))
-                result.append(f"--- 视频{video_idx}: [当前模型不支持视频分析，无法查看该视频内容] ---")
+            if mode == "unavailable":
+                if supports_video:
+                    logger.warning(i18n_t("log.agent.declared_video_image_frame"))
+                    result.append(f"--- 视频{video_idx}: [当前模型无法读取该视频内容] ---")
+                else:
+                    logger.warning(i18n_t("log.agent.declare_video_analysis_capability"))
+                    result.append(f"--- 视频{video_idx}: [当前模型无法读取该视频内容] ---")
                 continue
 
             try:
-                if provider == "gemini":
-                    # ⚠️ media_type 必传：Files API URI 无扩展名，pydantic_ai 猜不出
-                    # mime 会按 application/octet-stream 发送，Gemini 直接 400
+                if mode == "gemini":
+                    # media_type 必传：Files API URI 无扩展名，缺 mime 会 400
                     if isinstance(item, VideoUrl) and is_gemini_file_uri(item.url):
-                        # 已是 Files API 引用：直接转 UploadedFile，不重复上传
                         result.append(
                             UploadedFile(file_id=item.url, provider_name="google-gla", media_type="video/mp4")
                         )
@@ -597,28 +698,49 @@ class GsCoreAIAgent(RunOnceMixin):
                     result.append(UploadedFile(file_id=file_uri, provider_name="google-gla", media_type=mime))
                     continue
 
-                # 非 gemini：抽帧兼容路径要求模型至少能看图
-                if not supports_image:
-                    logger.warning(i18n_t("log.agent.declared_video_image_frame"))
-                    result.append(f"--- 视频{video_idx}: [当前模型不支持图片，无法用抽帧方式分析该视频] ---")
+                if mode == "openai_file":
+                    data, mime = await self._video_item_to_bytes(item)
+                    client = None
+                    if isinstance(self.model, (OpenAIChatModel, OpenAIResponsesModel)):
+                        client = openai_files_client_from_model(self.model)
+                    # Responses 父类不 map video BinaryContent，禁止 inline
+                    allow_inline = not isinstance(self.model, OpenAIResponsesModel)
+                    converted, how = await video_bytes_to_openai_content(data, mime, client, allow_inline=allow_inline)
+                    size_mb = len(data) / 1024 / 1024
+                    if how == "files_missing" or converted is None:
+                        logger.warning(
+                            i18n_t(
+                                "log.agent.video_openai_files_missing",
+                                p0=video_idx,
+                                size=size_mb,
+                            )
+                        )
+                        if supports_image:
+                            result.extend(await self._frames_from_video_bytes(data, mime, video_idx))
+                        else:
+                            result.append(f"--- 视频{video_idx}: [当前模型无法读取该视频内容] ---")
+                        continue
+                    result.append(converted)
+                    if how == "uploaded" and isinstance(converted, UploadedFile):
+                        logger.info(
+                            i18n_t(
+                                "log.agent.video_openai_file_uploaded",
+                                p0=video_idx,
+                                file_id=converted.file_id,
+                            )
+                        )
+                    else:
+                        logger.info(
+                            i18n_t(
+                                "log.agent.video_openai_file_inline",
+                                p0=video_idx,
+                                size=size_mb,
+                            )
+                        )
                     continue
 
-                from gsuid_core.ai_core.multimodal.frame_extract import extract_frames_ffmpeg
-
                 data, mime = await self._video_item_to_bytes(item)
-                video_format = mime.split("/")[-1] or "mp4"
-                frames = await extract_frames_ffmpeg(data, video_format=video_format, interval_seconds=2.0)
-                result.append(f"--- 视频{video_idx} 抽帧（每 2 秒 1 帧，共 {len(frames)} 帧，按时间顺序排列）---")
-                for frame in frames:
-                    b64 = base64.b64encode(frame).decode("ascii")
-                    result.append(ImageUrl(url=f"data:image/jpeg;base64,{b64}"))
-                logger.info(
-                    i18n_t(
-                        "log.agent.video_frame_sampled_images",
-                        p0=video_idx,
-                        p1=len(frames),
-                    )
-                )
+                result.extend(await self._frames_from_video_bytes(data, mime, video_idx))
             except Exception as e:
                 logger.error(i18n_t("log.agent.process_video", p0=video_idx, e=e))
                 result.append(f"--- 视频{video_idx}: [视频处理失败: {e}] ---")
@@ -631,10 +753,11 @@ class GsCoreAIAgent(RunOnceMixin):
         """处理用户消息中的图片/视频内容
 
         当 user_message 为 Sequence[UserContent] 时，检查其中是否包含多模态内容。
-        视频项先经 :meth:`_prepare_video_content` 三分支转换（gemini 直传 /
-        抽帧兼容 / 占位说明）；随后根据当前模型的 model_support 配置处理图片：
+        视频项先经 :meth:`_prepare_video_content` 转换（gemini / openai file /
+        抽帧 / 占位）；随后根据当前模型的 model_support 配置处理图片：
         - 模型支持图片：保留 ImageUrl，返回 list[UserContent]
-        - 模型不支持图片：调用 understand_image 将图片转述为文本，合并到文本消息中
+        - 模型不支持图片：图片转述为文本；只保留视频 file，图片 BinaryContent 丢弃；
+          无法投喂的视频改成「无法读取」文本。
 
         Args:
             content_list: 用户消息内容列表
@@ -662,7 +785,14 @@ class GsCoreAIAgent(RunOnceMixin):
 
         if "image" in model_support:
             # 模型支持图片，保留原始内容；
+            from gsuid_core.ai_core.persona.appearance import (
+                bytes_from_image_ref,
+                format_look_identity_note,
+            )
+
             result: list[UserContent] = []
+            notes: list[str] = []
+            seen_notes: set[str] = set()
             for item in content_list:
                 if isinstance(item, str):
                     result.append(f"[用户发言]\n{item}")
@@ -674,8 +804,19 @@ class GsCoreAIAgent(RunOnceMixin):
                         logger.warning(i18n_t("log.agent.image_materialization_adding_history", p0=item.url[:120]))
                         continue
                     result.append(ImageUrl(url=url))
+                    if self.persona_name:
+                        note = format_look_identity_note(self.persona_name, bytes_from_image_ref(url))
+                        if note and note not in seen_notes:
+                            seen_notes.add(note)
+                            notes.append(note)
                 else:
                     result.append(item)
+            if notes:
+                joined = "\n".join(notes)
+                if result and isinstance(result[0], str):
+                    result[0] = f"{result[0]}\n{joined}"
+                else:
+                    result.insert(0, joined)
             return result
 
         # 模型不支持图片，调用图片理解模块转述
@@ -683,12 +824,26 @@ class GsCoreAIAgent(RunOnceMixin):
             logger.info(i18n_t("log.agent.imgund_images_image_paraphrasing", p0=len(image_urls)))
             # 用户问题：用于把冗长的图片描述按需精简到与问题相关的部分
             user_question = "\n".join(text_parts).strip()
+            from gsuid_core.ai_core.persona.appearance import (
+                bytes_from_image_ref,
+                format_look_identity_note,
+            )
+
             descriptions: list[str] = []
             for idx, url in enumerate(image_urls):
                 try:
-                    description = await understand_image(image_url=url, parent_session_id=self.session_id)
+                    description = await understand_image(
+                        image_url=url,
+                        parent_session_id=self.session_id,
+                        persona_name=self.persona_name,
+                    )
                     description = await self._summarize_image_description(description, user_question)
-                    descriptions.append(f"图片{idx + 1}: {description}")
+                    line = f"图片{idx + 1}: {description}"
+                    if self.persona_name:
+                        note = format_look_identity_note(self.persona_name, bytes_from_image_ref(url))
+                        if note:
+                            line = f"{line}\n{note}"
+                    descriptions.append(line)
                 except Exception as e:
                     logger.error(i18n_t("log.agent.imgund_understand_image", p0=idx + 1, e=e))
                     descriptions.append(f"图片{idx + 1}: [图片理解失败]")
@@ -698,7 +853,17 @@ class GsCoreAIAgent(RunOnceMixin):
                 text_parts.append(image_text)
 
         combined = "\n".join(text_parts) if text_parts else ""
-        return f"[用户发言]\n{combined}"
+        native_videos = [item for item in content_list if self._is_native_video_part(item)]
+        if not native_videos:
+            if any(self._is_video_item(item) for item in content_list):
+                if combined:
+                    combined = f"{combined}\n用户发送了视频，但当前模型无法读取视频内容。"
+                else:
+                    combined = "用户发送了视频，但当前模型无法读取视频内容。"
+            return f"[用户发言]\n{combined}"
+        mixed: list[UserContent] = [f"[用户发言]\n{combined}"]
+        mixed.extend(native_videos)
+        return mixed
 
     async def _summarize_image_description(
         self,
@@ -1024,27 +1189,28 @@ class GsCoreAIAgent(RunOnceMixin):
         bot: Bot,
         ev: Optional[Event],
     ) -> None:
-        """出戏命中后的重说闭环：轻量重写一次，产物放行；history 脏文替换。"""
+        """出戏命中且本轮没有下一轮请求：把系统提醒交给模型自判，按它的正文发送。"""
         original = "\n\n".join(text for text, _ in blocked)
         first_hit = blocked[0][1]
         rewrite_message = (
             f"{output_firewall.build_rewrite_warning(first_hit)}\n\n"
-            f"【被拦下的原文】\n{original}\n\n"
-            "请保持原意、用你的角色口吻重写这段话，直接输出重写后的内容，不要解释。"
+            f"【待判断的原文】\n{original}\n\n"
+            "请自主判断后直接输出要发给用户的内容："
+            "不是出戏就原样或微调；是暴露自身身份再用角色口吻改写。不要解释。"
         )
         rewritten = await self._lightweight_text_rewrite(rewrite_message)
+        _ooc_fb = output_firewall.fallback_ooc_text(self.persona_name)
+        _hard = first_hit.category in output_firewall.NEVER_RELEASE_CATEGORIES
         if not rewritten:
-            rewritten = output_firewall.PERSONA_FALLBACK_TEXT
-        if first_hit.category in output_firewall.NEVER_RELEASE_CATEGORIES:
+            rewritten = _ooc_fb if _hard else original
+        if _hard:
             _user_text = ev.raw_text if ev is not None and ev.raw_text else ""
             _recheck = output_firewall.check_ooc(rewritten, user_text=_user_text)
             if _recheck is not None and _recheck.category in output_firewall.NEVER_RELEASE_CATEGORIES:
                 logger.warning(i18n_t("log.agent.firewall_rewrite_output_hit_non"))
-                rewritten = output_firewall.PERSONA_FALLBACK_TEXT
+                rewritten = _ooc_fb
         if angle_bracket_guard.has_illegal_angle_tags(rewritten):
-            rewritten = (
-                angle_bracket_guard.sanitize_illegal_angle_tags(rewritten) or output_firewall.PERSONA_FALLBACK_TEXT
-            )
+            rewritten = angle_bracket_guard.sanitize_illegal_angle_tags(rewritten) or (_ooc_fb if _hard else original)
         self._session_logger.log_text_output(rewritten)
         try:
             await send_chat_result(bot, rewritten, ev=ev, ooc_check=False)
@@ -1183,9 +1349,12 @@ class GsCoreAIAgent(RunOnceMixin):
         if hit is None:
             return text
         if hit.category == "machine_dump":
-            return output_firewall.MACHINE_FALLBACK_TEXT
-        # never-release 与其它 OOC：收尾单次路径用角色兜底，避免 ooc_check=False 漏放
-        return output_firewall.PERSONA_FALLBACK_TEXT
+            return output_firewall.fallback_machine_text(self.persona_name)
+        if hit.category in output_firewall.NEVER_RELEASE_CATEGORIES:
+            return output_firewall.fallback_ooc_text(self.persona_name)
+        if hit.category in output_firewall.SOFT_JUDGE_CATEGORIES:
+            return text
+        return output_firewall.fallback_ooc_text(self.persona_name)
 
     async def _resolve_output_gate_after_run(
         self,
@@ -1292,6 +1461,8 @@ class GsCoreAIAgent(RunOnceMixin):
         turn_graph: Optional[TurnGraph] = None,
         cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
+        outbound_stream: bool = False,
+        stats_chat_type: Optional[str] = None,
     ) -> str: ...
 
     @overload
@@ -1313,6 +1484,8 @@ class GsCoreAIAgent(RunOnceMixin):
         turn_graph: Optional[TurnGraph] = None,
         cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
+        outbound_stream: bool = False,
+        stats_chat_type: Optional[str] = None,
     ) -> _T: ...
 
     async def run(
@@ -1332,6 +1505,8 @@ class GsCoreAIAgent(RunOnceMixin):
         turn_graph: Optional[TurnGraph] = None,
         cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
+        outbound_stream: bool = False,
+        stats_chat_type: Optional[str] = None,
     ) -> object:
         """
         运行 Agent 并返回结果
@@ -1353,23 +1528,26 @@ class GsCoreAIAgent(RunOnceMixin):
             budget_gate: 本次 run 是否为预算入口。True（巡检 / proactive / 定时等自主调用）
                 时超额直接早退、绝不花费 Token；交互被动路径已在 handle_ai 提前闸门，按默认
                 False 只记账不二次拦截。无论是否拦截，可归属 scope 的 Token 都会记账。
-            suppress_intermediate_text: True 时，本轮中**只要出现过 ToolCallPart**，其前后伴随的
-                文本片段都不会发送给用户，仅保留没有任何工具调用的最终文本回复。
-                用于多工具编排场景，避免中间步骤的碎碎念刷屏。
+            suppress_intermediate_text: True 时，本轮中**只要出现过函数 ToolCallPart**，其前后
+                伴随的规划/内心 OS 默认不发送。例外：主人格尚未出站过的一句接任务应仍发送
+                一次（不按 12 字；结构垃圾仍压）。无工具的最终回复照常发送。
             turn_graph: 入口构建的 TurnGraph（可选）；缺省时在装配层现场构建。
-            cheap_gate: CheapGate 成本档（可选）；驱动 light 零工具 / 群聊瘦保底。
+            cheap_gate: CheapGate 成本档（可选）；驱动群聊瘦保底。
+            outbound_stream: True=可见文本按 delta 出站；False=等完整 TextPart。
+                与 pydantic-ai ``node.stream()``（TTFT/TPS）正交。
+            stats_chat_type: Token 用量分类；空则用 ``create_by``。HTTP 入口传 Http_Chat。
 
         Returns:
             Agent 执行结果。默认返回 str，当 output_type 指定时返回对应模型实例
         """
-        # A: 同 Session 抢答——仅「真人 vs 真人」才 cancel；
-        # 框架回灌与真人互不 supersede（排队等锁），避免交付被闲聊顶掉 / 回灌打断用户。
+        self._outbound_stream = outbound_stream
+        self._stats_chat_type = stats_chat_type if stats_chat_type else ""
+        # 同 Session 后到消息排队等锁，不再 cancel 进行中的工具轮。
         if self.create_by in _INTERACTIVE_CREATE_BY and self._run_lock.locked():
             if is_framework_injection or self._running_framework:
                 logger.info(i18n_t("log.agent.supersede_skip_framework_queue"))
             else:
-                self._cancel_generation.set()
-                logger.info(i18n_t("log.agent.supersede_cancel_current"))
+                logger.info(i18n_t("log.agent.supersede_queue_wait"))
 
         async with self._run_lock:
             logger.info(i18n_t("log.agent.acquired_lock"))
@@ -1539,7 +1717,7 @@ def create_agent(
     dynamic_tools: Optional[bool] = None,
     scope_key: Optional[str] = None,
     wall_clock_budget: Optional[float] = None,
-    on_trace: Optional[Callable[[str, str], None]] = None,
+    on_trace: Optional[Callable[[TraceKind, str], None]] = None,
     capability_node_id: Optional[str] = None,
 ) -> GsCoreAIAgent:
     """
@@ -1560,9 +1738,9 @@ def create_agent(
         wall_clock_budget: C-4 墙钟软预算(秒)覆写。None=沿用全局 scaffold_wall_clock_budget(默认 45s，
             按聊天回复标定)；<=0=关闭软预算。长流程编排入口（一轮几十次工具调用、还要等人确认）
             必须显式放宽，否则会在半途被"停止新工具轮"提示逼停
-        on_trace: 轨迹观察者 `on_trace(kind, text)`，kind ∈ {"thinking","tool"}（tool 的 text 为
-            `"<工具名>|<参数JSON>"`）。宿主用它把模型推理与工具调用实时呈现给用户
-            （如前端「思考过程」折叠块）。旁路钩子，异常会被吞掉，不影响 run
+        on_trace: 轨迹观察者 `on_trace(kind, text)`，kind ∈ TraceKind
+            ``thinking`` / ``thinking_delta`` / ``tool`` / ``tool_result``。
+            ``tool`` 的 text 为 ``"<工具名>|<参数JSON>"``。旁路钩子，异常不影响 run
 
     Returns:
         PydanticAIAgent 实例

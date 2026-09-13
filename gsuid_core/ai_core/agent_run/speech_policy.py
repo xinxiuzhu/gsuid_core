@@ -3,8 +3,9 @@
 与业务域词表无关；用 turn 来源、交付态、句式结构判定。
 
 期望阶段（长信息任务）：
-1 接任务可短应 → 2 检索/委派决策不发言 → 3 委派前一句「会比较久」
-→ 4/5/6 子代理静默 → 7 发图后一句收尾。
+1 重任务接任务必须短应 → 2 检索/委派不发言 → 3 委派前后默认 SILENCE
+→ 4/5/6 子任务静默 → 7 发图后一句收尾。
+轻查询不先应，干完再开口。
 """
 
 from __future__ import annotations
@@ -28,8 +29,8 @@ SpeechPolicy = Literal[
     "delivered",
 ]
 
-# 单轮主通道可见台词上限（兜底；DELIVERED 终局态落地后主要是防多 TextPart 刷屏）
-MAIN_CHANNEL_VISIBLE_LIMIT = 3
+# 单轮主通道可见台词上限默认（配置 main_channel_visible_limit 覆盖）
+MAIN_CHANNEL_VISIBLE_LIMIT = 2
 
 # 用户追问进度：疑问/催促闭类（非业务域）
 _STATUS_INQUIRY_RE = re.compile(
@@ -52,7 +53,7 @@ _PREMATURE_DELIVERY_RE = re.compile(
 # 空交付 / 摆烂：声称**已有材料**却不出图、推给用户「再喊我」（须配合 fact_pack_pending）
 _EMPTY_HANDOFF_RE = re.compile(
     r"(念不(动|完|下)|懒得念|太长了.{0,10}(不|懒|念)|"
-    r"卷轴里|记着呢|全(都)?(记|在)(着|里|呢)|细节(全)?在|"
+    r"记着呢|全(都)?(记|在)(着|里|呢)|细节(全)?在|"
     r"要哪段|再喊我|有点印象|"
     r"全记着|都在里面了(?!…?图)|"
     r"先睡了.{0,8}$)",
@@ -98,20 +99,30 @@ def looks_like_delivery_status_narration(text: str) -> bool:
     return _DELIVERY_REPORT_RE.search(body) is not None
 
 
-# 等待安慰 / 委派前「会比较久」声明（步骤 3）
+# 在途极短安慰额度（委派后的第二句起）。不定死话术；过程动词/第二执行者/清单仍拦。
+IN_FLIGHT_SPEECH_MAX = 12
+# 开场接任务应：不按 12 字卡。默认对齐人格 speech_len_hard；结构垃圾才拦。
+FIRST_ACK_SPEECH_MAX = 150
+# 仍算等待句（测试/旧会话），但不是唯一合法出口。
+IN_FLIGHT_WAIT_TEMPLATES: tuple[str, ...] = ("马上好。", "嗯，在弄了。")
+_INFLIGHT_PROCESS_VERB_RE = re.compile(r"(还在(渲|画|跑|查)|在渲|查中|还没(画|渲|写)好)")
+
+# 等待安慰 / 第一人称「这就去办」（不是第二个执行者）
 _WAIT_COMFORT_RE = re.compile(
     r"(等(一?下|会|会儿)|稍等|先等|等我|慢点|"
     r"(画|翻|弄|查|整).{0,6}(一下|会儿)|"
     r"先(翻|画|弄)|马上|很快|"
+    r"这就(去|来)?(翻|弄|查|办|看|整)|"
     r"(比较|有点|会)?(久|慢|费时|花(点|些)?时间)|"
     r"耐心|等着|先等着|得翻|得查|得弄|翻会儿|查会儿|"
     r"别急|慢慢|稍后|等等我)",
     re.IGNORECASE,
 )
 
-# 编排元话语：叙述内部 worker（结构=让 X 去/做 + 拉丁标识）
+# 编排元话语：叙述内部 worker（让/叫/派 + 非自称 + 去；或拉丁节点名）
 _ORCHESTRATION_NARRATION_RE = re.compile(
     r"(让|叫|派)\s*[A-Za-z][A-Za-z0-9_]{2,}\s*(去|来|出|画|渲|跑|执行|处理)|"
+    r"(让|叫|派)\s*(?!我|自己|你)([^\s，。！？、]{1,8})\s*去|"
     r"\b(render_agent|research_agent|create_subagent|agent_profile)\b|"
     r"\brender\b.{0,6}(出|画|渲)|"
     r"(出|画|渲).{0,6}\brender\b",
@@ -122,7 +133,10 @@ _ORCHESTRATION_NARRATION_RE = re.compile(
 _OPEN_SOLICIT_RE = re.compile(
     r"(要不要我|要不要|需不需要|还要我|要我再|要我继续|要我换|要我帮|"
     r"要不要继续|还想知道|还有(什么|哪)|有什么想|需要我|"
-    r"我再(帮|查|搜|找)|我可以再)",
+    r"我再(帮|查|搜|找)|我可以再|"
+    r"如果还需要|若还需要|如还需|接下来如果|"
+    r"请告诉|有其他(需要|问题|想问)|随时(问|叫|找|吩咐)|"
+    r"欢迎继续|需要的话)",
     re.IGNORECASE,
 )
 
@@ -140,7 +154,8 @@ _WALL_CLOCK_CLOSE = (
     "（系统提示：本轮处理耗时已超预算。立即基于已有信息用角色口吻给出最终回复；"
     "除非是为已有事实包委派 render_agent 出图，否则不要再发起新的工具调用；"
     "信息不全就如实说明现状，绝不编造。"
-    "禁止对用户念内部节点名或编排流程；禁止用多段标题/列表把长信息念成台词。）"
+    "禁止对用户念内部节点名或编排流程；禁止用多段标题/列表把长信息念成台词。"
+    "若仍在等待后台：只输出 <SILENCE>，禁止过程叙事与任务编号。）"
 )
 
 _WALL_CLOCK_PIPELINE = (
@@ -148,8 +163,8 @@ _WALL_CLOCK_PIPELINE = (
     "这是硬例外，**禁止**因预算停工具。"
     "你必须立刻 "
     'create_subagent(agent_profile="render_agent", task=本轮事实包或 res_ 句柄) 出图；'
-    "禁止新开检索；禁止长文当台词；禁止说「翻完了/卷轴里有/念不动」却不出图；"
-    "可先一句「等一下…」再委派；出图完成前其余 <SILENCE>；禁止念内部节点名。）"
+    "禁止新开检索；禁止长文当台词；禁止说「查完了/资料里有/念不动」却不出图；"
+    "出图完成前其余 <SILENCE>；禁止念内部节点名。）"
 )
 
 _RENDER_DELEGATE_NUDGE = (
@@ -220,12 +235,15 @@ def looks_like_status_inquiry(text: str, *, has_active_task: bool) -> bool:
 def looks_like_numeric_recitation(text: str) -> bool:
     """台词是否在念多点读数（应上图，不是群聊气泡）。
 
-    判据是读数密度：小数、百分号、或 ≥4 位有效数字。日期片段与两位数不计。
+    形态：多行含数字的对照表，或高密度小数/百分号。不按业务域词分支。
     """
     body = (text or "").strip()
-    if len(body) < 80:
+    if not body or is_silence_marker(body):
         return False
-    if is_silence_marker(body):
+    n_digits = len(re.findall(r"\d+", body))
+    if _fact_lines_multi_point(body) and n_digits >= 5 and len(body) >= 24:
+        return True
+    if len(body) < 80:
         return False
     nums = re.findall(r"(?<![\d.])(?:\d+\.\d+%?|\d{1,3}%|\d{4,})(?![\d.])", body)
     if len(nums) >= 6:
@@ -256,18 +274,46 @@ def looks_like_empty_handoff(text: str) -> bool:
     return bool(_EMPTY_HANDOFF_RE.search(body))
 
 
+def looks_like_machine_latin(text: str) -> bool:
+    """长句拉丁字母占比过高：机器独白，不是 IM 角色句。纯链接放过。"""
+    body = (text or "").strip()
+    if len(body) < 40:
+        return False
+    low = body.lower()
+    if body.count(" ") < 4 and ("http://" in low or "https://" in low or "/" in body):
+        return False
+    n = 0
+    for ch in body:
+        o = ord(ch)
+        if 65 <= o <= 90 or 97 <= o <= 122:
+            n += 1
+    return n * 5 >= len(body) * 3
+
+
 def looks_like_process_meta(text: str) -> bool:
     """是否框架/过程元话语（对用户即 OOC）。"""
     body = (text or "").strip()
     if not body or is_silence_marker(body):
         return False
+    if looks_like_machine_latin(body):
+        return True
     return bool(_PROCESS_META_RE.search(body))
 
 
+def looks_like_wait_template(text: str) -> bool:
+    return (text or "").strip() in IN_FLIGHT_WAIT_TEMPLATES
+
+
 def looks_like_wait_comfort(text: str) -> bool:
-    """是否短等待安慰或「会比较久」委派声明（步骤 3，可发一次）。"""
+    """是否极短等待安慰或第一人称「这就去办」（可发一次）。"""
     body = (text or "").strip()
-    if not body or len(body) > 96:
+    if looks_like_wait_template(body):
+        return True
+    if not body or len(body) > IN_FLIGHT_SPEECH_MAX:
+        return False
+    if has_orchestration_narration(body):
+        return False
+    if _INFLIGHT_PROCESS_VERB_RE.search(body):
         return False
     # 不得同时是空交付摆烂
     if _EMPTY_HANDOFF_RE.search(body) and not _WAIT_COMFORT_RE.search(body):
@@ -277,16 +323,33 @@ def looks_like_wait_comfort(text: str) -> bool:
     return bool(_WAIT_COMFORT_RE.search(body))
 
 
-def looks_like_inflight_quota_speech(text: str) -> bool:
-    """在途台词额度：一句短等待或短应，不含清单/念白。"""
+def looks_like_task_accept_speech(text: str, *, max_len: int = 0) -> bool:
+    """开场接任务应：一句角色发言，表示接下来去做。
+
+    不按 12 字卡死（会话痨人格会复述任务）。拦的是结构垃圾：编排词、过程动词、
+    长结构/念数、多段规划。max_len≤0 时用 FIRST_ACK_SPEECH_MAX。
+    """
     body = (text or "").strip()
-    if not body or len(body) > 96:
+    if looks_like_wait_template(body):
+        return True
+    if not body or is_silence_marker(body):
+        return False
+    cap = max_len if max_len > 0 else FIRST_ACK_SPEECH_MAX
+    if len(body) > cap:
+        return False
+    if has_orchestration_narration(body):
+        return False
+    if _INFLIGHT_PROCESS_VERB_RE.search(body):
         return False
     if looks_like_report_speech(body) or looks_like_numeric_recitation(body):
         return False
     if looks_like_empty_handoff(body):
         return False
-    if body.count("\n") >= 3:
+    if looks_like_process_meta(body):
+        return False
+    if looks_like_machine_latin(body):
+        return False
+    if body.count("\n") >= 2:
         return False
     if claims_premature_delivery(body) and not looks_like_wait_comfort(body):
         return False
@@ -295,6 +358,11 @@ def looks_like_inflight_quota_speech(text: str) -> bool:
     if len(_MD_HEADING_RE.findall(body)) >= 1:
         return False
     return True
+
+
+def looks_like_inflight_quota_speech(text: str) -> bool:
+    """在途第二句起的极短额度（≤12 字）。开场接任务应走 looks_like_task_accept_speech。"""
+    return looks_like_task_accept_speech(text, max_len=IN_FLIGHT_SPEECH_MAX)
 
 
 def has_orchestration_narration(text: str) -> bool:
@@ -415,6 +483,8 @@ def should_block_user_visible_text(
     fact_pack_pending: bool = False,
     has_active_task: bool = False,
     render_inflight: bool = False,
+    speech_len_hard: int = 0,
+    user_asked_detail: bool = False,
 ) -> tuple[bool, str]:
     """是否拦截本段对用户可见文本。返回 (block, reason)。"""
     body = (text or "").strip()
@@ -456,9 +526,9 @@ def should_block_user_visible_text(
             return True, "post_image_too_long"
         return False, "post_image_ok"
 
-    # 异步在途：一句短额度（等待或短应）；清单/念白/完成腔不占额度、直接静默
+    # 异步在途：开场接任务应一句（不按 12 字）；其后默认静默。清单/念白/完成腔不占额度。
     if inflight or pol == "silence_only":
-        if looks_like_inflight_quota_speech(body) and not wait_comfort_sent:
+        if not wait_comfort_sent and looks_like_task_accept_speech(body, max_len=speech_len_hard):
             return False, "wait_comfort"
         return True, "silence_only_or_async"
 
@@ -480,9 +550,8 @@ def should_block_user_visible_text(
     if claims_premature_delivery(body) and not image_sent:
         return True, "premature_delivery"
 
-    # 在途长任务：把多点读数念进气泡 = 把图上的信息误解成群聊正文
-    if has_active_task and not image_sent and looks_like_numeric_recitation(body):
-        # 进度追问且已查状态工具：放行短进度，不把时间戳/编号当念白
+    # 多点读数进气泡 = 该走资料图。不要求已有在途任务（首轮对照同样适用）。
+    if not image_sent and looks_like_numeric_recitation(body):
         if not (pol == "status_ok" and has_status_tool):
             return True, "numeric_recitation"
 
@@ -502,13 +571,13 @@ def should_block_user_visible_text(
         return False, "ok"
 
     if pol == "status_ok":
-        # 追问进度：应先查工具；零工具却报状态 → 拦（由 settle 再 nudge）
-        if not has_status_tool and not tool_calls_so_far and len(body) > 8:
-            # 极短「嗯」类放行价值低；进度句必须有工具
-            if _STATUS_INQUIRY_RE.search(body) or claims_premature_delivery(body) or len(body) > 15:
-                return True, "status_without_tool"
+        # 追问进度：零工具不得对用户报状态/完成（含极短句）
+        if not has_status_tool and not tool_calls_so_far:
+            return True, "status_without_tool"
         return False, "ok"
 
+    # 长度只写角色卡。硬拦会吞 by_bot 群聊回复（纠正/INV-4 未接此原因）。
+    _ = (speech_len_hard, user_asked_detail)
     return False, "ok"
 
 
@@ -560,17 +629,16 @@ def content_is_render_candidate(
     if "|" in body and body.count("\n") >= 3:
         return True
 
-    # FileOS 折叠：用原文形态判定；仅「多段/表/事实包」才可出图（检索噪声默认否）
+    # FileOS 折叠：用原文形态判定。多点事实行已在上面过门，折叠后仍要武装出图。
     if fileos_folded:
+        if _fact_lines_multi_point(body) and len(body) >= 80:
+            return True
         if "事实包" in body and len(body) >= 80:
             return True
         if "|" in body and body.count("\n") >= 3 and len(body) >= 200:
             return True
         if body.count("\n\n") >= 3 and len(body) >= 600:
             return True
-        # 纯检索列表默认不武装 render（单点问答可短回）
-        if _searchish:
-            return False
         return False
 
     # 搜索类：与旧口径类似但更严；单点检索默认不武装出图
@@ -584,6 +652,18 @@ def content_is_render_candidate(
             return True
         return False
     return False
+
+
+def should_mark_speech_delivered(*, text: str, has_media: bool) -> bool:
+    """send_message 是否置交付终局：媒体配台词，或非等待的纯文本。"""
+    body = (text or "").strip()
+    if has_media:
+        return bool(body)
+    if not body:
+        return False
+    if looks_like_wait_comfort(body):
+        return False
+    return True
 
 
 def is_status_tool_name(name: str) -> bool:

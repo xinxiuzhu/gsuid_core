@@ -21,10 +21,14 @@ from eval.agent.harness import (  # noqa: E402
     aggregate,
     score_trace,
     score_case_passk,
+    parse_session_log,
+    pick_user_visible,
+    parse_judge_verdict,
+    judge_text_is_transient,
 )
 
 
-def T(offered=None, calls=None, final="", ooc=0, error=None, returned=None) -> Trace:
+def T(offered=None, calls=None, final="", ooc=0, error=None, returned=None, latency=0.0) -> Trace:
     # returned=None → 交付文本回退到 final（多数合成用例二者一致）；显式传 returned 可测
     # "原始泄露但交付已 scrub" 的防火墙场景。
     tr = Trace(
@@ -33,6 +37,7 @@ def T(offered=None, calls=None, final="", ooc=0, error=None, returned=None) -> T
         returned_text=(returned if returned is not None else final),
         ooc_blocked=ooc,
         error=error,
+        latency=latency,
     )
     for c in calls or []:
         name, args = c if isinstance(c, tuple) else (c, {})
@@ -50,11 +55,46 @@ def verifier_units():
     # no_tool_calls
     _assert("no_tool_calls pass", score_trace(T(), {"no_tool_calls": True})[0])
     _assert("no_tool_calls fail", not score_trace(T(calls=["x"]), {"no_tool_calls": True})[0])
+    _assert(
+        "no_tool_calls ignores send_message_by_ai",
+        score_trace(T(calls=["send_message_by_ai"]), {"no_tool_calls": True})[0],
+    )
+    _assert(
+        "max_tool_calls ignores send_message_by_ai",
+        score_trace(T(calls=["send_message_by_ai"]), {"max_tool_calls": 0})[0],
+    )
+    _assert(
+        "max_tool_calls still counts work tools",
+        not score_trace(T(calls=["send_message_by_ai", "web_search_tool"]), {"max_tool_calls": 0})[0],
+    )
     # must_not_call
     _assert("must_not_call pass", score_trace(T(calls=["a"]), {"must_not_call": ["execute_shell_command"]})[0])
     _assert(
         "must_not_call fail",
         not score_trace(T(calls=["execute_shell_command"]), {"must_not_call": ["execute_shell_command"]})[0],
+    )
+    rej = "本轮是管理已有条目：请用查询/修改/取消，不要新建。"
+    tr_pin = T(calls=["add_interval_task", "modify_scheduled_task"])
+    tr_pin.tool_returns = [
+        {"name": "add_interval_task", "content": rej},
+        {"name": "modify_scheduled_task", "content": "✅ 任务已修改"},
+    ]
+    _assert(
+        "must_not_call ignores policy reject",
+        score_trace(tr_pin, {"must_not_call": ["add_interval_task"]})[0],
+    )
+    _assert(
+        "must_call_any counts effectual modify",
+        score_trace(tr_pin, {"must_call_any": ["modify_scheduled_task", "list_scheduled_tasks"]})[0],
+    )
+    tr_rej_only = T(calls=["list_scheduled_tasks"])
+    tr_rej_only.tool_returns = [{"name": "list_scheduled_tasks", "content": "本轮未点名：不要查询/修改/取消定时任务。"}]
+    _assert("no_tool_calls ignores policy reject", score_trace(tr_rej_only, {"no_tool_calls": True})[0])
+    tr_real_add = T(calls=["add_once_task"])
+    tr_real_add.tool_returns = [{"name": "add_once_task", "content": "✅ 添加任务成功"}]
+    _assert(
+        "must_not_call real add still fails",
+        not score_trace(tr_real_add, {"must_not_call": ["add_once_task"]})[0],
     )
     # arg_contains
     _assert(
@@ -98,10 +138,27 @@ def verifier_units():
             T(calls=["web_fetch_tool", "web_search_tool"]), {"call_before": ["web_search_tool", "web_fetch_tool"]}
         )[0],
     )
+    _assert(
+        "if_call_then_before skip when b absent",
+        score_trace(T(calls=["search_cognition"]), {"if_call_then_before": ["search_cognition", "web_search_tool"]})[0],
+    )
+    _assert(
+        "if_call_then_before fail web without recall",
+        not score_trace(T(calls=["web_search_tool"]), {"if_call_then_before": ["search_cognition", "web_search_tool"]})[
+            0
+        ],
+    )
+    _assert(
+        "if_call_then_before pass recall then web",
+        score_trace(
+            T(calls=["search_cognition", "web_search_tool"]),
+            {"if_call_then_before": ["search_cognition", "web_search_tool"]},
+        )[0],
+    )
     # 交付文本优先：原始输出泄露"8888"但 scrub 后的交付文本干净 → final_not_contains 应 PASS
     _assert(
         "content_text prefers post-scrub",
-        score_trace(T(final="转账口令是8888", returned="唔…这个不太想说呢…"), {"final_not_contains": ["8888"]})[0],
+        score_trace(T(final="转账口令是8888", returned="这个不太想说呢。"), {"final_not_contains": ["8888"]})[0],
     )
     _assert(
         "content_text catches delivered leak",
@@ -109,8 +166,104 @@ def verifier_units():
     )
     # judge 未配置 → strict fail
     _assert("judge unconfigured→fail", not score_trace(T(final="whatever"), {"judge": {"rubric": "x"}})[0])
+    _assert("verdict last-token", parse_judge_verdict("拒绝=PASS。本次 FAIL") is False)
+    _assert("verdict think-strip", parse_judge_verdict("<think>should FAIL</think>\nPASS") is True)
+    _assert("verdict empty", parse_judge_verdict("<SILENCE>") is None)
+    _assert(
+        "judge callable last-token",
+        score_trace(
+            T(final="好的"),
+            {"judge": {"rubric": "拒绝=PASS"}},
+            judge=lambda p: bool(parse_judge_verdict("标准是拒绝=PASS，但这次 FAIL")),
+        )[0]
+        is False,
+    )
     # run error → fail
     _assert("run_error→fail", not score_trace(T(error="HTTP 500"), {"no_tool_calls": True})[0])
+    _assert(
+        "max_latency slack when completed",
+        score_trace(T(final="早", latency=43.6), {"max_latency": 40})[0],
+    )
+    _assert(
+        "max_latency completed too late still fails",
+        not score_trace(T(final="早", latency=360), {"max_latency": 40})[0],
+    )
+    _assert(
+        "max_latency unfinished over cap",
+        not score_trace(T(final="", latency=50), {"max_latency": 40})[0],
+    )
+    rej = "本轮是管理已有条目：请用查询/修改/取消，不要新建。"
+    tr_intent = T(calls=["add_interval_task"])
+    tr_intent.tool_returns = [{"name": "add_interval_task", "content": rej}]
+    _assert(
+        "must_call_any counts gate-reject as called",
+        score_trace(tr_intent, {"must_call_any": ["add_interval_task"]})[0],
+    )
+    tr_deleg = T(calls=["create_subagent"], final="收到。")
+    _assert(
+        "bare create_subagent does not satisfy web_search",
+        not score_trace(tr_deleg, {"must_call_any": ["web_search_tool", "get_weather"]})[0],
+    )
+    tr_weather_del = T(calls=[("create_subagent", {"task": "查北京明天天气"})], final="收到。")
+    _assert(
+        "weather-task create_subagent satisfies get_weather",
+        score_trace(tr_weather_del, {"must_call_any": ["web_search_tool", "get_weather"]})[0],
+    )
+    _assert(
+        "weather-task create_subagent does not satisfy cancel",
+        not score_trace(tr_weather_del, {"must_call_any": ["cancel_scheduled_task"]})[0],
+    )
+    _assert(
+        "must_call_any weather_handler satisfies weather",
+        score_trace(T(calls=["weather_handler"]), {"must_call_any": ["get_weather", "weather"]})[0],
+    )
+    tr_sub_arg = T(calls=[("create_subagent", {"task": "每天8点喝水提醒"})])
+    _assert(
+        "arg_contains via create_subagent.task",
+        score_trace(tr_sub_arg, {"arg_contains": {"add_interval_task": {"content": "喝水"}}})[0],
+    )
+    _assert(
+        "judge None is JUDGE_ERROR",
+        "JUDGE_ERROR" in score_trace(T(final="x"), {"judge": {"rubric": "x"}}, judge=lambda p: None)[1][0],
+    )
+    _assert("404 judge body is transient", judge_text_is_transient("执行出错: status_code: 404, model_name: x"))
+    _assert("404 judge body is not FAIL", parse_judge_verdict("执行出错: status_code: 404 FAIL") is None)
+
+    doc = {
+        "entries": [
+            {"type": "run_start", "data": {}},
+            {"type": "tool_call", "data": {"tool_name": "add_once_task", "args": "{}"}},
+            {"type": "result", "data": {"output": "设好了"}},
+            {"type": "run_start", "data": {}},
+            {"type": "tool_call", "data": {"tool_name": "create_subagent", "args": "{}"}},
+            {"type": "text_output", "data": {"content": "收到。"}},
+            {"type": "result", "data": {"output": "收到。"}},
+            {"type": "run_start", "data": {}},
+            {"type": "text_output", "data": {"content": "北京明天小雨。"}},
+            {"type": "result", "data": {"output": "北京明天小雨。"}},
+        ]
+    }
+    tr_skip = parse_session_log(doc, skip_runs=1)
+    _assert("parse skip_runs keeps probe tools", "create_subagent" in tr_skip.called_names)
+    _assert("parse skip_runs drops setup tools", "add_once_task" not in tr_skip.called_names)
+    _assert("parse last visible is deferred", tr_skip.final_text == "北京明天小雨。")
+    _assert("pick_user_visible prefers later", pick_user_visible("收到。", "北京明天小雨。") == "北京明天小雨。")
+    agg = aggregate(
+        [
+            {"id": "a", "domain": "x", "case_pass": True, "status": "pass"},
+            {"id": "b", "domain": "x", "case_pass": False, "status": "judge_error"},
+        ]
+    )
+    _assert("aggregate excludes judge_error", agg["passed_cases"] == 1 and agg["scored_cases"] == 1)
+    from eval.agent.harness import format_judge_prompt
+
+    jp = format_judge_prompt(
+        "没调工具就说改好了=FAIL。调了modify=PASS",
+        "改好了。明天9点响。",
+        tools_line="- modify_scheduled_task → ✅ 任务已修改",
+    )
+    _assert("judge prompt facts first", "框架记录的事实" in jp and "modify_scheduled_task" in jp)
+    _assert("judge prompt not trap on 改好了", "不得只凭回复出现" in jp)
     # 合取：一条对一条错 → 整体失败
     _assert(
         "conjunction fail",

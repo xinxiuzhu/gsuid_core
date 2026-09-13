@@ -52,7 +52,7 @@ from gsuid_core.ai_core.trigger_bridge import MockBot
 from gsuid_core.ai_core.context_assembly import assemble_dynamic_context
 from gsuid_core.ai_core.configs.ai_config import ai_config
 from gsuid_core.ai_core.relationship.engine import settle_turn
-from gsuid_core.ai_core.interaction_scaffold import CheapGate
+from gsuid_core.ai_core.interaction_scaffold import CheapGate, GroupOpenGate
 
 # AI并发控制配置
 MAX_CONCURRENT_AI_CALLS = 10  # 全局最大并发AI调用数
@@ -73,6 +73,14 @@ class InteractiveTurnResult:
     rel: Optional[RelationshipView]
 
 
+@dataclass
+class PassiveChatResult:
+    """``run_passive_interactive_chat`` 的早退/完成结果（H01 之前到 turn）。"""
+
+    status: Literal["ok", "silence", "disabled", "not_ready", "budget"]
+    turn: Optional[InteractiveTurnResult] = None
+
+
 async def _wait_core_ready() -> bool:
     """AI 核心未就绪时等待迁移完成，避免迁移期间处理聊天触发旧向量查询。"""
     try:
@@ -87,6 +95,86 @@ async def _wait_core_ready() -> bool:
     except Exception as e:
         logger.warning(t("log.ai.gscore_check_core_init", e=e))
     return True
+
+
+async def run_passive_interactive_chat(
+    bot: Bot,
+    event: Event,
+    *,
+    enqueue_ts: Optional[float] = None,
+    soft_triggered: bool = False,
+    budget_mode: Literal["gate", "decision", "skip"] = "gate",
+    wall_clock_budget: Optional[float] = None,
+    return_mode: Literal["always", "return", "by_bot"] = "by_bot",
+    deliver: bool = True,
+    settle: bool = True,
+    outbound_stream: bool = False,
+    stats_chat_type: Optional[str] = None,
+) -> PassiveChatResult:
+    """适配器与 HTTP Agent 共用的被动聊天入口（不含 ``_ai_semaphore``）。
+
+    顺序：enable / ready → 预算 → H01 → 长度 → 空内容门 → session → turn。
+    HTTP 开流前已查预算时传 ``budget_mode="skip"``；墙钟仅 ``HTTP_AGENT:`` session。
+    ``outbound_stream`` / ``stats_chat_type`` 由入口传入，loop 与用量记账读取。
+    """
+    if not ai_config.get_config("enable").data:
+        logger.debug(t("log.ai.gscore_service_enabled_skipping"))
+        return PassiveChatResult("disabled")
+    if not await _wait_core_ready():
+        return PassiveChatResult("not_ready")
+
+    query = event.raw_text
+    if budget_mode == "gate":
+        if not await check_budget_gate(bot, event):
+            return PassiveChatResult("budget")
+    elif budget_mode == "decision":
+        from gsuid_core.ai_core.turn_pipeline import evaluate_budget
+
+        decision = await evaluate_budget(event)
+        if decision is not None and not decision.allowed:
+            return PassiveChatResult("budget")
+
+    hook_ctx = AgentHookContext(
+        point=AgentHookPoint.BEFORE_AI_CHAT,
+        ev=event,
+        bot=bot if isinstance(bot, Bot) else None,
+        session_id=event.session_id,
+        create_by="Chat",
+        query=query,
+        soft_triggered=soft_triggered,
+    )
+    if await fire_hooks(AgentHookPoint.BEFORE_AI_CHAT, hook_ctx) is not HookDecision.CONTINUE:
+        return PassiveChatResult("silence")
+
+    query = apply_absolute_length_guard(event, query)
+    hook_ctx.query = query
+
+    _is_at_me = bool(event.is_tome) or event.user_type == "direct"
+    if not query.strip() and not has_model_visible_content(event) and not _is_at_me:
+        logger.info(t("log.ai.gscore_empty_content_visible"))
+        return PassiveChatResult("silence")
+
+    session = await get_ai_session(event)
+    if wall_clock_budget is not None and event.session_id.startswith("HTTP_AGENT:"):
+        session.wall_clock_budget = wall_clock_budget
+    hook_ctx.persona_name = session.persona_name
+    turn = await run_interactive_turn(
+        bot=bot,
+        event=event,
+        session=session,
+        query=query,
+        hook_ctx=hook_ctx,
+        soft_triggered=soft_triggered,
+        enqueue_ts=enqueue_ts,
+        return_mode=return_mode,
+        deliver=deliver,
+        settle=settle,
+        outbound_stream=outbound_stream,
+        stats_chat_type=stats_chat_type,
+    )
+    if turn.is_silence:
+        return PassiveChatResult("silence", turn=turn)
+    return PassiveChatResult("ok", turn=turn)
 
 
 async def handle_ai_chat(
@@ -117,47 +205,12 @@ async def handle_ai_chat(
         if stale_request(enqueue_ts, STALE_CHAT_REQUEST_TTL):
             return
         try:
-            query = event.raw_text
-            if not await check_budget_gate(bot, event):
-                return
-
-            # 本轮 hook Context：一次建好，各点位复用（字段跨点位传递）
-            hook_ctx = AgentHookContext(
-                point=AgentHookPoint.BEFORE_AI_CHAT,
-                ev=event,
-                bot=bot if isinstance(bot, Bot) else None,
-                session_id=event.session_id,
-                create_by="Chat",
-                query=query,
-                soft_triggered=soft_triggered,
-            )
-            # H01：会话静默窗等「整轮不跑」的判定
-            if await fire_hooks(AgentHookPoint.BEFORE_AI_CHAT, hook_ctx) is not HookDecision.CONTINUE:
-                return
-
-            query = apply_absolute_length_guard(event, query)
-            hook_ctx.query = query
-
-            # 空内容前置门：无可见内容且未@我则静默（与 payload 同源）
-            _is_at_me = bool(event.is_tome) or event.user_type == "direct"
-            if not query.strip() and not has_model_visible_content(event) and not _is_at_me:
-                logger.info(t("log.ai.gscore_empty_content_visible"))
-                return
-
-            session = await get_ai_session(event)
-            hook_ctx.persona_name = session.persona_name
-            await run_interactive_turn(
-                bot=bot,
-                event=event,
-                session=session,
-                query=query,
-                hook_ctx=hook_ctx,
-                soft_triggered=soft_triggered,
+            await run_passive_interactive_chat(
+                bot,
+                event,
                 enqueue_ts=enqueue_ts,
-                return_mode="by_bot",
-                deliver=True,
+                soft_triggered=soft_triggered,
             )
-
         except Exception as e:
             logger.exception(t("log.ai.gscore_ai_exception_chat_error", e=e))
 
@@ -175,6 +228,8 @@ async def run_interactive_turn(
     deliver: bool = True,
     settle: bool = True,
     history_context: Optional[str] = None,
+    outbound_stream: bool = False,
+    stats_chat_type: Optional[str] = None,
 ) -> InteractiveTurnResult:
     """生产与评测共用的一轮编排（H01 之后的分类 / 检索 / 装配 / 结算）。
 
@@ -205,10 +260,11 @@ async def run_interactive_turn(
         recent_tool_call=has_recent_tool_call(session.history),
         followup_max_len=int(ai_config.get_config("scaffold_followup_max_len").data),
         ambient_max_len=int(ai_config.get_config("scaffold_ambient_max_len").data),
+        has_reply=bool(event.reply or event.reply_id),
     )
-    # 结构性静音（@了别人 / 多人互聊 / 催别人）：内容不是冲着人格，不结算。
-    cheap = decide_cheap_gate(turn_graph, soft_triggered=soft_triggered)
-    if cheap is CheapGate.SILENCE:
+    hook_ctx.turn_graph = turn_graph
+    # 只拦开口门 / 寻址门。lurk / 低好感区要 rel，不能在 AFTER_SESSION 前判。
+    if turn_graph.open_gate is GroupOpenGate.SILENCE or turn_graph.address_gated:
         logger.info(t("log.ai.gscore_group_open_gate_silence"))
         return InteractiveTurnResult("", "<SILENCE>", True, False, "", True, hook_ctx, hook_ctx.relationship)
 
@@ -227,7 +283,17 @@ async def run_interactive_turn(
     await fire_hooks(AgentHookPoint.CLASSIFY, hook_ctx)
     intent = hook_ctx.intent or ""
 
-    cheap = decide_cheap_gate(turn_graph, soft_triggered=soft_triggered, intent=intent, rel=rel)
+    cheap = decide_cheap_gate(
+        turn_graph,
+        soft_triggered=soft_triggered,
+        intent=intent,
+        rel=rel,
+        # H03 套件旗 + history 工具证据；装配后的第二道仍用 has_actionable
+        has_active_task=(
+            hook_ctx.has_actionable or has_recent_tool_call(session.history) or bool(hook_ctx.prev_turn_used_tools)
+        ),
+    )
+    hook_ctx.cheap_gate = cheap.value
     if cheap is CheapGate.SILENCE:
         logger.info(t("log.ai.gscore_group_open_gate_silence"))
         if settle:
@@ -246,22 +312,34 @@ async def run_interactive_turn(
         if enqueue_ts is not None:
             enqueue_ts = time.time()
 
-    user_messages, guard_flags = await prepare_content_payload(event)
+    user_messages, guard_flags = await prepare_content_payload(event, quoted_tome=turn_graph.quoted_tome)
     await apply_summary_guard(event, user_messages)
-    stamp_current_time(user_messages)
+    stamp_current_time(user_messages, now=hook_ctx.clock_at)
 
     hook_ctx.assembled_domains = session.get_assembled_capability_domains()
     hook_ctx.priority_speakers = await collect_priority_speakers(
         bot_id=bot_id,
         group_id=str(event.group_id) if event.group_id else None,
         history=hist_records,
+        current_user_id=str(event.user_id) if event.user_id else None,
+        query=query,
+        persona_name=session.persona_name,
     )
     await fire_hooks(AgentHookPoint.RETRIEVE_CONTEXT, hook_ctx)
+    # 检索预算最长 15s，超过队头 TTL；检索结束后重新计时，避免刚查完就被当过期丢弃。
+    if enqueue_ts is not None:
+        enqueue_ts = time.time()
 
     hook_ctx.turn_graph = turn_graph
     hook_ctx.cheap_gate = cheap.value
     hook_ctx.recent_report_titles = recent_report_titles(session.history)
-    hist_block = build_group_history_block(event) if history_context is None else history_context
+    hist_block = ""
+    if history_context is not None:
+        hist_block = history_context
+    elif cheap is CheapGate.FULL and (
+        turn_graph.call_to_self or turn_graph.ellipsis_followup or turn_graph.task_management
+    ):
+        hist_block = build_group_history_block(event)
     full_context, has_actionable = await assemble_dynamic_context(
         query=query,
         user_id=str(event.user_id),
@@ -303,6 +381,8 @@ async def run_interactive_turn(
         has_active_task=has_actionable,
         turn_graph=turn_graph,
         cheap_gate=cheap,
+        outbound_stream=outbound_stream,
+        stats_chat_type=stats_chat_type,
     )
 
     result_text, is_silence, is_error = classify_run_result(chat_result)
@@ -318,6 +398,11 @@ async def run_interactive_turn(
         )
 
     if settle and session.persona_name:
+        hook_ctx.tool_names_called = tuple(session._last_attempt_tool_calls)
+        hook_ctx.result_text = result_text[:200]
+        _think_max = int(ai_config.get_config("thinking_text_max").data)
+        _think = session._last_attempt_thinking or ""
+        hook_ctx.thinking_text = _think[-_think_max:] if _think else ""
         await _settle_and_fire_after_run(
             bot=bot,
             event=event,
@@ -360,13 +445,13 @@ async def _settle_and_fire_after_run(
         silenced=is_silence,
         error=is_error,
         reached_model=True,
-        is_light=cheap is CheapGate.LIGHT,
         is_master=rel.is_master,
         guard_flags=guard_flags,
     )
     hook_ctx.point = AgentHookPoint.AFTER_RUN
     hook_ctx.signals = outcome.signals
     hook_ctx.settle_outcome = outcome
+    hook_ctx.result_text = query if not hook_ctx.result_text else hook_ctx.result_text
     task = asyncio.create_task(fire_hooks(AgentHookPoint.AFTER_RUN, hook_ctx))
 
     underlying = _underlying_bot(bot)

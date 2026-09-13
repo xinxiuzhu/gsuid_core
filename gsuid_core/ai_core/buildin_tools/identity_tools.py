@@ -58,7 +58,7 @@ async def remember_user_alias(
     alias: str,
     user_id: Optional[str] = None,
 ) -> str:
-    """记住"群里某人叫什么"（称呼 / 外号 / 昵称）。
+    """写入"群里某人叫什么"（称呼 / 外号 / 昵称）。
 
     当群里明确指定某个群成员的称呼时调用，例如："以后叫他小A"、"@某人 是小B"、
     "她叫小C"。把"称呼 → 用户ID"存入群成员称呼表，之后会作为**确定身份事实**注入
@@ -98,7 +98,13 @@ async def remember_user_alias(
     # Event.user_pm 为已声明字段（int，默认 6=最低权限）；ev 缺失时按最低权限处理
     # 规范化后比对，避免「主　人」「ＡＤＭＩＮ」这类混淆绕过 denylist
     caller_pm = ev.user_pm if ev is not None else 6
-    if _normalize_alias_for_guard(alias) in _PROTECTED_NORMALIZED and caller_pm != 0:
+    protected = set(_PROTECTED_NORMALIZED)
+    from gsuid_core.ai_core.persona.settings import get_master_title, persona_name_from_event
+
+    custom_title = get_master_title(persona_name_from_event(ev))
+    if custom_title:
+        protected.add(_normalize_alias_for_guard(custom_title))
+    if _normalize_alias_for_guard(alias) in protected and caller_pm != 0:
         logger.warning(
             t(
                 "log.ai.identity_user_target_id_pm",

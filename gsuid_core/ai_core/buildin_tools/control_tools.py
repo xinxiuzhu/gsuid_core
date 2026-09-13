@@ -25,7 +25,12 @@ from gsuid_core.ai_core.control.delegation import (
 _MAX_WAIT_SEC = 20.0
 
 
-@ai_tools(category="buildin", capability_domain="产物")
+@ai_tools(
+    category="buildin",
+    capability_domain="产物",
+    covers=["在途委派进度", "子任务是否完成", "委派句柄查状态"],
+    aliases=["委派进度查询", "子代理完成了没"],
+)
 async def check_delegation(
     ctx: RunContext[ToolContext],
     delegation_id: str,
@@ -34,7 +39,7 @@ async def check_delegation(
     """查在途委派的真实状态与产物；``wait_sec>0`` 则等到终态或超时。
 
     ``delegation_id`` 用 create_subagent 回执里的 ``dlg_…`` 句柄（裸 root_task_id
-    亦可）。用户追问进度时用 ``wait_sec=0`` 立即读；你打算等一下再答用 >0。
+    亦可）。用户追问进度 / 好了没 / 做完没 时用 ``wait_sec=0`` 立即读。
     句柄只进本工具参数，**禁止**写进给用户看的台词。
     """
     _ = ctx
@@ -47,7 +52,7 @@ async def check_delegation(
 
 @ai_tools(category="buildin", capability_domain="产物")
 async def dispute_directive(ctx: RunContext[ToolContext], reason: str) -> str:
-    """框架内部校验的观察与事实不符时用本工具申辩，而**不要**对用户解释。
+    """当框架内部校验的观察与事实不符时写入申辩，而**不要**对用户解释。
 
     典型场景：校验说「你把长信息念成了台词」但你写的是用户点名要的叙事文/代码；
     或说「已有事实包未出图」但本轮根本没查数。申辩后你上一条回复照原样交付，

@@ -58,7 +58,7 @@ def _ensure_aware(dt: datetime | None) -> datetime | None:
 MAX_EXECUTION_LIMIT = 150
 
 # 中性执行者 prompt：任务执行体不注入 persona。生产事故（plans/prod_session_review §4）：
-# persona 的"想说就说"压过任务里的静默条款，价格无事件时仍向群里播报"继续睡zzz"。
+# persona 的"想说就说"压过任务里的静默条款，条件未满足时仍向群里播报闲聊。
 SCHEDULED_TASK_EXECUTOR_PROMPT = (
     "你是定时任务执行器（不是角色扮演）。你收到的任务指令来自用户先前的预约。\n"
     "执行规则（优先级最高，覆盖任何风格要求）：\n"
@@ -326,8 +326,7 @@ async def execute_scheduled_task(task_id: str) -> None:
                 suppress_when_heartbeat_recent=False,
             )
         elif result_stripped:
-            # 溯源尾注（§5）。不用整行（…）形态——send_chat_result 的人设净化会把
-            # "整行仅括号"当舞台旁白删除，尾注会静默丢失（评审修复 F4）。
+            # 溯源尾注（§5）。不用整行（…），避免和人设可见心声抢形态。
             message_with_source = f"{result_stripped}\n⏰ 定时任务 {task_id}"
             sent = await emit_proactive_message(
                 event=ev,

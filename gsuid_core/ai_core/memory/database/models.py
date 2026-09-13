@@ -15,15 +15,64 @@ from typing import List, Optional
 from datetime import datetime, timezone, timedelta
 
 from sqlmodel import Field, SQLModel, Relationship, col, select
-from sqlalchemy import Text, Index, Table, Column, String, ForeignKey, UniqueConstraint, or_, desc, func, exists, insert
+from sqlalchemy import (
+    Text,
+    Index,
+    Table,
+    Column,
+    String,
+    ForeignKey,
+    UniqueConstraint,
+    or_,
+    desc,
+    func,
+    union as sql_union,
+    exists,
+    insert,
+)
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
+from sqlalchemy.sql.selectable import Select
 from sqlalchemy.dialects.postgresql import JSON
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.ai_core.memory.vector.ops import upsert_episode_vector
-from gsuid_core.utils.database.base_models import async_maker, with_session
+from gsuid_core.utils.database.base_models import async_maker, with_session, with_read_session
+
+
+def _like_contains(token: str) -> str:
+    escaped = token.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def _ids_matching_tokens(
+    id_col: ColumnElement[str],
+    scope_col: ColumnElement[str],
+    text_col: ColumnElement[str],
+    order_col: ColumnElement[datetime],
+    scope_key: str,
+    tokens: list[str],
+    limit: int,
+) -> Select[tuple[str]]:
+    """每个 token 各自 LIMIT 后 UNION。SQLite 必须包成子查询才认分段 LIMIT。"""
+    per = max(6, min(12, limit // max(len(tokens), 1) + 2))
+    pieces: list[Select[tuple[str]]] = []
+    for tok in tokens:
+        inner = (
+            select(id_col.label("eid"))
+            .where(scope_col == scope_key, text_col.like(_like_contains(tok), escape="\\"))
+            .order_by(order_col.desc())
+            .limit(per)
+            .subquery()
+        )
+        pieces.append(select(inner.c.eid))
+    if len(pieces) == 1:
+        return pieces[0]
+    unioned = sql_union(*pieces).subquery()
+    return select(unioned.c.eid)
+
 
 # ─────────────────────────────────────────────
 # 多对多关联表
@@ -191,6 +240,117 @@ class AIMemEpisode(SQLModel, table=True):
             await upsert_episode_vectors_batch(payload)
             written += len(chunk)
         return written
+
+    @classmethod
+    @with_read_session
+    async def search_by_tokens(
+        cls,
+        session: AsyncSession,
+        scope_key: str,
+        tokens: list[str],
+        limit: int = 24,
+    ) -> list["AIMemEpisode"]:
+        """按 token 词面召回本 scope 的 Episode（每 token 限条后 UNION，一次往返）。"""
+        if not tokens or not scope_key:
+            return []
+        id_q = _ids_matching_tokens(
+            col(cls.id),
+            col(cls.scope_key),
+            col(cls.content),
+            col(cls.valid_at),
+            scope_key,
+            tokens[:18],
+            limit,
+        )
+        stmt = select(cls).where(col(cls.id).in_(id_q))
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+
+    @classmethod
+    @with_read_session
+    async def search_by_valid_at_range(
+        cls,
+        session: AsyncSession,
+        scope_key: str,
+        start: datetime,
+        end: datetime,
+        limit: int = 24,
+    ) -> list["AIMemEpisode"]:
+        """本 scope 在 [start, end] 内的片段。相对日问句用，不是全库 dump。"""
+        if not scope_key or limit <= 0:
+            return []
+        lo = start.astimezone(timezone.utc).replace(tzinfo=None) if start.tzinfo is not None else start
+        hi = end.astimezone(timezone.utc).replace(tzinfo=None) if end.tzinfo is not None else end
+        stmt = (
+            select(cls)
+            .where(
+                col(cls.scope_key) == scope_key,
+                col(cls.valid_at) >= lo,
+                col(cls.valid_at) <= hi,
+            )
+            .order_by(col(cls.valid_at).desc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+
+    @classmethod
+    @with_read_session
+    async def neighbors_by_time(
+        cls,
+        session: AsyncSession,
+        scope_key: str,
+        valid_at: datetime,
+        before: int = 6,
+        after: int = 6,
+    ) -> list["AIMemEpisode"]:
+        """同一 scope 按 valid_at 取前后邻条，拼回证据会话。"""
+        if not scope_key or (before <= 0 and after <= 0):
+            return []
+        rows: list["AIMemEpisode"] = []
+        seen: set[str] = set()
+        if before > 0:
+            stmt_b = (
+                select(cls)
+                .where(col(cls.scope_key) == scope_key, col(cls.valid_at) <= valid_at)
+                .order_by(col(cls.valid_at).desc())
+                .limit(before + 1)
+            )
+            earlier = list((await session.execute(stmt_b)).scalars().all())
+            for row in reversed(earlier):
+                if row.id in seen:
+                    continue
+                seen.add(row.id)
+                rows.append(row)
+        if after > 0:
+            stmt_a = (
+                select(cls)
+                .where(col(cls.scope_key) == scope_key, col(cls.valid_at) > valid_at)
+                .order_by(col(cls.valid_at).asc())
+                .limit(after)
+            )
+            later = list((await session.execute(stmt_a)).scalars().all())
+            for row in later:
+                if row.id in seen:
+                    continue
+                seen.add(row.id)
+                rows.append(row)
+        return rows
+
+    @classmethod
+    @with_read_session
+    async def list_by_scope(
+        cls,
+        session: AsyncSession,
+        scope_key: str,
+        limit: int = 2000,
+    ) -> list["AIMemEpisode"]:
+        """同一 scope 按时间取出全部 Episode（评测还原 haystack 会话）。"""
+        if not scope_key or limit <= 0:
+            return []
+        stmt = select(cls).where(col(cls.scope_key) == scope_key).order_by(col(cls.valid_at).asc()).limit(limit)
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
 
     # ── §3.2① Episode 保留策略 / 冷热分集合 ──────────
     # Episode 是"每条放行消息都写"的无界增长主力（P0-2）。以下方法为生命周期 Worker
@@ -918,6 +1078,31 @@ class AIMemEdge(SQLModel, table=True):
             .order_by(col(cls.valid_at).desc())
             .limit(limit)
         )
+        return list(result.scalars().all())
+
+    @classmethod
+    @with_read_session
+    async def search_by_tokens(
+        cls,
+        session: AsyncSession,
+        scope_key: str,
+        tokens: list[str],
+        limit: int = 24,
+    ) -> list["AIMemEdge"]:
+        """按 token 词面召回本 scope 的 Edge（每 token 限条后 UNION，一次往返）。"""
+        if not tokens or not scope_key:
+            return []
+        id_q = _ids_matching_tokens(
+            col(cls.id),
+            col(cls.scope_key),
+            col(cls.fact),
+            col(cls.valid_at),
+            scope_key,
+            tokens[:18],
+            limit,
+        )
+        stmt = select(cls).where(col(cls.id).in_(id_q))
+        result = await session.execute(stmt)
         return list(result.scalars().all())
 
     # ── C11 记忆生命周期 ───────────────────────────

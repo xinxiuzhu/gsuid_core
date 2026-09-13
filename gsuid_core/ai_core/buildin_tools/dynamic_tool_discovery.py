@@ -5,7 +5,7 @@
 当AI发现自己缺乏某个能力时，可以调用此工具来发现可用的工具。
 """
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 from dataclasses import replace
 
 from pydantic_ai import RunContext
@@ -15,49 +15,84 @@ from gsuid_core.logger import logger
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.rag.tools import search_tools, search_tools_by_domain
-from gsuid_core.ai_core.output_firewall import EXPOSED_TOOLS_EXTRA_KEY
+from gsuid_core.ai_core.buildin_tools.visibility import (
+    check_sched_create,
+    check_sched_mutate,
+)
+from gsuid_core.ai_core.buildin_tools.find_tools_rank import (
+    RankedHit,
+    tool_brief,
+    agent_is_dedicated,
+    build_find_tools_plan,
+    classify_callable_tool,
+    format_find_tools_plan,
+    need_matches_tool_text,
+)
 
 FIND_TOOLS_LOADED_KEY = "find_tools_last_loaded"
 FIND_TOOLS_GAP_NOTE = (
-    "（系统：连续检索未暴露新工具。用角色短句说明做不到；禁止再 find_tools；禁止念工具名或叙述装载过程。）"
+    "（系统：连续检索未暴露新工具。可用 capability_map 查看全目录后再决定；"
+    "用角色短句说明做不到；禁止再 find_tools；禁止念工具名或叙述装载过程。）"
 )
+
+
+def _need_matches_tool_text(need: str, retrieval_text: str, covers: list[str]) -> bool:
+    """兼容旧导入；实现见 find_tools_rank.need_matches_tool_text。"""
+    return need_matches_tool_text(need, retrieval_text, covers)
 
 
 def _record_find_tools_round(extra: dict[str, Any], loaded: list[str]) -> bool:
     """记下本轮暴露名。返回 True 表示相对上一轮没有新名字。"""
+    from gsuid_core.ai_core.output_firewall import EXPOSED_TOOLS_EXTRA_KEY
+
     had_prev = FIND_TOOLS_LOADED_KEY in extra
     prev_raw = extra[FIND_TOOLS_LOADED_KEY] if had_prev else None
     prev: set[str] = set(prev_raw) if isinstance(prev_raw, list) else set()
     extra[FIND_TOOLS_LOADED_KEY] = list(loaded)
+    expose = [n for n in loaded if not n.startswith("agent:")]
     exposed_raw = extra[EXPOSED_TOOLS_EXTRA_KEY] if EXPOSED_TOOLS_EXTRA_KEY in extra else None
     if isinstance(exposed_raw, list):
-        for n in loaded:
+        for n in expose:
             if n not in exposed_raw:
                 exposed_raw.append(n)
     else:
-        extra[EXPOSED_TOOLS_EXTRA_KEY] = list(loaded)
+        extra[EXPOSED_TOOLS_EXTRA_KEY] = list(expose)
     if not had_prev:
         return False
     return set(loaded) <= prev
 
 
-def _format_node_line(node_id: str) -> Optional[str]:
-    """节点展示行：`node_id`（显示名）：when_to_use；节点不存在返回 None。"""
+def _node_hit(node_id: str, score: float) -> RankedHit | None:
     from gsuid_core.ai_core.agent_node import get_node
 
     node = get_node(node_id)
     if node is None:
         return None
     when = (node.when_to_use or "").strip() or node.display_name
-    return f"- `{node.node_id}`（{node.display_name}）：{when}"
+    return RankedHit(name=node.node_id, label=when, score=score)
 
 
-async def _capability_agent_lines(need: str, *, limit: int = 5) -> list[str]:
-    """按 need 匹配可委派能力代理，返回展示行（关键词快路径 + 语义兜底）。
+def nodes_with_keyword_hit(need: str) -> list[str]:
+    """match_keywords 出现在 need 里的节点（不含 persona / 评估器）。"""
+    from gsuid_core.ai_core.agent_node import list_nodes
 
-    关键词表是枚举式的、必有洞；语义匹配（节点检索空间）兜住枚举之外的表述。
-    两路合并去重，关键词命中排前。
-    """
+    blob = (need or "").strip().lower()
+    if not blob:
+        return []
+    hits: list[str] = []
+    for node in list_nodes():
+        if node.source == "persona" or node.node_id == "capability_evaluator":
+            continue
+        for kw in node.match_keywords:
+            k = (kw or "").strip().lower()
+            if k and k in blob:
+                hits.append(node.node_id)
+                break
+    return hits
+
+
+async def _matched_capability_node_ids(need: str, *, limit: int = 5) -> list[str]:
+    """关键词快路径 + 语义兜底 + 弱子串。返回 node_id，关键词命中排前。"""
     from gsuid_core.ai_core.agent_node import list_nodes
     from gsuid_core.ai_core.agent_node.registry import match_capability_node
     from gsuid_core.ai_core.agent_node.semantic_routing import semantic_match_nodes
@@ -65,32 +100,28 @@ async def _capability_agent_lines(need: str, *, limit: int = 5) -> list[str]:
     need_s = (need or "").strip()
     if not need_s:
         return []
-    lines: list[str] = []
+    ids: list[str] = []
     seen: set[str] = set()
 
     def _push(node_id: str) -> None:
-        if node_id in seen or len(lines) >= limit:
+        if node_id in seen or len(ids) >= limit:
             return
-        line = _format_node_line(node_id)
-        if line is None:
+        if _node_hit(node_id, 0.0) is None:
             return
         seen.add(node_id)
-        lines.append(line)
+        ids.append(node_id)
 
-    # 1) 关键词快路径：整句最长关键词命中的主节点
     primary = match_capability_node(need_s)
     if primary:
         _push(primary)
-    # 2) 语义兜底：关键词没覆盖的说法（跨领域新词）由向量空间接住
     try:
         for node_id, _score in await semantic_match_nodes(need_s, limit=limit):
             _push(node_id)
     except Exception as e:
         logger.debug(t("log.ai.find_tools_semantic_route_fail", e=e))
-    # 3) 注册表弱匹配补全（保留原有 token 子串逻辑，覆盖节点自述里的词）
     blob = need_s.lower()
     for node in list_nodes():
-        if len(lines) >= limit:
+        if len(ids) >= limit:
             break
         if node.node_id in seen:
             continue
@@ -110,12 +141,75 @@ async def _capability_agent_lines(need: str, *, limit: int = 5) -> list[str]:
                     break
         if hit:
             _push(node.node_id)
-    return lines
+    return ids
 
 
-def _delegation_directive(lines: list[str]) -> str:
-    """把候选节点行组装成委派指引文本。"""
-    return '请用 create_subagent(agent_profile="<node_id>", task=...) 委派给下列能力代理：\n' + "\n".join(lines)
+def _offered_dedicated_hits(
+    *,
+    names: Sequence[str],
+    need: str,
+    exclusive: set[str],
+) -> list[RankedHit]:
+    """已暴露专用工具里真正对口的，并入分档；短 cover 不会在这里误伤。"""
+    from gsuid_core.ai_core.register import find_tool_base
+
+    hits: list[RankedHit] = []
+    for name in names:
+        tb = find_tool_base(name)
+        if tb is None:
+            continue
+        covers = list(tb.covers)
+        retrieval = tb.retrieval_text
+        if not need_matches_tool_text(need, retrieval, covers):
+            continue
+        if (
+            classify_callable_tool(
+                name=tb.name,
+                category=tb.category,
+                plugin=tb.plugin,
+                hide_from_main=tb.hide_from_main,
+                exclusive=exclusive,
+            )
+            != "dedicated"
+        ):
+            continue
+        hits.append(
+            RankedHit(
+                name=tb.name,
+                label=tool_brief(covers=covers, description=tb.description),
+                score=3000.0,
+            )
+        )
+    return hits
+
+
+async def visible_offered_names(ctx: RunContext[ToolContext], names: Sequence[str]) -> list[str]:
+    """已加载名单去掉本步 visible_when 隐藏的（否则会诱导调用 Unknown tool）。"""
+    from gsuid_core.ai_core.register import find_tool_base
+    from gsuid_core.ai_core.agent_run.tools import _SCHED_CREATE_NAMES, _SCHED_MUTATE_NAMES
+
+    out: list[str] = []
+    for name in names:
+        tb = find_tool_base(name)
+        if tb is None:
+            continue
+        try:
+            run_ctx = replace(ctx, tool_name=name, retry=0, max_retries=1)
+        except TypeError:
+            run_ctx = ctx
+        try:
+            tool_def = await tb.tool.prepare_tool_def(run_ctx)
+        except Exception as e:
+            logger.debug(t("log.ai.find_tools_prepare_treated_unavailable_fail", p0=name, e=e))
+            tool_def = tb.tool
+        if not tool_def:
+            continue
+        if name in _SCHED_CREATE_NAMES and not check_sched_create(ctx.deps)[0]:
+            continue
+        if name in _SCHED_MUTATE_NAMES and not check_sched_mutate(ctx.deps)[0]:
+            continue
+        out.append(name)
+    return out
 
 
 # 能力缺口登记（4.5）：find_tools 未命中时计数，供运维按「高频被求而缺失」
@@ -142,59 +236,88 @@ async def find_tools(
     ctx: RunContext[ToolContext],
     need: str,
 ) -> str:
-    """按需加载完成任务所缺的工具（渐进式工具暴露）。
+    """列表没有的能力必须先调：用一句话描述所缺能力。未调用前禁止说做不到/没装。
 
-    当你发现当前可用工具里**没有**能完成用户需求的工具时，用一句话描述你需要的能力，
-    调用本工具。命中的相关工具会在**下一步**变为可直接调用——不要在本步假装调用它们，
-    先调用本工具把它们加载进来，再在后续步骤正式调用。
-
-    适用场景示例：
-    - 用户的追问语义太短、当前工具列表里找不到合适工具时（如澄清后回了个地名/时间）；
-    - 需要某类专门能力（查询外部数据、渲染图片、读写文件、查数据库等）但工具不在列。
+    每次都会检索，不因列表里已有工具而跳过。已暴露且真正对口的专用工具并入回执。
+    一次返回专用能力 / 专用工具 / 通用能力 / 通用工具；有专用项时禁止改用通用项。
+    专用工具下一步可直接调；专用能力用 create_subagent(agent_profile=node_id)。
 
     Args:
         ctx: 工具执行上下文。
-        need: 你需要的能力的自然语言描述，越具体越好（如"查询某城市的实时天气"）。
+        need: 所缺能力的一句话描述。
 
     Returns:
-        本次加载到的工具清单；这些工具下一步即可调用。
+        分档清单；对不上当没找到。
     """
     try:
-        # Phase 3a 两段式·domain 粒度检索：先语义召回（含 Reranker 精排），再聚合到
-        # capability_domain 整族纳入，保证"能创建就能改/删"，加载到的工具语义连贯而非零散单点。
-        family_tools = await search_tools_by_domain(query=need, domain_limit=3, per_domain_limit=6)
-        if not family_tools:
-            _record_capability_gap(need)
-            stale = _record_find_tools_round(ctx.deps.extra, [])
-            # 真无命中：不给"据现有能力作答"的编造许可证；语义层找委派出路。
-            agent_lines = await _capability_agent_lines(need)
-            if agent_lines:
-                msg = "🔎 未检索到可直接加载的工具，但该能力可能由能力代理持有。\n" + _delegation_directive(agent_lines)
-                return f"{msg}\n{FIND_TOOLS_GAP_NOTE}" if stale else msg
-            miss = (
-                f"⚠️ 未检索到与「{need}」相关的工具。可换更具体的能力描述重试一次；"
-                "若确实没有该能力，涉及实时数据/外部事实时如实角色化说明查不到，"
-                "禁止编造数值、禁止用网页摘要冒充实时读数。"
-            )
-            return f"{miss}\n{FIND_TOOLS_GAP_NOTE}" if stale else miss
+        from gsuid_core.ai_core.register import find_tool_base
+        from gsuid_core.ai_core.output_firewall import EXPOSED_TOOLS_EXTRA_KEY
+        from gsuid_core.ai_core.agent_node.registry import owning_nodes_of_tools
 
-        # 检索层不感知 visible_when，须与暴露层同用 prepare_tool_def 预判：隐藏工具若照报
-        # "已加载"，模型按名调用必 Unknown tool 并反复重试（实测踩坑）。静默剔除，仅落日志。
-        loaded_names: list[str] = []
+        exclusive = set(ctx.deps.blocked_tool_names)
+        offered_raw = ctx.deps.extra[EXPOSED_TOOLS_EXTRA_KEY] if EXPOSED_TOOLS_EXTRA_KEY in ctx.deps.extra else None
+        offered: list[str] = [n for n in offered_raw if isinstance(n, str)] if isinstance(offered_raw, list) else []
+        offered_set = set(offered)
+
+        # 已加载命中不短路：短 cover 会误把列表里的工具当对口，真正缺的就搜不到。
+        offered_hits = _offered_dedicated_hits(names=offered, need=need, exclusive=exclusive)
+        visible_offered = await visible_offered_names(ctx, [h.name for h in offered_hits])
+        visible_offered_set = set(visible_offered)
+        offered_hits = [h for h in offered_hits if h.name in visible_offered_set]
+
+        family_tools = await search_tools_by_domain(
+            query=need, domain_limit=3, per_domain_limit=6, exclude_names=offered_set
+        )
+        dedicated_tools: list[RankedHit] = list(offered_hits)
+        generic_tools: list[RankedHit] = []
+        fold_names: list[str] = []
         hidden_names: list[str] = []
-        for tool in family_tools:
-            run_ctx = replace(
-                ctx,
-                tool_name=tool.name,
-                retry=0,
-                max_retries=tool.max_retries if tool.max_retries is not None else 1,
+        for idx, tool in enumerate(family_tools):
+            tb = find_tool_base(tool.name)
+            if tb is None:
+                continue
+            covers = list(tb.covers)
+            retrieval = tb.retrieval_text
+            score = float(1000 - idx)
+            tier = classify_callable_tool(
+                name=tb.name,
+                category=tb.category,
+                plugin=tb.plugin,
+                hide_from_main=tb.hide_from_main,
+                exclusive=exclusive,
             )
+            if tier == "fold":
+                # 向量已召回；词面过滤会丢掉「对比表出成图」这类 exclusive
+                fold_names.append(tool.name)
+                continue
+            if not need_matches_tool_text(need, retrieval, covers):
+                continue
+            try:
+                run_ctx = replace(
+                    ctx,
+                    tool_name=tool.name,
+                    retry=0,
+                    max_retries=tool.max_retries if tool.max_retries is not None else 1,
+                )
+            except TypeError:
+                run_ctx = ctx
             try:
                 tool_def = await tool.prepare_tool_def(run_ctx)
             except Exception as e:
                 logger.debug(t("log.ai.find_tools_prepare_treated_unavailable_fail", p0=tool.name, e=e))
                 tool_def = None
-            (loaded_names if tool_def else hidden_names).append(tool.name)
+            if not tool_def:
+                hidden_names.append(tool.name)
+                continue
+            hit = RankedHit(
+                name=tool.name,
+                label=tool_brief(covers=covers, description=tb.description),
+                score=score,
+            )
+            if tier == "dedicated":
+                dedicated_tools.append(hit)
+            elif tool.name not in offered_set:
+                generic_tools.append(hit)
 
         if hidden_names:
             logger.info(
@@ -204,53 +327,61 @@ async def find_tools(
                     hidden_names=hidden_names,
                 )
             )
-        # 主人格交互轮：能力代理专属工具不得经 find_tools 回灌（与静态池剥离同口径）
-        blocked = ctx.deps.blocked_tool_names
-        blocked_hit_names = [n for n in loaded_names if n in blocked] if blocked else []
-        if blocked:
-            loaded_names = [n for n in loaded_names if n not in blocked]
 
-        if not loaded_names:
+        dedicated_agents: list[RankedHit] = []
+        generic_agents: list[RankedHit] = []
+        owner_ids: list[str] = []
+        if fold_names:
+            owners = owning_nodes_of_tools(fold_names)
+            for ids in owners.values():
+                for node_id in ids:
+                    if node_id not in owner_ids:
+                        owner_ids.append(node_id)
+        for idx, node_id in enumerate(owner_ids):
+            if not agent_is_dedicated(node_id):
+                continue
+            hit = _node_hit(node_id, float(2000 - idx))
+            if hit is not None:
+                dedicated_agents.append(hit)
+
+        for idx, node_id in enumerate(nodes_with_keyword_hit(need)):
+            if not agent_is_dedicated(node_id):
+                continue
+            hit = _node_hit(node_id, float(1500 - idx))
+            if hit is not None:
+                dedicated_agents.append(hit)
+
+        matched_ids = await _matched_capability_node_ids(need)
+        for idx, node_id in enumerate(matched_ids):
+            if agent_is_dedicated(node_id):
+                continue
+            hit = _node_hit(node_id, float(500 - idx))
+            if hit is not None:
+                generic_agents.append(hit)
+
+        plan = build_find_tools_plan(
+            dedicated_agents=dedicated_agents,
+            dedicated_tools=dedicated_tools,
+            generic_agents=generic_agents,
+            generic_tools=generic_tools,
+        )
+        if plan.is_empty():
             _record_capability_gap(need)
             stale_empty = _record_find_tools_round(ctx.deps.extra, [])
-            # 命中但全被 exclusive 剥离：工具真实存在、归能力代理专属——明确指路委派，
-            # 不再谎称"没有找到"（旧同文案把模型推向 web_search 顶替，见 2026-08-11 归因）。
-            if blocked_hit_names:
-                from gsuid_core.ai_core.agent_node.registry import owning_nodes_of_tools
+            from gsuid_core.ai_core.register import format_capability_family_overview
 
-                owners = owning_nodes_of_tools(blocked_hit_names)
-                owner_ids: list[str] = []
-                for ids in owners.values():
-                    for node_id in ids:
-                        if node_id not in owner_ids:
-                            owner_ids.append(node_id)
-                lines = [line for line in map(_format_node_line, owner_ids) if line]
-                if not lines:
-                    lines = await _capability_agent_lines(need)
-                if lines:
-                    locked = (
-                        "🔒 该类工具为能力代理专属，不在主人格手里直接装配（这是设计，不是缺失）。\n"
-                        + _delegation_directive(lines)
-                        + "\n对不上需求时可以换描述再找，或改搜网页。"
-                    )
-                    return f"{locked}\n{FIND_TOOLS_GAP_NOTE}" if stale_empty else locked
-            # 全被 visible_when 隐藏：维持不泄露隐藏工具存在，但给出语义委派兜底。
-            agent_lines = await _capability_agent_lines(need)
-            if agent_lines:
-                hidden = "🔎 未检索到当前场景可直接加载的工具，但该能力可能由能力代理持有。\n" + _delegation_directive(
-                    agent_lines
-                )
-                return f"{hidden}\n{FIND_TOOLS_GAP_NOTE}" if stale_empty else hidden
-            miss2 = (
+            fam = format_capability_family_overview(max_families=3, max_chars=400)
+            miss = (
                 f"⚠️ 未检索到与「{need}」相关的工具。可换更具体的能力描述重试一次；"
-                "若确实没有该能力，涉及实时数据/外部事实时如实角色化说明查不到，"
-                "禁止编造数值、禁止用网页摘要冒充实时读数。"
+                "若确实没有该能力，如实说明做不到，禁止编造。"
             )
-            return f"{miss2}\n{FIND_TOOLS_GAP_NOTE}" if stale_empty else miss2
+            if fam:
+                miss = f"{miss}\n{fam}"
+            return f"{miss}\n{FIND_TOOLS_GAP_NOTE}" if stale_empty else miss
 
+        loaded_names = plan.loadable_tool_names()
         ctx.deps.dynamic_tool_names.update(loaded_names)
-        stale = _record_find_tools_round(ctx.deps.extra, loaded_names)
-
+        stale = _record_find_tools_round(ctx.deps.extra, plan.fingerprint())
         logger.info(
             t(
                 "log.ai.find_tools_dynamically_requirement_load",
@@ -259,16 +390,10 @@ async def find_tools(
                 loaded_names=loaded_names,
             )
         )
-        listing = "\n".join(f"- {name}" for name in loaded_names)
-        parts = [f"✅ 已加载以下工具，下一步即可直接调用：\n{listing}"]
-        parts.append("若对不上需求，可换一句描述再 find_tools，或改用网页检索。")
-        # 通用：同步提示可委派的能力代理（插件注册的 node_id），不特判业务域
-        agent_lines = await _capability_agent_lines(need)
-        if agent_lines:
-            parts.append("若任务适合专职代理，" + _delegation_directive(agent_lines))
+        msg = format_find_tools_plan(plan)
         if stale:
-            parts.append(FIND_TOOLS_GAP_NOTE)
-        return "\n".join(parts)
+            return f"{msg}\n{FIND_TOOLS_GAP_NOTE}"
+        return msg
 
     except RuntimeError as e:
         logger.warning(t("log.ai.find_tools_feature_enabled", e=e))
@@ -276,6 +401,64 @@ async def find_tools(
     except Exception as e:
         logger.error(t("log.ai.find_tools_event", e=e))
         return f"⚠️ 工具加载失败: {str(e)}"
+
+
+@ai_tools(category="meta")
+async def capability_map(
+    ctx: RunContext[ToolContext],
+    scope: str = "all",
+    filter: str = "",
+) -> str:
+    """列出我（及可委派代理）的全部能力目录（不含参数细节）。
+
+    每行：工具名 — 覆盖场景一句话，按能力域分组。需要细节再用 find_tools 查具体工具。
+    单次最多 60 行；超出请按 domain/plugin 过滤再查。
+
+    Args:
+        ctx: 工具执行上下文。
+        scope: all / domain / plugin。
+        filter: 按能力域或插件名过滤。
+    """
+    _ = ctx
+    from gsuid_core.ai_core.register import get_all_tools, main_persona_roster_ok
+
+    tools = get_all_tools()
+    grouped: dict[str, list[str]] = {}
+    needle = (filter or "").strip().lower()
+    for _name, tb in tools.items():
+        if tb is None or not main_persona_roster_ok(tb):
+            continue
+        domain = tb.capability_domain or tb.plugin or "其他"
+        plugin = tb.plugin
+        if scope == "domain" and needle and needle not in domain.lower():
+            continue
+        if scope == "plugin" and needle and needle not in plugin.lower():
+            continue
+        if scope == "all" and needle and needle not in f"{tb.name} {domain} {plugin}".lower():
+            continue
+        cover = ""
+        if tb.covers:
+            cover = tb.covers[0]
+        elif tb.schema_brief:
+            cover = tb.schema_brief.split("。", 1)[0]
+        elif tb.description:
+            cover = tb.description.split("\n", 1)[0][:40]
+        grouped.setdefault(domain, []).append(f"{tb.name}：{cover}")
+    if not grouped:
+        return "目录为空。换 filter 或 scope 再查。"
+    if scope == "all":
+        lines = [f"【{domain}】 {len(rows)} 项" for domain, rows in sorted(grouped.items())]
+        lines.append("展开用 scope=domain 加 filter。")
+        return "\n".join(lines)
+    lines: list[str] = []
+    for domain in sorted(grouped):
+        lines.append(f"【{domain}】")
+        lines.extend(f"- {row}" for row in grouped[domain])
+        if len(lines) >= 60:
+            lines = lines[:60]
+            lines.append("（超出 60 行，请用 scope=domain/plugin 加 filter 再查）")
+            break
+    return "\n".join(lines)
 
 
 # @ai_tools(category="buildin")

@@ -389,55 +389,53 @@ PUT /api/logs/config
 ## 7.8 追踪日志 API
 
 > **适用范围**：仅追踪**命令执行路径**（用户发送 `/command` 或消息触发插件函数）。AI 核心路径（LLM 调用、tool use 等）有独立的 `ai_session_logs_api`，不走此追踪系统。
+>
+> HTTP `/api` 请求追踪是另一套账本，见 [45-http-traces.md](./45-http-traces.md)；不要把 HTTP 流量写入本节的 `logs/traces/` 或 `/api/traces*`。
 
 ### 存储架构
 
 | 层级 | 内容 | 用途 |
 |------|------|------|
 | 内存（仅执行中） | `TraceLogEntry` 列表 | **正在执行中**追踪的实时查询；命令一结束即落盘并从内存移除，不做内存保留 |
-| JSONL 目录 | 元数据（trace_id, command, user_id, status, duration_ms, log_count） | 已完成追踪目录索引 |
+| JSONL 目录 | `logs/traces/YYYY-MM-DD/index.jsonl` + `{ab}.jsonl` + `count`（非今天日历旁路；与 HTTP 同一套分片；旧整日 jsonl 仍可读） | 已完成追踪目录索引 |
 | daily log | 每条 JSON 带 `trace_id` 字段 | 完整日志持久化，供扫描提取 |
 
 > 已完成追踪不再驻留内存：查询其详情时从 JSONL（元数据）+ daily log（完整日志，按 `trace_id` 扫描重建）读取。异常退出导致未正常结束的 running 追踪，由后台任务按 `stale_running_sec`（默认 1h）兜底回收。
 
 ### 7.8.1 获取追踪列表（统一入口）
 ```
-GET /api/traces?date=2026-05-28&limit=100
+GET /api/traces?date=2026-05-28&page=1&per_page=100
 ```
 
 **Query 参数**：
 - `date`: 日期 YYYY-MM-DD，默认今天。用于扫描 JSONL 已完成追踪。
-- `limit`: 返回条数上限，默认 500
+- `page`: 页码，从 1 起，默认 1；超出末页时夹到末页
+- `per_page`: 每页条数，默认 100，夹取 `[1, 100]`
 
-合并内存中的 **running** 追踪和 JSONL 中的 **completed** 追踪，返回统一目录。前端点击 `trace_id` 后可调用 `GET /api/traces/{trace_id}` 查看详情。
+合并内存中的 **running** 追踪和 JSONL 中的 **completed** 追踪，过滤后分页。前端点击 `trace_id` 后可调用 `GET /api/traces/{trace_id}` 查看详情。
 
 **响应**：
 ```json
 {
     "status": 0,
     "msg": "ok",
-    "data": [
-        {
-            "trace_id": "a1b2c3d4-xxx",
-            "command": "签到",
-            "user_id": "12345",
-            "group_id": "67890",
-            "start_time": 1748356800.123,
-            "duration_ms": 3000,
-            "log_count": 15,
-            "status": "completed"
-        },
-        {
-            "trace_id": "e5f6g7h8-xxx",
-            "command": "我的自选",
-            "user_id": "12345",
-            "group_id": "67890",
-            "start_time": 1748356900.456,
-            "duration_ms": null,
-            "log_count": 42,
-            "status": "running"
-        }
-    ]
+    "data": {
+        "rows": [
+            {
+                "trace_id": "a1b2c3d4-xxx",
+                "command": "签到",
+                "user_id": "12345",
+                "group_id": "67890",
+                "start_time": 1748356800.123,
+                "duration_ms": 3000,
+                "log_count": 15,
+                "status": "completed"
+            }
+        ],
+        "count": 1,
+        "page": 1,
+        "per_page": 100
+    }
 }
 ```
 
@@ -523,8 +521,9 @@ GET /api/traces/daily_counts?days=60
 - `days`: 回溯天数，默认 `60`（约两个月），服务端自动夹取到 `[1, 366]`。
 
 **统计口径**：
-- 数据源为 JSONL 目录（`logs/traces/YYYY-MM-DD.jsonl`），按 `trace_id` 去重计数，同一追踪的 `running -> completed` 多条记录只算一次。
-- **今天的计数实时可见**：running 追踪在开始时即写入 JSONL running 标记，无需等命令结束。
+- 数据源为 JSONL 目录（`logs/traces/YYYY-MM-DD/index.jsonl`，旧整日文件仍可读），按 `trace_id` 去重计数，同一追踪的 `running -> completed` 多条记录只算一次。
+- **今天的计数实时可见**：running 追踪在开始时即写入 JSONL running 标记，无需等命令结束；今天每次扫 index。
+- **非今天**读 `{date}/count` 旁路（带 index/legacy 大小指纹）；源文件变了会重扫并回写。
 - 当天无命令（JSONL 文件不存在）→ 计数为 `0`。
 
 **响应**：

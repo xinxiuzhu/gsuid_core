@@ -11,6 +11,7 @@ from typing import (
     Optional,
     Sequence,
     Awaitable,
+    overload,
 )
 from functools import wraps
 from typing_extensions import ParamSpec, Concatenate
@@ -152,6 +153,8 @@ class _CrossLoopAsyncSemaphore:
         self._semaphore.release()
 
 
+sqlite_read_semaphore = None
+
 if _db_type == "sqlite":
     sync_url = "sqlite:///"
     base_url = "sqlite+aiosqlite:///"
@@ -176,7 +179,8 @@ else:
 
 
 async def init_database():
-    global _db_initialized, engine, finally_url, async_maker, sqlite_semaphore, sqlite_write_lock
+    global _db_initialized, engine, finally_url, async_maker
+    global sqlite_semaphore, sqlite_read_semaphore, sqlite_write_lock
 
     if _db_initialized:
         return
@@ -221,10 +225,9 @@ async def init_database():
                     cursor.execute("PRAGMA synchronous=NORMAL")
                     cursor.close()
 
-                # WWUID 的后台分发器运行在独立线程和事件循环中，不能共享
-                # asyncio.Semaphore/Lock。这里使用跨事件循环限流器，并将所有
-                # 标记为 write=True 的事务放入同一个进程级写锁。
+                # 跨事件循环限流；独立读槽避免写事务阻塞 WAL 读取。
                 sqlite_semaphore = _CrossLoopAsyncSemaphore(8)
+                sqlite_read_semaphore = _CrossLoopAsyncSemaphore(24)
                 sqlite_write_lock = _CrossLoopAsyncLock()
             else:
                 db_config.update(
@@ -302,24 +305,23 @@ def _is_transient_db_error(err: BaseException) -> bool:
     return "database is locked" in msg or "database table is locked" in msg or "busy" in msg or "disk i/o error" in msg
 
 
-def with_session(
-    func: Callable[Concatenate[Any, AsyncSession, P], Awaitable[R]] | None = None,
+def _session_wrapper(
+    func: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]],
     *,
+    read_only: bool,
     write: bool = False,
-):
-    if func is None:
-        return lambda wrapped: with_session(wrapped, write=write)
-
+) -> Callable[Concatenate[T, P], Awaitable[R]]:
     @wraps(func)
-    async def wrapper(self, *args: P.args, **kwargs: P.kwargs):
+    async def wrapper(self: T, *args: P.args, **kwargs: P.kwargs) -> R:
         max_retries = 3
         last_err: BaseException | None = None
         for attempt in range(max_retries):
             try:
 
-                async def run_with_session():
-                    if sqlite_semaphore:
-                        async with sqlite_semaphore:
+                async def run_with_session() -> R:
+                    sem = sqlite_read_semaphore if read_only else sqlite_semaphore
+                    if sem:
+                        async with sem:
                             async with async_maker() as session:
                                 data = await func(self, session, *args, **kwargs)
                                 await session.commit()
@@ -364,7 +366,48 @@ def with_session(
             raise last_err
         raise RuntimeError(i18n_t("[数据库] with_session 未知失败"))
 
-    return wrapper  # type: ignore
+    return wrapper
+
+
+@overload
+def with_session(
+    func: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]],
+    *,
+    write: bool = False,
+) -> Callable[Concatenate[T, P], Awaitable[R]]: ...
+
+
+@overload
+def with_session(
+    func: None = None,
+    *,
+    write: bool = False,
+) -> Callable[[Callable[Concatenate[T, AsyncSession, P], Awaitable[R]]], Callable[Concatenate[T, P], Awaitable[R]]]: ...
+
+
+def with_session(
+    func: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]] | None = None,
+    *,
+    write: bool = False,
+) -> (
+    Callable[Concatenate[T, P], Awaitable[R]]
+    | Callable[[Callable[Concatenate[T, AsyncSession, P], Awaitable[R]]], Callable[Concatenate[T, P], Awaitable[R]]]
+):
+    def decorate(
+        wrapped: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]],
+    ) -> Callable[Concatenate[T, P], Awaitable[R]]:
+        return _session_wrapper(wrapped, read_only=False, write=write)
+
+    if func is None:
+        return decorate
+    return decorate(func)
+
+
+def with_read_session(
+    func: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]],
+) -> Callable[Concatenate[T, P], Awaitable[R]]:
+    """SELECT 走独立读槽，不跟大写抢 sqlite_semaphore。WAL 下可读。"""
+    return _session_wrapper(func, read_only=True)
 
 
 async def get_all_table_ddl(engine: AsyncEngine) -> Dict[str, str]:

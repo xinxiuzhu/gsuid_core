@@ -58,6 +58,7 @@ add_sv = SV(name="查询帮助信息", pm=6, area="ALL") # 一般只需要定义
 4. **`on_message` 关键警告**：会接收**所有消息**，框架内部会按 `priority` 排序所有触发器，
    `on_message` 在最低优先级。一旦你写了一个 `on_message` 不限制条件就 `await bot.send(...)`，
    机器人会复读所有消息——只用于"消息计数"、"被动观察"、"日志记录"等非应答场景。
+   **不计入命令统计**（不挡 AI、不进 Trace）；默认 `unique_id` 是 uuid4，不要拿它当命令名。
 
 5. **`on_file(ext)` 的 `ev.file_name`**：用户上传 `cat.png` 时，`ext` 必须是 `"png"`（不带点），
    `ev.file_name` 给你 `"cat.png"`，`ev.file` 为 `True`，但**真实文件内容**需要你自己从平台拉取
@@ -73,6 +74,8 @@ add_sv = SV(name="查询帮助信息", pm=6, area="ALL") # 一般只需要定义
 | `to_me` | `bool` | `False` | 是否必须 @ 机器人才触发（`ev.is_tome=True`） |
 | `prefix` | `bool` | `True` | 是否给关键词自动拼上插件的 `force_prefix`/`prefix`（**几乎总是 True**） |
 | `to_ai` | `str` | `""` | 非空时自动把本触发器注册为 AI 工具（详见第十章）。⚠️ 与 `@ai_tools` 冲突，不可同时使用 |
+| `covers` | `list[str] \| None` | `None` | 数据/能力覆盖面，进向量检索与 `find_tools` 单向命中（仅 `to_ai` 非空时生效） |
+| `aliases` | `list[str] \| None` | `None` | 带领域前缀的同义问法，如 `["天气·查城市天气"]`（仅 `to_ai` 非空时生效） |
 
 **`block=True` 使用建议**：
 - 高优先级"短路"触发器（如插件级帮助、错误提示）应 `block=True`，避免兜底触发器再次响应。

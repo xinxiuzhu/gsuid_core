@@ -30,11 +30,13 @@ BACKUP: _Tag = [f"{_SYS}/系统/备份"]
 LOGS: _Tag = [f"{_SYS}/系统/日志"]
 SCHEDULER: _Tag = [f"{_SYS}/系统/调度器"]
 TRACE: _Tag = [f"{_SYS}/系统/链路追踪"]
+HTTP_TRACE: _Tag = [f"{_SYS}/系统/HTTP 请求追踪"]
 STATE_STORE: _Tag = [f"{_SYS}/系统/状态存储"]
 
 # ─────────────────────────── 插件 ───────────────────────────
 PLUGINS: _Tag = [f"{_SYS}/插件/插件管理"]
 PLUGIN_ICON: _Tag = [f"{_SYS}/插件/插件图标"]
+PLUGIN_PAGES: _Tag = [f"{_SYS}/插件/插件页面"]
 GIT_MIRROR: _Tag = [f"{_SYS}/插件/Git 镜像源"]
 GIT_UPDATE: _Tag = [f"{_SYS}/插件/Git 更新"]
 

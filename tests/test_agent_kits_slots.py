@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, List
+from datetime import datetime
 
 import pytest
 
@@ -57,15 +58,27 @@ def test_block_order_is_the_single_source(isolated) -> None:
     """块名表是唯一顺序定义；A 写 memory、C 写 relationship，名字不许各自造。"""
     assert CONTEXT_BLOCK_ORDER.index("mood") < CONTEXT_BLOCK_ORDER.index("relationship")
     assert CONTEXT_BLOCK_ORDER.index("identity") < CONTEXT_BLOCK_ORDER.index("history")
+    assert CONTEXT_BLOCK_ORDER.index("history") < CONTEXT_BLOCK_ORDER.index("group_context")
+    assert CONTEXT_BLOCK_ORDER.index("group_context") < CONTEXT_BLOCK_ORDER.index("memory")
+    assert CONTEXT_BLOCK_ORDER.index("task") < CONTEXT_BLOCK_ORDER.index("plan_hint")
     assert CONTEXT_BLOCK_ORDER.index("history") < CONTEXT_BLOCK_ORDER.index("memory")
     assert CONTEXT_BLOCK_ORDER[-1] == "plugin_hints", "第三方 hint 恒在最后"
-    for name in ("memory", "relationship", "mood", "identity", "history", "plugin_hints"):
+    for name in (
+        "memory",
+        "relationship",
+        "mood",
+        "identity",
+        "history",
+        "group_context",
+        "plan_hint",
+        "plugin_hints",
+    ):
         assert is_known_block(name)
     assert not is_known_block("whatever")
 
 
 def test_slot_table_covers_18_replaceable_units(isolated) -> None:
-    assert len(KIT_SLOTS) == 18
+    assert len(KIT_SLOTS) == 19
     names = {s.name for s in KIT_SLOTS}
     # 槽名不含点号：点号既是槽名一部分又是配置层级分隔符会有解析歧义
     assert all("." not in n for n in names), names
@@ -315,6 +328,30 @@ def test_both_entries_stamp_current_time_from_one_producer() -> None:
     assert "stamp_current_time" in handle_ai, "一轮编排必须钉时间行"
     assert "run_interactive_turn(" in endpoint, "评测必须走同一轮编排（时间行在那里钉）"
     assert "[当前时间：" not in handle_ai and "[当前时间：" not in endpoint
+    kit = (root / "ai_core" / "kits" / "memory" / "kit.py").read_text(encoding="utf-8")
+    assert "timeout_ms=15_000" in kit
+    assert "timeout_ms=45_000" not in kit
+    assert "clock_date=clock_date" in endpoint
+    assert "memory_eval" in endpoint
+
+
+def test_stamp_current_time_uses_explicit_clock() -> None:
+    """评测 clock_at 必须盖掉墙上时钟，否则 temporal-reasoning 会按 2026 算几天前。"""
+    from gsuid_core.ai_core.turn_pipeline import parse_clock_at, current_time_line, stamp_current_time
+
+    clock = parse_clock_at("2023/04/18 16:50")
+    assert clock == datetime(2023, 4, 18, 16, 50, 0)
+    dated = parse_clock_at("2023/05/30 (Tue) 23:40")
+    assert dated == datetime(2023, 5, 30, 23, 40, 0)
+    line = current_time_line(clock)
+    assert "2023-04-18 16:50:00" in line
+    assert "星期二" in line
+    wall = current_time_line()
+    assert "2023-04-18" not in wall
+    msgs: list[str] = ["How many days ago was rafting?"]
+    stamp_current_time(msgs, now=parse_clock_at("2023/06/17 17:34"))
+    assert "2023-06-17 17:34:00" in msgs[0]
+    assert "2026-" not in msgs[0]
 
 
 def test_kernel_tool_assembly_gate_is_config_driven_not_occupancy() -> None:

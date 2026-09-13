@@ -94,9 +94,10 @@ AI_CONFIG: Dict[str, GSC] = {
     ),
     "websearch_provider": GsStrConfig(
         "网络搜索服务提供方（主用）",
-        "指定网络搜索的主用提供方。多源策略非「无」时，失败会按备用顺序切换到其它已配置源",
-        "Tavily",
-        options=["Tavily", "Jina", "Exa", "MCP"],
+        "指定网络搜索的主用提供方。未配置或主用无 Key 时走 AnySearch 匿名额度。"
+        "多源策略非「无」时，失败会按备用顺序切换到其它已配置源",
+        "AnySearch",
+        options=["AnySearch", "Firecrawl", "Tavily", "Jina", "Exa", "MCP"],
     ),
     "websearch_lb_strategy": GsStrConfig(
         "网络搜索多源策略",
@@ -106,9 +107,10 @@ AI_CONFIG: Dict[str, GSC] = {
     ),
     "websearch_fallback_order": GsListStrConfig(
         "网络搜索备用源顺序",
-        "错误切换/自动分流时的候选顺序（不含主用源）。留空则自动收集所有已配置的源（顺序：Tavily → Exa → Jina → MCP）",
+        "错误切换/自动分流时的候选顺序（不含主用源）。留空则自动收集已配置源"
+        "（顺序：AnySearch → Firecrawl → Tavily → Exa → Jina → MCP）",
         [],
-        options=["Tavily", "Jina", "Exa", "MCP"],
+        options=["AnySearch", "Firecrawl", "Tavily", "Jina", "Exa", "MCP"],
     ),
     "webfetch_provider": GsStrConfig(
         "网页抓取服务提供方（主用）",
@@ -218,15 +220,79 @@ AI_CONFIG: Dict[str, GSC] = {
         "单会话注入模型的最大历史消息条数。工具型 run 单轮产生 10+ 条消息, 过小会导致"
         "几乎每轮触发 compact、provider 前缀缓存反复失效(方案五); 调大可记住更多上文、"
         "减少 compact, 但更费 Token、也更易超出模型上下文",
-        30,
+        50,
         options=[10, 15, 20, 30, 50, 80],
     ),
     "suppress_intermediate_text": GsBoolConfig(
         "抑制中间文本",
-        "开启后, 本轮出现过工具调用时其前后伴随的文本片段(中间步骤碎碎念)不发送给用户, 只保留"
-        "没有任何工具调用的最终回复, 避免多工具编排时刷屏。调用方显式传 suppress_intermediate_text=True 时"
-        "仍强制抑制。修改后即时生效",
+        "开启后按「第几次带函数 ToolCall 的响应」分槽: 首次可一句接任务, 其后切工具静默,"
+        "无 ToolCall 的终局开口。内容仍走已有闸门。调用方显式传 True 时仍强制抑制。修改后即时生效",
         True,
+    ),
+    "session_tool_ceiling": GsIntConfig(
+        "会话工具名硬顶",
+        "主会话工具名列表上限; 超顶拒新名、不 evict。修改后即时生效",
+        24,
+        options=[12, 16, 24, 32, 48],
+    ),
+    "group_session_tool_ceiling": GsIntConfig(
+        "群聊会话工具名硬顶",
+        "群聊瘦核下的工具名上限; 超顶拒新名、不 evict。闲聊保持瘦核, 有持久实体时才 append。修改后即时生效",
+        20,
+        options=[12, 16, 20, 24, 32],
+    ),
+    "group_idle_max_iterations": GsIntConfig(
+        "群聊空闲轮最大思考轮数",
+        "群聊无跟进且无在途任务时的 request_limit 上限, 防止零工具空转。修改后即时生效",
+        2,
+        options=[2, 3, 4, 6, 9],
+    ),
+    "main_channel_visible_limit": GsIntConfig(
+        "主通道单轮出站上限",
+        "同 run 主通道可见台词段数上限(接任务应 + 终局各占一格)。修改后即时生效",
+        2,
+        options=[1, 2, 3],
+    ),
+    "group_lurk_mode": GsBoolConfig(
+        "群聊未点名默认静默",
+        "开启后群聊未点名且非主人/呼名/省略跟进/活跃任务时默认 SILENCE。不含 soft_continue。默认关闭。修改后即时生效",
+        False,
+    ),
+    "group_at_list_max": GsIntConfig(
+        "群聊 at 列表展开上限",
+        "at_list 超过该长度则拒绝扩写点名, 只记条数。修改后即时生效",
+        8,
+        options=[4, 8, 12, 16],
+    ),
+    "group_repeat_body_n": GsIntConfig(
+        "同人短窗同文重复次数",
+        "同一用户短窗内相同正文达到该次数则本轮 SILENCE。修改后即时生效",
+        3,
+        options=[2, 3, 5, 8],
+    ),
+    "thinking_text_max": GsIntConfig(
+        "thinking 蒸馏字数上限",
+        "hook_ctx.thinking_text 取 thinking 尾部的最大字数。修改后即时生效",
+        2000,
+        options=[500, 1000, 2000, 4000],
+    ),
+    "remember_fact_trunc": GsIntConfig(
+        "短工具回执 FACT 截断字数",
+        "未落盘的短工具回执写入 FACT 时的摘要截断长度。修改后即时生效",
+        200,
+        options=[80, 120, 200, 400],
+    ),
+    "outbound_topic_n": GsIntConfig(
+        "出站 topic 缺省字数",
+        "record_outbound 的 topic 为空时, 用可见文本前 N 字。修改后即时生效",
+        12,
+        options=[8, 12, 16, 24],
+    ),
+    "capability_roster_max": GsIntConfig(
+        "能力花名册单行字数上限",
+        "system 花名册每行 when_to_use 上限；不截断丢节点。详情走 capability_map。修改后下次新建会话生效",
+        120,
+        options=[80, 120, 200, 800, 1800],
     ),
     "agent_max_run_attempts": GsIntConfig(
         "核心请求重试次数",
@@ -532,7 +598,7 @@ MCP_SERVER_CONFIG: Dict[str, GSC] = {
     ),
 }
 
-# 槽位配置从 KIT_SLOTS 派生: 18 个近似条目手写必然与槽位表漂移。
+# 槽位配置从 KIT_SLOTS 派生: 手写条目必然与槽位表漂移。
 for _slot_spec in KIT_SLOTS:
     _hint = "off=该槽无占用者" + ("(密封槽, 关闭会拆安全面)" if _slot_spec.sealed else "")
     AI_CONFIG[f"kit_slots.{_slot_spec.name}"] = GsStrConfig(
@@ -548,7 +614,7 @@ PERSONA_CONFIG: Dict[str, GSC] = {
         "启用人设服务",
         "指定启用某些人设服务",
         [],
-        options=["早柚"],
+        options=[],
     ),
     "persona_for_session": GsDictConfig(
         "人设服务针对群聊",
@@ -597,6 +663,64 @@ EXA_CONFIG: Dict[str, GSC] = {
         "指定搜索类型，neural 为语义搜索（更智能），keyword 为关键词搜索（更精确）",
         "neural",
         options=["neural", "keyword"],
+    ),
+}
+
+ANYSEARCH_CONFIG: Dict[str, GSC] = {
+    "api_key": GsListStrConfig(
+        "AnySearch API密钥",
+        "指定 AnySearch API 的密钥。可不填：匿名按 IP 限流并消耗每日免费额度。"
+        "请前往 https://anysearch.com/console/api-keys 获取。无效 Key 不会回落匿名。支持多 Key 池轮询",
+        [],
+        options=[],
+    ),
+    "max_results": GsIntConfig(
+        "最大搜索结果数",
+        "POST /v1/search 的 max_results，默认 10，范围 1–100",
+        10,
+        max_value=100,
+        options=[5, 10, 15, 20, 50, 100],
+    ),
+    "timeout": GsIntConfig(
+        "请求超时(秒)",
+        "调用 api.anysearch.com/v1/search 的超时时间",
+        30,
+        options=[10, 15, 20, 30, 45, 60],
+    ),
+    "zone": GsStrConfig(
+        "搜索区域",
+        "REST zone：cn 或 intl。留空则不传，由服务端按查询路由",
+        "",
+        options=["cn", "intl"],
+    ),
+    "language": GsStrConfig(
+        "偏好语言",
+        "REST language，如 zh-CN / en。留空则不传",
+        "",
+        options=["zh-CN", "en"],
+    ),
+}
+
+FIRECRAWL_CONFIG: Dict[str, GSC] = {
+    "api_key": GsListStrConfig(
+        "Firecrawl API密钥",
+        "指定 Firecrawl API 的密钥。可不填：走 keyless 免费档（按 IP 限流）。"
+        "请前往 https://www.firecrawl.dev 获取。无效 Key 不会回落匿名。支持多 Key 池轮询",
+        [],
+        options=[],
+    ),
+    "max_results": GsIntConfig(
+        "最大搜索结果数",
+        "AsyncFirecrawl.search 的 limit，默认 10，范围 1–100",
+        10,
+        max_value=100,
+        options=[5, 10, 15, 20, 50, 100],
+    ),
+    "timeout": GsIntConfig(
+        "请求超时(秒)",
+        "调用 Firecrawl /v2/search 的超时时间（SDK timeout 以毫秒下发）",
+        30,
+        options=[10, 15, 20, 30, 45, 60],
     ),
 }
 
@@ -709,9 +833,12 @@ WEB_FETCH_CONFIG: Dict[str, GSC] = {
 LOCAL_EMBEDDING_CONFIG: Dict[str, GSC] = {
     "embedding_model_name": GsStrConfig(
         "指定嵌入模型名称",
-        "指定启用的嵌入模型名称",
+        "本地 fastembed 模型。jina-v2-base-zh 中英混合且 8192 token；bge-small-zh 仅中文且 512 token 会截断长片段",
         "BAAI/bge-small-zh-v1.5",
-        options=["BAAI/bge-small-zh-v1.5"],
+        options=[
+            "jinaai/jina-embeddings-v2-base-zh",
+            "BAAI/bge-small-zh-v1.5",
+        ],
     ),
     "embedding_modalities": GsListStrConfig(
         "嵌入模型支持的模态",
@@ -882,8 +1009,8 @@ MEMORY_CONFIG: Dict[str, GSC] = {
     "memory_inject_max_chars": GsIntConfig(
         "记忆注入字符预算",
         "单次注入对话上下文的记忆文本最大字符数, 调大可保留更多历史但更费 Token",
-        2000,
-        options=[1000, 2000, 4000, 8000, 16000],
+        800,
+        options=[400, 800, 1000, 2000, 4000],
     ),
     "enable_system2get": GsBoolConfig(
         "是否启用 System-2",
@@ -1114,6 +1241,18 @@ exa_config = StringConfig(
     "GsCore AI Exa搜索配置",
     get_res_path("ai_core") / "exa_config.json",
     EXA_CONFIG,
+)
+
+anysearch_config = StringConfig(
+    "GsCore AI AnySearch搜索配置",
+    get_res_path("ai_core") / "anysearch_config.json",
+    ANYSEARCH_CONFIG,
+)
+
+firecrawl_config = StringConfig(
+    "GsCore AI Firecrawl搜索配置",
+    get_res_path("ai_core") / "firecrawl_config.json",
+    FIRECRAWL_CONFIG,
 )
 
 jina_config = StringConfig(

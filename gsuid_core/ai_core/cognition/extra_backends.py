@@ -182,3 +182,72 @@ async def search_memes_backend(query: str, *, scope: CogScope, limit: int) -> _B
         )
         ids.append(hid)
     return ids, hits
+
+
+async def search_meme_knowledge_backend(query: str, *, scope: CogScope, limit: int) -> _BackendResult:
+    try:
+        from gsuid_core.ai_core.meme.database_model import AiMemeKnowledge
+
+        scope_key = f"group:{scope.group_id}" if scope.group_id else ""
+        rows = await AiMemeKnowledge.match_terms(
+            query,
+            bot_id=scope.bot_id or "",
+            scope_key=scope_key,
+            limit=limit,
+        )
+    except Exception as e:
+        logger.debug(t("log.ai.cognition_backend_fail", backend="meme_knowledge", e=e))
+        return _EMPTY
+    ids: List[str] = []
+    hits: Dict[str, CognitiveHit] = {}
+    for row in rows:
+        hid = f"memeknow_{row.id}"
+        meaning = (row.meaning or "")[:120]
+        hits[hid] = CognitiveHit(
+            kind=CogKind.MEME_KNOWLEDGE,
+            id=hid,
+            title=row.term,
+            summary=f"{meaning}（来源：{row.source or '未知'}）",
+            score=min(0.95, 0.5 + row.confidence * 0.4),
+            source="meme_knowledge",
+        )
+        ids.append(hid)
+    return ids, hits
+
+
+async def search_outbound(query: str, *, scope: CogScope, limit: int) -> _BackendResult:
+    from datetime import datetime
+
+    from gsuid_core.ai_core.database.outbound import OutboundAudit
+
+    gid = str(scope.group_id) if scope.group_id else (f"direct:{scope.user_id}" if scope.user_id else "")
+    if not gid:
+        return _EMPTY
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    try:
+        rows = await OutboundAudit.search_recent(group_id=gid, query=query, limit=limit)
+    except (OperationalError, ProgrammingError) as e:
+        logger.debug(t("log.ai.cognition_backend_fail", backend="outbound", e=e))
+        return _EMPTY
+    ids: List[str] = []
+    hits: Dict[str, CognitiveHit] = {}
+    for row in rows:
+        hid = f"ob_{row.id}"
+        as_of = datetime.fromtimestamp(row.ts).strftime("%Y-%m-%d %H:%M") if row.ts else ""
+        title = row.topic or "出站"
+        summary = (row.text or title)[:120]
+        if row.image_handles:
+            summary = f"{summary} {row.image_handles}".strip()[:160]
+        hits[hid] = CognitiveHit(
+            kind=CogKind.OUTBOUND,
+            id=hid,
+            title=title,
+            summary=summary,
+            score=0.7,
+            as_of=as_of,
+            handle=row.image_handles.split(",", 1)[0] if row.image_handles else "",
+            source="outbound",
+        )
+        ids.append(hid)
+    return ids, hits

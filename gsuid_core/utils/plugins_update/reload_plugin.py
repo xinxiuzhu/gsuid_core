@@ -161,6 +161,30 @@ def _clean_plugin_global_state(plugin_name: str) -> None:
     # ④ Agent 环 hook + 套件槽 + AI 工具注册表
     _clean_plugin_agent_state(plugin_name)
 
+    # ⑤ 帮助图缓存与一览注册条目
+    try:
+        from gsuid_core.help.utils import clean_plugin_help
+
+        clean_plugin_help(plugin_name)
+    except Exception as e:
+        logger.warning(i18n_t("log.plugin.gscore_fail_help_cache", plugin_name=plugin_name, e=e))
+
+    # ⑥ 插件 Web 页面注册表（静态页 metadata；路由本身由 Core 统一 catch-all 提供）
+    try:
+        from gsuid_core.webconsole.plugin_page import unregister_plugin_pages
+
+        removed_pages = unregister_plugin_pages(plugin_name)
+        if removed_pages:
+            logger.info(
+                i18n_t(
+                    "log.plugin.gscore_plugin_pages_unregistered",
+                    plugin_name=plugin_name,
+                    removed_pages=removed_pages,
+                )
+            )
+    except Exception as e:
+        logger.warning(i18n_t("log.plugin.gscore_fail_plugin_pages", plugin_name=plugin_name, e=e))
+
 
 def _clean_plugin_agent_state(plugin_name: str) -> None:
     """摘掉插件的 Agent 环 hook、让它占用的槽位回落默认套件、卸掉它注册的 AI 工具。
@@ -359,6 +383,11 @@ def reload_plugin(plugin_name: str) -> str:
     if plugin_path is None:
         return f"❌ 插件{plugin_name}不存在!"
 
+    from gsuid_core.server import read_meta_plugin_info
+    from gsuid_core.meta_plugins import unregister_meta_plugin
+
+    meta_info = read_meta_plugin_info(plugin_path)
+
     # 预检可加载模块列表（不 import）；空列表或错误信息直接返回，不触碰运行时状态
     module_list = gss.load_plugin(plugin_path)
     if module_list is None:
@@ -391,6 +420,8 @@ def reload_plugin(plugin_name: str) -> str:
     # 第三步：清理 sys.modules 和 _module_cache
     # 必须覆盖所有子模块，不能只清入口
     # ──────────────────────────────────────────
+    if meta_info is not None:
+        unregister_meta_plugin(plugin_name)
     stale_modules = [k for k in sys.modules if _belongs_to_plugin(k, plugin_name)]
     for k in stale_modules:
         sys.modules.pop(k, None)
@@ -418,12 +449,20 @@ def reload_plugin(plugin_name: str) -> str:
     # ──────────────────────────────────────────
     # 第四步：重新加载（使用第 0 步已解析的 Path，避免仅查 plugins/ 漏掉内置插件）
     # ──────────────────────────────────────────
+    import_error: Optional[str] = None
     for module_name, filepath, _type in module_list:
         try:
             gss.cached_import(module_name, filepath, _type)
         except Exception as e:
             logger.exception(i18n_t("log.plugin.module_name_fail", module_name=module_name, e=e))
-            return f"❌ 重载失败: {e}"
+            import_error = f"❌ 重载失败: {e}"
+            break
+
+    if meta_info is not None:
+        gss.bind_loaded_meta_plugin(meta_info, module_list)
+
+    if import_error is not None:
+        return import_error
 
     # ──────────────────────────────────────────
     # 第 4.5 步：把刚 append 到末尾的新路由放回原 anchor 位置

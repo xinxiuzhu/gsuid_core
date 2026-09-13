@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any
+from typing import Any, Sequence
 
 from pydantic_graph import End
 from pydantic_ai.agent import CallToolsNode, ModelRequestNode
@@ -11,12 +11,18 @@ from pydantic_ai.messages import (
     TextPart,
     ThinkingPart,
     ToolCallPart,
+    TextPartDelta,
+    PartDeltaEvent,
+    PartStartEvent,
     ToolReturnPart,
     UserPromptPart,
+    ThinkingPartDelta,
     NativeToolCallPart,
     NativeToolReturnPart,
+    ModelResponseStreamEvent,
 )
 
+from gsuid_core.bot import Bot
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
 from gsuid_core.ai_core import (
@@ -26,6 +32,7 @@ from gsuid_core.ai_core import (
     angle_bracket_guard,
 )
 from gsuid_core.ai_core.utils import (
+    ThinkTagSplitter,
     send_chat_result,
     is_silence_marker,
     _split_embedded_thinking,
@@ -50,6 +57,7 @@ from gsuid_core.ai_core.agent_run.support import (
     _tool_return_looks_failed,
     _tool_return_is_async_pending,
     _tool_call_targets_render_agent,
+    _tool_return_is_effectual_write,
     _update_thrash_streak_for_response,
 )
 from gsuid_core.ai_core.configs.ai_config import ai_config
@@ -57,11 +65,10 @@ from gsuid_core.ai_core.control.directive import DISPUTE_CLOSED_KEY
 from gsuid_core.ai_core.agent_run.speech_policy import (
     MAIN_CHANNEL_VISIBLE_LIMIT,
     is_status_tool_name,
-    looks_like_wait_comfort,
     strip_open_solicitations,
     content_is_render_candidate,
+    looks_like_task_accept_speech,
     should_block_user_visible_text,
-    looks_like_inflight_quota_speech,
 )
 from gsuid_core.ai_core.agent_run.remote_web_search import is_hosted_web_search_name
 from gsuid_core.ai_core.capability_agents.delegation_contracts import (
@@ -83,7 +90,264 @@ from gsuid_core.ai_core.capability_agents.delegation_contracts import (
 )
 
 
+def _response_has_function_tool_call(parts: Sequence[object]) -> bool:
+    """同响应是否含函数工具（不含 hosted NativeToolCall）。"""
+    return any(isinstance(p, ToolCallPart) and not isinstance(p, NativeToolCallPart) for p in parts)
+
+
+# 委派/出图才需要立刻应一声；回想/网页检索等轻查询很快，先应再答会双说。
+_HEAVY_ACK_TOOLS: frozenset[str] = frozenset(
+    {
+        "create_subagent",
+        "render_html_to_image",
+        "render_card",
+        "render_markdown_to_image",
+        "render_chart_spec",
+    }
+)
+
+
+def tools_warrant_task_ack(tool_names: Sequence[str]) -> bool:
+    """首包工具是否重到需要立刻应一声。"""
+    for n in tool_names:
+        if n in _HEAVY_ACK_TOOLS:
+            return True
+    return False
+
+
+def decide_text_outbound_slot(
+    *,
+    has_fn_tool: bool,
+    accept_slot_used: bool,
+    heavy_ack: bool,
+) -> str:
+    """按函数 ToolCall 分槽。重任务首次可接任务应；轻查询等到干完再开口。"""
+    if has_fn_tool:
+        if heavy_ack and not accept_slot_used:
+            return "send_accept"
+        return "unsent"
+    return "send_final"
+
+
+def needs_task_ack_turn(
+    *,
+    create_by: str,
+    is_subagent: bool,
+    is_framework: bool,
+    is_status_inquiry: bool,
+    is_group: bool,
+    call_to_self: bool,
+    followup_detected: bool,
+    is_http: bool,
+) -> bool:
+    """点名/跟进/私聊/HTTP 的交互主人格才须接任务应。零工具由调用方另判。"""
+    if is_subagent or is_framework or is_status_inquiry:
+        return False
+    if create_by not in ("Chat", "Agent", "TEST"):
+        return False
+    if is_http or not is_group:
+        return True
+    return call_to_self or followup_detected
+
+
+def send_message_call_has_visible_text(parts: Sequence[object]) -> bool:
+    """首包若已是带台词的 send_message_by_ai，那句算接任务应，不重复补。"""
+    for p in parts:
+        if not isinstance(p, ToolCallPart) or p.tool_name != "send_message_by_ai":
+            continue
+        args = p.args_as_dict()
+        raw = args["text"] if "text" in args else ""
+        if isinstance(raw, str) and raw.strip() and not is_silence_marker(raw.strip()):
+            return True
+    return False
+
+
+def _ack_from_tone_markers(markers: tuple[str, ...]) -> str:
+    """用当前卡语气词拼短应。ASCII 口癖（如 zzz）不当整句。"""
+    for raw in markers:
+        m = raw.strip()
+        if not m or len(m) > 8:
+            continue
+        if m.isascii() and not any(ch in m for ch in ".~"):
+            continue
+        if m.endswith(("…", "...", "……", "～", "~")):
+            return f"{m}好。"
+        if m[-1] in "。！？!?":
+            return m
+        return f"{m}，好。"
+    return ""
+
+
+def task_ack_phrase(persona_name: str | None) -> str:
+    """接任务应：persona.json → 卡上语气词 → 中性「收到。」。"""
+    from gsuid_core.ai_core.persona.resource import get_tone_markers
+    from gsuid_core.ai_core.persona.settings import get_persona_setting
+
+    text = get_persona_setting(persona_name, "task_ack").strip()
+    if text:
+        return text
+    from_card = _ack_from_tone_markers(get_tone_markers(persona_name))
+    return from_card if from_card else "收到。"
+
+
 class LoopPhase(RunOnceHost):
+    async def _emit_stream_events(
+        self,
+        st: RunOnceState,
+        event: ModelResponseStreamEvent,
+        *,
+        text_starts: set[int],
+        splitter: ThinkTagSplitter,
+    ) -> None:
+        """从 pydantic-ai 流式 event 抽出 thinking / 可见 text delta。
+
+        thinking 走 ``on_trace``（旁路轨迹）；text 仅 ``outbound_stream`` 时入队。
+        非流式出站仍等完整 TextPart + 闸门。Text 里夹的 ``<think>`` 在此剥掉。
+        """
+        if isinstance(event, PartDeltaEvent):
+            delta = event.delta
+            if isinstance(delta, ThinkingPartDelta):
+                piece = delta.content_delta or ""
+                if piece:
+                    st.thinking_streamed = True
+                    self._emit_trace("thinking_delta", piece)
+            elif isinstance(delta, TextPartDelta):
+                piece = delta.content_delta
+                if piece:
+                    await self._enqueue_text_delta(st, piece, splitter)
+            return
+        if isinstance(event, PartStartEvent):
+            part = event.part
+            if isinstance(part, ThinkingPart):
+                piece = part.content or ""
+                if piece:
+                    st.thinking_streamed = True
+                    self._emit_trace("thinking_delta", piece)
+            elif isinstance(part, TextPart):
+                if event.index in text_starts and event.previous_part_kind is None:
+                    return
+                text_starts.add(event.index)
+                piece = part.content or ""
+                if piece:
+                    await self._enqueue_text_delta(st, piece, splitter)
+            elif isinstance(part, ToolCallPart) and not isinstance(part, NativeToolCallPart):
+                st.stream_saw_fn_tool = True
+
+    async def _enqueue_text_delta(
+        self,
+        st: RunOnceState,
+        piece: str,
+        splitter: ThinkTagSplitter | None,
+    ) -> None:
+        if not piece or st.bot is None:
+            return
+        visible = piece
+        if splitter is not None:
+            visible, thought = splitter.feed(piece)
+            if thought:
+                st.thinking_streamed = True
+                self._emit_trace("thinking_delta", thought)
+        if not visible:
+            return
+        # 终局静默 / 已见函数工具的中间 OS 不要打到流式出站
+        if st.speech_policy in ("silence_only", "delivered"):
+            return
+        if st.suppress_intermediate_text and st.stream_saw_fn_tool:
+            return
+        bot = self._outbound_bot(st)
+        if bot is None:
+            return
+        bot.enqueue_text_delta(visible)
+
+    def _outbound_bot(self, st: RunOnceState) -> Bot | None:
+        """出站流式模式才返回 bot；pydantic-ai 流式打点不走这里。"""
+        if not st.outbound_stream:
+            return None
+        return st.bot
+
+    async def _flush_bot_text_delta(self, st: RunOnceState) -> None:
+        bot = self._outbound_bot(st)
+        if bot is not None:
+            await bot.flush_text_delta()
+
+    def _discard_stream_preview(self, st: RunOnceState, text: str = "") -> None:
+        bot = self._outbound_bot(st)
+        if bot is not None:
+            bot.discard_streamed_preview(text)
+
+    async def _commit_streamed_or_send(
+        self,
+        st: RunOnceState,
+        text: str,
+        *,
+        already_streamed: bool,
+        at_user_id: str | None = None,
+    ) -> None:
+        bot = st.bot
+        if bot is None:
+            return
+        if already_streamed:
+            if st.outbound_stream:
+                await bot.commit_streamed_history(text)
+            self._run_sent_texts.add(text)
+            st.main_channel_sends += 1
+            return
+        await send_chat_result(bot, text, ev=st.ev, at_user_id=at_user_id)
+        self._run_sent_texts.add(text)
+        st.main_channel_sends += 1
+
+    async def _send_gated_text(self, st: RunOnceState, text: str, *, at_user_id: str | None) -> None:
+        """闸门已通过：流式只补未推后缀，否则 ``send_chat_result``。"""
+        already = False
+        bot = self._outbound_bot(st)
+        if bot is not None:
+            leftover = bot.take_unsent_suffix(text)
+            if leftover is None:
+                already = True
+            elif leftover != text:
+                bot.enqueue_text_delta(leftover)
+                await bot.flush_text_delta()
+                # leftover 已出站；本段吃掉整段流，对齐缓冲勿留给下一 part
+                bot.reset_text_stream()
+                already = True
+        await self._commit_streamed_or_send(st, text, already_streamed=already, at_user_id=at_user_id)
+
+    async def _try_send_gated_in_iter(self, st: RunOnceState, text: str, *, at_user_id: str | None) -> bool:
+        # Why: send_chat_result 异常会穿透 _agent.iter() 触发 athrow/cancel
+        try:
+            await self._send_gated_text(st, text, at_user_id=at_user_id)
+        except Exception as _e:
+            logger.debug(i18n_t("log.agent.text_send_fail_failed", _e=_e))
+            return False
+        return True
+
+    async def _emit_task_ack_fallback(self, st: RunOnceState) -> bool:
+        """模型没写合格接任务应时发人格卡/中性「收到。」。过不了闸不占槽。"""
+        if st.bot is None or st.return_mode not in ("always", "by_bot"):
+            return False
+        if st.main_channel_sends > 0 or st.wait_comfort_sent:
+            return False
+        phrase = task_ack_phrase(self.persona_name)
+        if not looks_like_task_accept_speech(phrase):
+            return False
+        _user_raw = st.ev.raw_text if st.ev is not None and st.ev.raw_text else ""
+        _gr = output_gate.pre_send_gate(
+            phrase,
+            _require_context(st).extra,
+            user_text=_user_raw,
+            channel="main",
+            count_attempt=True,
+        )
+        if _gr.decision is not output_gate.GateDecision.ALLOW:
+            return False
+        _extra = _require_context(st).extra
+        _at_uid = _extra["at_user_id"] if "at_user_id" in _extra else None
+        _at = str(_at_uid) if isinstance(_at_uid, str) and _at_uid else None
+        if not await self._try_send_gated_in_iter(st, phrase, at_user_id=_at):
+            return False
+        st.wait_comfort_sent = True
+        return True
+
     def _apply_create_subagent_return(self, st: RunOnceState, part: ToolReturnPart, body: str) -> None:
         """create_subagent 回执：ack 确认在途，失败且未 ack 则回滚抢先静默。"""
         async_ack = bool(_tool_return_is_async_pending(part) or ("后台执行" in body) or ("自动回灌" in body))
@@ -123,6 +387,10 @@ class LoopPhase(RunOnceHost):
         logger.debug(i18n_t("log.agent.trigger_node_modelrequestnode"))
 
         self._session_logger.log_node_transition("ModelRequestNode")
+        if st.saw_final_response:
+            st.post_final_requests += 1
+            if st.post_final_requests > 1:
+                st.ab_pending_nudges = []
 
         # 先扫本请求内 ToolReturn 形态，再决定墙钟文案（避免事实包刚返回却注入「禁工具」）
         for _pre in node.request.parts:
@@ -185,12 +453,15 @@ class LoopPhase(RunOnceHost):
 
         # 输出闸门：上一轮 REWRITE feedback（多段已合并）注入下一轮请求
         if st.ab_pending_nudges:
+            _had_ooc = any(output_gate.is_ooc_judge_feedback(n) for n in st.ab_pending_nudges)
             _nudge_body = output_gate.merge_rewrite_feedbacks(st.ab_pending_nudges)
             node.request.parts = [
                 *node.request.parts,
                 UserPromptPart(content=_nudge_body),
             ]
             logger.warning(i18n_t("log.ai.output_gate_injected_rewrite_feedback"))
+            if _had_ooc:
+                output_gate.mark_ooc_reminded(_require_context(st).extra)
             st.ab_pending_nudges = []
         # 熔断提示只注入一次（与 thrash fuse 同形）
         if (output_gate.is_fused(_require_context(st).extra) or st.ab_abort) and not output_gate.fuse_already_injected(
@@ -250,7 +521,7 @@ class LoopPhase(RunOnceHost):
                         # 工具返回过长时写入短占位，避免污染上下文
                         part.content = f"[工具 {part.tool_name} 已生成内容, 但未发送给用户, 资源ID: {resource_id}]"
 
-                # FileOS：主人格先落盘并折叠长文；能力代理旁路落盘保留全文
+                # FileOS：主人格与能力代理过阈值落盘+句柄；禁止长文进 history
                 _fileos_folded = False
                 _raw_tr = part.content if isinstance(part.content, str) else None
                 if type(part) is ToolReturnPart and _raw_tr is not None:
@@ -265,7 +536,7 @@ class LoopPhase(RunOnceHost):
                     _pc = get_plan_context()
                     _tid = (_pc.task_id if _pc else "") or ""
                     _rid = (_pc.root_task_id if _pc else "") or ""
-                    if self.create_by in _MAIN_PERSONA_CREATE_BY:
+                    if self.create_by in _MAIN_PERSONA_CREATE_BY or self.create_by == "CapabilityAgent":
                         _is_group = bool(st.ev is not None and st.ev.group_id)
                         try:
                             _folded = await persist_and_fold_tool_return(
@@ -367,6 +638,18 @@ class LoopPhase(RunOnceHost):
                     )
                 )
                 self._session_logger.log_tool_return(part.tool_name, part.content, part.tool_call_id)
+                _trace_out = part.content if isinstance(part.content, str) else str(part.content or "")
+                if _trace_out.startswith("base64://") or isinstance(part.content, bytes):
+                    _trace_out = "[binary]"
+                if _trace_out.strip():
+                    self._emit_trace("tool_result", f"{part.tool_name or ''}|{_trace_out[:2000]}")
+                _ret_body = part.content if isinstance(part.content, str) else str(part.content or "")
+                if _tool_return_is_effectual_write(
+                    part.tool_name or "",
+                    _ret_body,
+                    failed=_tool_return_looks_failed(part),
+                ):
+                    st.effectual_mutate = True
 
         # 事件驱动输出契约：仅终态工具返回才注入（异步 ack 不触发）
         if _has_tool_return and self.create_by in _INTERACTIVE_CREATE_BY:
@@ -412,6 +695,21 @@ class LoopPhase(RunOnceHost):
                         capability_node_id=self.capability_node_id,
                     )
                     _contract = _fail_c if _any_fail else _ok_c
+                    if (
+                        not _any_fail
+                        and st.tool_call_list
+                        and st.tool_call_list[0] == "web_search_tool"
+                        and not st.web_search_delegate_nudged
+                    ):
+                        from gsuid_core.ai_core.agent_node.registry import match_capability_node
+
+                        _nid = match_capability_node(st.last_user_question)
+                        if _nid:
+                            st.web_search_delegate_nudged = True
+                            _contract = (
+                                f"（系统：当前问题已命中能力节点 `{_nid}`，"
+                                f'请 create_subagent(agent_profile="{_nid}", task=...) 委派，不要继续网页检索。）'
+                            )
                     # 不再把多点结构升级成「唯一合法下一步 = 出图」，也不再叠
                     # 气候/仅 web 禁令。工具返回上的 [source=web] / [as_of=] 够模型自己判断。
                     if not any(
@@ -437,11 +735,33 @@ class LoopPhase(RunOnceHost):
         st.req_start = time.perf_counter()
         st.first_event_at = None
         st.last_event_at = None
+        st.thinking_streamed = False
+        st.stream_saw_fn_tool = False
+        bot = self._outbound_bot(st)
+        if bot is not None:
+            bot.reset_text_stream()
+        _text_starts: set[int] = set()
+        _tags = st.thinking_tags if st.thinking_tags else ("<think>", "</think>")
+        splitter = ThinkTagSplitter(_tags[0], _tags[1])
         async with node.stream(agent_run.ctx) as request_stream:
-            async for _event in request_stream:
-                st.last_event_at = time.perf_counter()
-                if st.first_event_at is None:
-                    st.first_event_at = st.last_event_at
+            try:
+                async for _event in request_stream:
+                    if st.cancel_ev is not None and st.cancel_ev.is_set():
+                        st.generation_cancelled = True
+                        logger.info(i18n_t("log.agent.generation_cancelled_supersede"))
+                        break
+                    st.last_event_at = time.perf_counter()
+                    if st.first_event_at is None:
+                        st.first_event_at = st.last_event_at
+                    await self._emit_stream_events(st, _event, text_starts=_text_starts, splitter=splitter)
+            finally:
+                vis, th = splitter.flush()
+                if th:
+                    st.thinking_streamed = True
+                    self._emit_trace("thinking_delta", th)
+                if vis:
+                    await self._enqueue_text_delta(st, vis, None)
+                await self._flush_bot_text_delta(st)
 
     async def _run_once_on_call_tools(
         self,
@@ -509,9 +829,18 @@ class LoopPhase(RunOnceHost):
                         st.speech_policy = "silence_only"
                     break
 
-        # 遍历大模型返回的具体片段 (Parts)
-        # 本轮是否已出现工具调用：用于 suppress_intermediate_text 时判断
-        _saw_tool_call_this_turn = False
+        # 出站槽：重任务才接任务应。hosted 搜索不当函数工具。
+        _saw_tool_call_this_turn = _response_has_function_tool_call(node.model_response.parts)
+        _fn_tool_names = [
+            p.tool_name
+            for p in node.model_response.parts
+            if isinstance(p, ToolCallPart) and not isinstance(p, NativeToolCallPart)
+        ]
+        _heavy_ack = tools_warrant_task_ack(_fn_tool_names)
+        if _saw_tool_call_this_turn:
+            st.tool_bearing_responses += 1
+        _accept_slot_used = False
+        _resp_unsent: list[str] = []
         # 同 ModelResponse 多 TextPart：尖括号 attempt 只计 1 次
         output_gate.begin_response_batch(_require_context(st).extra)
         _ab_attempt_counted_this_response = False
@@ -538,6 +867,7 @@ class LoopPhase(RunOnceHost):
                         st.speech_policy = "silence_only"
                 if is_status_tool_name(part.tool_name):
                     st.has_status_tool_call = True
+                    _require_context(st).extra["has_status_tool"] = True
                 if part.tool_name == "send_message_by_ai":
                     st.image_sent_this_run = True
                     # 发图后解除异步静默，允许一句角色收尾（步骤 7）
@@ -571,28 +901,53 @@ class LoopPhase(RunOnceHost):
             # 大模型直接输出文本
             elif isinstance(part, TextPart):
                 _text = part.content.strip()
-                # 拆出 <think> 后只剩空白的文本片段（如纯思考+工具调用轮）， 既无需打印也无需下发，
+                # 拆出 <think> 后只剩空白的文本片段（如纯思考+工具调用轮），既无需打印也无需下发
                 if not _text:
+                    self._discard_stream_preview(st)
                     continue
                 logger.debug(i18n_t("log.agent.llm_text", _text=_text))
                 self._session_logger.log_text_output(_text)
                 if is_silence_marker(_text):
+                    # 看过出戏提醒后选静默 = 自主判断不发，收尾旁路不得再送原文
+                    if output_gate.ooc_reminder_delivered(_require_context(st).extra):
+                        st.ooc_blocked.clear()
                     logger.info(i18n_t("log.agent.silent_skipping_text", _text=_text))
+                    self._discard_stream_preview(st, _text)
                     continue
                 _stripped_protocol = remainder_after_protocol_tags(_text).strip()
                 if _stripped_protocol != _text:
                     _text = _stripped_protocol
                     if not _text:
+                        self._discard_stream_preview(st)
                         continue
                 if _text in self._run_sent_texts:
                     logger.debug(i18n_t("log.agent.skipping_duplicate", p0=repr(_text[:40])))
+                    self._discard_stream_preview(st, _text)
                     continue
-                # suppress 中间碎碎念，但「委派/出图等待句」必须能出站（即使同响应里 Tool 在前）
-                _is_wait_comfort = looks_like_wait_comfort(_text)
-                if st.suppress_intermediate_text and _saw_tool_call_this_turn and not _is_wait_comfort:
+                # 同响应已有函数工具：规划/内心 OS 不出站。主人格一句接任务应除外（不按 12 字）。
+                # 不按工具名特判。hosted 搜索不置位（答案就在 TextPart）。
+                _hard = 0
+                if self.create_by in _MAIN_PERSONA_CREATE_BY and self.persona_name:
+                    from gsuid_core.ai_core.persona.config import persona_config_manager
+
+                    _pc = persona_config_manager.get_config(self.persona_name)
+                    _hard = int(_pc.get_config("speech_len_hard").data)
+                _slot = "send_final"
+                if st.suppress_intermediate_text:
+                    _slot = decide_text_outbound_slot(
+                        has_fn_tool=_saw_tool_call_this_turn,
+                        accept_slot_used=_accept_slot_used,
+                        heavy_ack=_heavy_ack,
+                    )
+                if _slot == "unsent":
                     logger.debug(i18n_t("log.agent.suppressing_intermediate_text", p0=repr(_text[:40])))
+                    _resp_unsent.append(_text)
+                    self._discard_stream_preview(st, _text)
                     continue
-                if self.create_by in _MAIN_PERSONA_CREATE_BY:
+                if _slot == "send_final":
+                    st.saw_final_response = True
+                # return 不下发；话术门 continue 会让评测 HTTP 抓不到念数答卷
+                if self.create_by in _MAIN_PERSONA_CREATE_BY and st.return_mode != "return":
                     _fact_pending = bool(
                         st.saw_structured_return and not st.delegated_render and not st.image_sent_this_run
                     )
@@ -607,34 +962,36 @@ class LoopPhase(RunOnceHost):
                         fact_pack_pending=_fact_pending,
                         has_active_task=st.has_active_task,
                         render_inflight=bool(st.delegated_render and not st.image_sent_this_run),
+                        speech_len_hard=_hard,
+                        user_asked_detail=False,
                     )
                     if _blk:
                         # 只记排版失配；**不得**回写 saw_structured_return（那是出处凭据，
                         # 由真实 ToolReturn 置位）。伪造它会让纯文本长回答被当成待出图事实包。
-                        if _why in ("report_speech", "empty_handoff"):
+                        if _why in ("report_speech", "empty_handoff", "persona_length_breach"):
                             st.presentation_mismatch = True
                             # 暂扣原文：纠正被申辩/无替代品时由 settle 兜底发出（INV-4）
-                            # 多点读数念白不是用户要的正文，丢掉即可，勿进 INV-4 回放。
                             if _text not in st.presentation_withheld:
                                 st.presentation_withheld.append(_text)
                                 st.presentation_withheld_reasons.append(_why)
+                        elif _why == "numeric_recitation":
+                            # 念数丢掉、不进 INV-4；记原因以便 settle 走 render 纠正。
+                            st.presentation_mismatch = True
+                            st.presentation_withheld_reasons.append(_why)
                         logger.info(
                             i18n_t(
                                 "log.agent.silent_skipping_text",
                                 _text=f"[speech_policy={st.speech_policy}/{_why}] {_text[:60]}",
                             )
                         )
+                        if _slot == "send_accept":
+                            _resp_unsent.append(_text)
+                        self._discard_stream_preview(st, _text)
                         continue
-                    _inflight_now = bool(
-                        st.pending_async_delivery
-                        or st.speech_policy == "silence_only"
-                        or (st.delegated_render and not st.image_sent_this_run)
-                    )
-                    if _is_wait_comfort or (_inflight_now and looks_like_inflight_quota_speech(_text)):
-                        st.wait_comfort_sent = True
                     # 砍掉「要不要我再查」类助理收尾，保留事实句
                     _text = strip_open_solicitations(_text)
                     if not _text.strip():
+                        self._discard_stream_preview(st)
                         continue
                 if st.bot and _text and st.return_mode in ["always", "by_bot"]:
                     # 统一输出闸门；同 response 尖括号只计一次 attempt
@@ -657,9 +1014,12 @@ class LoopPhase(RunOnceHost):
                                 preview=repr(_text[:80]),
                             )
                         )
+                        if _slot == "send_accept":
+                            _resp_unsent.append(_text)
+                        self._discard_stream_preview(st, _text)
                         continue
                     if _gr.decision is output_gate.GateDecision.REWRITE:
-                        if _gr.defer_ooc and _gr.ooc_hit is not None:
+                        if _gr.policy == "ooc" and _gr.ooc_hit is not None:
                             logger.warning(
                                 i18n_t(
                                     "log.agent.firewall_main_output_hit_ooc",
@@ -667,7 +1027,10 @@ class LoopPhase(RunOnceHost):
                                     p1=_gr.ooc_hit.matched,
                                 )
                             )
-                            st.ooc_blocked.append((_text, _gr.ooc_hit))
+                            if _gr.defer_ooc:
+                                st.ooc_blocked.append((_text, _gr.ooc_hit))
+                            if _gr.feedback:
+                                st.ab_pending_nudges.append(_gr.feedback)
                         else:
                             if _gr.policy == "angle_bracket":
                                 _ab_attempt_counted_this_response = True
@@ -675,42 +1038,63 @@ class LoopPhase(RunOnceHost):
                                 st.ab_pending_nudges.append(_gr.feedback)
                             if _gr.fused:
                                 st.ab_abort = True
+                        if _slot == "send_accept":
+                            _resp_unsent.append(_text)
+                        self._discard_stream_preview(st, _text)
                         continue
                     if _gr.decision is output_gate.GateDecision.FALLBACK:
-                        _fb = _gr.send_text or output_firewall.MACHINE_FALLBACK_TEXT
+                        self._discard_stream_preview(st, _text)
+                        _fb = _gr.send_text or output_firewall.fallback_machine_text(self.persona_name)
+                        _fb_sent = False
                         try:
                             await send_chat_result(st.bot, _fb, ev=st.ev, ooc_check=False)
                             self._run_sent_texts.add(_fb)
+                            st.main_channel_sends += 1
+                            _fb_sent = True
                         except Exception as _me:
                             logger.debug(i18n_t("log.agent.text_send_fail_failed", _e=_me))
+                        if _fb_sent:
+                            if _slot == "send_accept":
+                                _accept_slot_used = True
+                            st.wait_comfort_sent = True
+                        if _slot == "send_accept":
+                            _resp_unsent.append(_text)
                         continue
-                    # 假完成预检（结构判据：完成声明 + 本轮至今零工具调用）：
-                    _fab_gate_on = not st.fake_done_retry and not st.tool_call_list and bool(st.tool_names)
+                    # 假完成预检：完成声明 + 本轮没有生效的写入（含 PIN 拒绝）
+                    _fab_gate_on = not st.fake_done_retry and not st.effectual_mutate and bool(st.tool_names)
                     if _fab_gate_on and _claims_fake_done(_text):
                         logger.warning(i18n_t("log.agent.fakedone_zero_claim_pending_ok", p0=repr(_text[:40])))
                         st.fab_blocked.append(_text)
+                        if _slot == "send_accept":
+                            _resp_unsent.append(_text)
+                        self._discard_stream_preview(st, _text)
                         continue
                     # 单轮出站配额兜底（4.10）：主通道台词超限即静默，防多 TextPart 刷屏
-                    if st.main_channel_sends >= MAIN_CHANNEL_VISIBLE_LIMIT:
+                    _cap = int(ai_config.get_config("main_channel_visible_limit").data)
+                    if _cap < 1:
+                        _cap = MAIN_CHANNEL_VISIBLE_LIMIT
+                    if st.main_channel_sends >= _cap:
                         logger.info(
                             i18n_t(
                                 "log.agent.silent_skipping_text",
                                 _text=f"[main_channel_cap] {_text[:40]}",
                             )
                         )
+                        _resp_unsent.append(_text)
+                        self._discard_stream_preview(st, _text)
                         continue
-                    # Why: send_chat_result 抛异常会穿透 _agent.iter() 的 async st.context 触发
-                    # athrow/cancel scope
-                    try:
-                        _extra = _require_context(st).extra
-                        _at_uid = _extra["at_user_id"] if "at_user_id" in _extra else None
-                        _at = str(_at_uid) if isinstance(_at_uid, str) and _at_uid else None
-                        await send_chat_result(st.bot, _text, ev=st.ev, at_user_id=_at)
-                        # 发送成功才登记去重：发送失败的段允许后续相同输出补发。
-                        self._run_sent_texts.add(_text)
-                        st.main_channel_sends += 1
-                    except Exception as _e:
-                        logger.debug(i18n_t("log.agent.text_send_fail_failed", _e=_e))
+                    _extra = _require_context(st).extra
+                    _at_uid = _extra["at_user_id"] if "at_user_id" in _extra else None
+                    _at = str(_at_uid) if isinstance(_at_uid, str) and _at_uid else None
+                    if await self._try_send_gated_in_iter(st, _text, at_user_id=_at):
+                        # 已有可见输出：收尾旁路不再把第一句出戏原文再发一遍
+                        st.ooc_blocked.clear()
+                        if _slot == "send_accept":
+                            _accept_slot_used = True
+                        st.wait_comfort_sent = True
+                elif _text and st.return_mode == "return":
+                    # 评测 HTTP 不下发，仍记下可见正文，避免工具轮之后只剩 <SILENCE>
+                    self._run_sent_texts.add(_text)
 
             elif isinstance(part, ThinkingPart):
                 _thinking = part.content.strip()
@@ -718,7 +1102,43 @@ class LoopPhase(RunOnceHost):
                 if _thinking:
                     st.thinking_segments.append(_thinking)
                 self._session_logger.log_thinking(_thinking)
-                self._emit_trace("thinking", _thinking)
+                # 流式 event 已按 delta 推过则不要整段再打一遍
+                if _thinking and not st.thinking_streamed:
+                    self._emit_trace("thinking", _thinking)
+
+        if (
+            _saw_tool_call_this_turn
+            and _heavy_ack
+            and st.main_channel_sends == 0
+            and not st.wait_comfort_sent
+            and not send_message_call_has_visible_text(node.model_response.parts)
+        ):
+            _tg = st.tg
+            _is_group = bool(_tg.is_group) if _tg is not None else bool(st.ev is not None and st.ev.group_id)
+            _call = bool(_tg.call_to_self) if _tg is not None else False
+            _is_http = bool(st.ev is not None and st.ev.WS_BOT_ID == "HTTP_AGENT")
+            if needs_task_ack_turn(
+                create_by=self.create_by,
+                is_subagent=self.is_subagent,
+                is_framework=st.fw_msg,
+                is_status_inquiry=st.status_inquiry,
+                is_group=_is_group,
+                call_to_self=_call,
+                followup_detected=st.followup_detected,
+                is_http=_is_http,
+            ):
+                await self._emit_task_ack_fallback(st)
+
+        if _resp_unsent:
+            st.unsent_texts.extend(_resp_unsent)
+            _unsent_left = list(_resp_unsent)
+            _kept_parts = []
+            for _p in node.model_response.parts:
+                if _unsent_left and isinstance(_p, TextPart) and _p.content.strip() == _unsent_left[0]:
+                    _unsent_left.pop(0)
+                    continue
+                _kept_parts.append(_p)
+            node.model_response.parts = _kept_parts
 
         # thrash：本响应只按「轮」计 1 次（并行多 query 不累加）
         st.same_tool_name, st.same_tool_streak = _update_thrash_streak_for_response(
@@ -764,39 +1184,45 @@ class LoopPhase(RunOnceHost):
 
         final_user = st.final_user_message
         assert final_user is not None
-        async with _agent.iter(
-            final_user,
-            deps=_require_context(st),
-            message_history=self.history,
-            usage_limits=_require_limits(st),
-        ) as agent_run:
-            # 遍历每一步 Node
-            async for node in agent_run:
-                # A: 节点间隙检查抢答取消（后到消息已请求 abort）
-                if st.cancel_ev is not None and st.cancel_ev.is_set():
-                    st.generation_cancelled = True
-                    logger.info(i18n_t("log.agent.generation_cancelled_supersede"))
-                    break
-                # 1. 发起大模型请求前的处理
-                if isinstance(node, ModelRequestNode):
-                    await self._run_once_on_model_request(st, node, agent_run)
+        self._history_iter_active = True
+        try:
+            async with _agent.iter(
+                final_user,
+                deps=_require_context(st),
+                message_history=self.history,
+                usage_limits=_require_limits(st),
+            ) as agent_run:
+                # 遍历每一步 Node
+                async for node in agent_run:
+                    # A: 节点间隙检查抢答取消（后到消息已请求 abort）
+                    if st.cancel_ev is not None and st.cancel_ev.is_set():
+                        st.generation_cancelled = True
+                        logger.info(i18n_t("log.agent.generation_cancelled_supersede"))
+                        break
+                    # 1. 发起大模型请求前的处理
+                    if isinstance(node, ModelRequestNode):
+                        await self._run_once_on_model_request(st, node, agent_run)
+                        if st.generation_cancelled:
+                            break
 
-                # 2. 获取到大模型响应，准备调用工具或者输出文本 这里使用了 isinstance
-                # Pyright 就能明确知道此时 node 是 CallToolsNode 拥有 model_response 属性
-                elif isinstance(node, CallToolsNode):
-                    await self._run_once_on_call_tools(st, node, statistics_manager)
+                    # 2. 获取到大模型响应，准备调用工具或者输出文本 这里使用了 isinstance
+                    # Pyright 就能明确知道此时 node 是 CallToolsNode 拥有 model_response 属性
+                    elif isinstance(node, CallToolsNode):
+                        await self._run_once_on_call_tools(st, node, statistics_manager)
 
-                # 3. 运行结束节点
-                elif isinstance(node, End):
-                    logger.debug(i18n_t("log.agent.node_trigger_end"))
-                    logger.debug(i18n_t("log.agent.run_ended_final_result_generated"))
-                    self._session_logger.log_node_transition("End")
+                    # 3. 运行结束节点
+                    elif isinstance(node, End):
+                        logger.debug(i18n_t("log.agent.node_trigger_end"))
+                        logger.debug(i18n_t("log.agent.run_ended_final_result_generated"))
+                        self._session_logger.log_node_transition("End")
 
-        # A: 被 supersede 打断 → 不写 history、不 OOC 重说，让后到 run 用完整上下文重生成。
-        # 在途委派不丢：根任务在库里，下轮由 build_task_context 注入，产物经邮箱回灌。
-        if st.generation_cancelled:
-            logger.info(i18n_t("log.agent.generation_aborted_no_history"))
-            return "" if st.output_type is None else None
+            # A: 被 supersede 打断 → 不写 history、不 OOC 重说，让后到 run 用完整上下文重生成。
+            # 在途委派不丢：根任务在库里，下轮由 build_task_context 注入，产物经邮箱回灌。
+            if st.generation_cancelled:
+                logger.info(i18n_t("log.agent.generation_aborted_no_history"))
+                return "" if st.output_type is None else None
 
-        # 遍历完成后收尾
-        return await self._run_once_settle_result(st, agent_run, statistics_manager)
+            # 遍历完成后收尾
+            return await self._run_once_settle_result(st, agent_run, statistics_manager)
+        finally:
+            self._history_iter_active = False

@@ -141,30 +141,32 @@ def list_nodes(include_persona: bool = False) -> List[AgentNode]:
 
 
 def format_capability_roster() -> str:
-    """可委派能力代理清单（供 system_prompt 固化，避免每轮 user 侧重复注入）。
+    """可委派短花名册：每节点一行 node_id + when_to_use。covers 不进 system。"""
+    nodes: list[AgentNode] = [n for n in list_nodes() if n.source != "persona" and n.node_id != "capability_evaluator"]
+    from gsuid_core.ai_core.configs.ai_config import ai_config
 
-    每行追加「数据覆盖」——由节点所辖工具的 ``covers`` 声明聚合而来，让 roster
-    与真实工具能力同源（如 stock_agent 的工具声明了现货贵金属/外汇覆盖，清单
-    自然写明可处理 XAU 类标的），杜绝人维护关键词导致的自述失真。
-    """
-    from .semantic_routing import aggregate_node_covers
-
+    cap = int(ai_config.get_config("capability_roster_max").data)
     lines: list[str] = []
-    for node in list_nodes():
-        if node.source == "persona" or node.node_id == "capability_evaluator":
-            continue
-        when = (node.when_to_use or "").strip() or "专业任务"
-        line = f"- `{node.node_id}`（{node.display_name}）：{when}"
-        covers = aggregate_node_covers(node)
-        if covers:
-            line += f"\n  数据覆盖：{'、'.join(covers)}"
+    for node in nodes:
+        when = (node.when_to_use or "").strip()
+        if not when:
+            from gsuid_core.logger import logger
+
+            logger.warning(t("log.agent.capability_node_missing_when", node=node.node_id))
+            when = "专业任务"
+        prefix = f"- `{node.node_id}`："
+        line = prefix + when
+        if cap > 0 and len(line) > cap:
+            line = prefix if len(prefix) >= cap else line[: cap - 1] + "…"
         lines.append(line)
     if not lines:
         return ""
     return (
-        "（可用能力代理——B 类组合/分析/推荐任务必须 "
+        "（可用能力代理——须 "
         '`create_subagent(agent_profile="<node_id>", task=...)` 委派，'
-        "agent_profile 只填下列 node_id，禁止自造名字：\n" + "\n".join(lines) + "）"
+        "agent_profile 只填下列 node_id，禁止自造名字：\n"
+        + "\n".join(lines)
+        + "\n提醒的增删改查在主会话；禁止声称没有对应工具。）"
     )
 
 
@@ -227,21 +229,19 @@ def match_capability_node(hint: str) -> str:
     return best_id
 
 
-def resolve_node(hint: str, default: str = "research_agent") -> str:
-    """自然语言 hint → node_id（用句柄不用 ID，原 resolve_profile 语义）。
+def resolve_node(hint: str, default: str = "") -> str:
+    """自然语言 hint → node_id。非空未知不静默落到某个专职节点。
 
     1. hint 就是已注册 node_id（含 persona 投影）→ 直接返回；
-    2. 命中 match_keywords → 取**最长关键词**命中的节点（更具体优先；
-       同分时保留注册序更靠前的节点，与旧「首个命中」一致）；
-    3. 都不命中 → 回退 default（default 不存在时回退首个注册节点）。
-
-    例：``分析并出对比表`` 同时命中 research「分析」与 render「对比表」→
-    因「对比表」更长，选 ``render_agent``。
+    2. 命中 match_keywords → 最长关键词优先；
+    3. 空 hint → default（若已注册）；非空未命中 → 空串。
     """
     matched = match_capability_node(hint)
     if matched:
         return matched
-    h = (hint or "").strip().lower()
+    h = (hint or "").strip()
     if not h:
-        return default if default in _NODES else next(iter(_NODES), "")
-    return default if default in _NODES else next(iter(_NODES), "")
+        if default and default in _NODES:
+            return default
+        return ""
+    return ""

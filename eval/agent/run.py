@@ -24,12 +24,19 @@ import uuid
 import asyncio
 import argparse
 from pathlib import Path
+from collections.abc import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import yaml  # noqa: E402
 
-from eval.agent.harness import aggregate, score_case_passk  # noqa: E402
+from eval.agent.harness import (  # noqa: E402
+    Trace,
+    aggregate,
+    score_case_passk,
+    parse_judge_verdict,
+    judge_text_is_transient,
+)
 
 
 def make_env_judge():
@@ -41,7 +48,7 @@ def make_env_judge():
         return None
     import httpx
 
-    def judge(prompt: str) -> bool:
+    def judge(prompt: str) -> bool | None:
         r = httpx.post(
             f"{base.rstrip('/')}/chat/completions",
             headers={"Authorization": f"Bearer {key}"},
@@ -56,13 +63,8 @@ def make_env_judge():
             timeout=60,
         )
         r.raise_for_status()
-        txt = r.json()["choices"][0]["message"]["content"].strip()
-        # 思考模型（MiniMax-M3 等）content 以 <think>…</think> 开头，startswith 会把一切判 FAIL
-        txt = re.sub(r"<think>.*?</think>", "", txt, flags=re.DOTALL).strip().upper()
-        m = re.findall(r"\b(PASS|FAIL)\b", txt)
-        if m:
-            return m[-1] == "PASS"
-        return txt.startswith("PASS")
+        txt = r.json()["choices"][0]["message"]["content"]
+        return parse_judge_verdict(str(txt) if txt is not None else "")
 
     return judge
 
@@ -87,32 +89,37 @@ def make_bot_judge(base_url: str, token: str = ""):
             headers=headers,
             json={
                 "user_id": f"judge_{uuid.uuid4().hex[:8]}",
-                "message": (
-                    "你是严格的评测判分器。阅读下面的判定标准与 Agent 回复，"
-                    "只输出一个词 PASS 或 FAIL，不要解释。\n\n" + prompt
-                ),
+                "message": prompt,
                 "history": [],
                 "enable_observer": False,
                 "enable_tools": False,
+                "as_judge": True,
             },
-            timeout=120,
+            timeout=60,
         )
         r.raise_for_status()
-        return extract_text_from_response(r.json().get("data")).strip().upper()
+        return extract_text_from_response(r.json().get("data"))
 
-    def judge(prompt: str) -> bool:
-        # 判分器与被测 Agent 共用同一个 core：批量跑完后 provider 仍在排队，单次超时会把
-        # 「本该 PASS」静默记成 FAIL（实测 6 例假失败）。传输层异常重试一次；重试仍失败
-        # 才判 FAIL——保持「宁可漏判也不假通过」，只是不再把网络抖动算成模型缺陷。
-        for attempt in (1, 2):
+    def judge(prompt: str) -> bool | None:
+        # 无裁决返回 None（harness 记 JUDGE_ERROR 并重试），不算产品 FAIL。
+        last = ""
+        for attempt in (1, 2, 3):
+            msg = prompt if attempt == 1 else prompt + "\n\n只输出一行：PASS 或 FAIL。"
             try:
-                txt = _ask(prompt)
+                raw = _ask(msg)
             except Exception as e:  # noqa: BLE001
                 print(f"  [WARN] bot-judge 异常(第{attempt}次): {e}")
                 continue
-            # 通用助手可能话多：只要出现 PASS 且不是 "FAIL" 主导即判过；严格取首个判词。
-            return txt.find("PASS") != -1 and (txt.find("FAIL") == -1 or txt.find("PASS") < txt.find("FAIL"))
-        return False
+            last = str(raw or "")
+            if judge_text_is_transient(last):
+                print(f"  [WARN] bot-judge 瞬时故障(第{attempt}次): {last[:80]!r}")
+                continue
+            v = parse_judge_verdict(last)
+            if v is not None:
+                return v
+            print(f"  [WARN] bot-judge 无裁决(第{attempt}次): {last[:80]!r}")
+        print(f"  [WARN] bot-judge 放弃: {last[:80]!r}")
+        return None
 
     return judge
 
@@ -146,7 +153,55 @@ def load_cases(path: Path, extra: list[Path] | None = None) -> tuple[int, list[d
     return k, list(by_id.values())
 
 
-async def _run_live(active: list[dict], k: int, args, judge) -> list[dict]:
+def _case_score_row(cid: str, case: dict, traces: list[Trace], r: dict) -> dict:
+    tool_counts = [len(t.tool_calls) for t in traces]
+    latencies = [t.latency for t in traces if t.latency]
+    fw_saved = 0
+    expect = case["expect"] if "expect" in case else {}
+    pats = expect["final_regex_absent"] if "final_regex_absent" in expect else []
+    if pats:
+        for t in traces:
+            raw_hit = any(re.search(p, t.final_text, re.I) for p in pats)
+            deliv_hit = any(re.search(p, t.content_text, re.I) for p in pats)
+            if raw_hit and not deliv_hit:
+                fw_saved += 1
+    sample: dict[str, str | list[str]] = {}
+    for t, ok in zip(traces, r["per_run_pass"]):
+        if not ok:
+            sample = {
+                "delivered": (t.content_text or "")[:220],
+                "raw": (t.final_text or "")[:220],
+                "tools": t.called_names,
+            }
+            break
+    in_tok = sum(t.input_tokens for t in traces)
+    out_tok = sum(t.output_tokens for t in traces)
+    cr_tok = sum(t.cache_read_tokens for t in traces)
+    cw_tok = sum(t.cache_write_tokens for t in traces)
+    case_cache = round(cr_tok / in_tok, 4) if in_tok else 0.0
+    return {
+        "id": cid,
+        "domain": case["domain"] if "domain" in case else "?",
+        "targets": case["targets"] if "targets" in case else [],
+        "case_pass": r["case_pass"],
+        "status": r["status"] if "status" in r else ("pass" if r["case_pass"] else "fail"),
+        "per_run": r["per_run_pass"],
+        "fails": r["fail_reasons"],
+        "avg_tools": round(sum(tool_counts) / len(tool_counts), 2) if tool_counts else 0.0,
+        "max_tools": max(tool_counts) if tool_counts else 0,
+        "avg_latency": round(sum(latencies) / len(latencies), 1) if latencies else 0.0,
+        "max_latency": round(max(latencies), 1) if latencies else 0.0,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "cache_read_tokens": cr_tok,
+        "cache_write_tokens": cw_tok,
+        "cache_rate": case_cache,
+        "firewall_saved_runs": fw_saved,
+        "sample": sample,
+    }
+
+
+async def _run_live(active: list[dict], k: int, args, judge: Callable[[str], bool | None] | None) -> list[dict]:
     import httpx
 
     from eval.agent.runner import run_suite_batch
@@ -154,8 +209,13 @@ async def _run_live(active: list[dict], k: int, args, judge) -> list[dict]:
     by_id = {c["id"]: c for c in active}
     # CLI 显式 --k 时硬覆盖所有 case 的 per-case k（冒烟要全 k=1）；未给则用 per-case/yaml 默认
     force_k = args.k is not None
+    if args.reset_state:
+        from eval.agent.reset_state import reset_eval_side_effects
+
+        stats = await reset_eval_side_effects()
+        print(f"[reset] {stats}", flush=True)
     async with httpx.AsyncClient() as client:
-        # 批量 B 模式：fire 全部 run（并发≤args.concurrency）→ 只等一次 flush → 一趟扫盘
+        # 回答阶段：fire 全部 run（并发=args.concurrency）→ 只等一次 flush → 一趟扫盘
         traces_by_case = await run_suite_batch(
             client,
             args.base_url,
@@ -165,62 +225,42 @@ async def _run_live(active: list[dict], k: int, args, judge) -> list[dict]:
             concurrency=args.concurrency,
             timeout=args.timeout,
             force_k=force_k,
+            delivery_wait=args.delivery_wait,
         )
 
-    import re as _re
+    ids = [c["id"] for c in active]
+    total = len(ids)
+    score_cc = max(1, int(args.score_concurrency))
+    print(f"[score] scoring {total} cases (concurrency={score_cc})…", flush=True)
+    sem = asyncio.Semaphore(score_cc)
+    print_lock = asyncio.Lock()
+    done = 0
 
-    results: list[dict] = []
-    for i, cid in enumerate([c["id"] for c in active], 1):
-        c = by_id[cid]
-        expect = c.get("expect") or {}
-        traces = traces_by_case.get(cid, [])
-        r = score_case_passk(traces, expect, judge=judge)
-        tool_counts = [len(t.tool_calls) for t in traces]
-        latencies = [t.latency for t in traces if t.latency]
-        # 出戏防火墙依赖度：对含 final_regex_absent 的例，统计"原始输出泄露但交付文本已被 scrub 干净"
-        # 的 run 数（= 防火墙救场次数），量化人格是否靠防火墙兜底而非模型自守。
-        fw_saved = 0
-        pats = expect.get("final_regex_absent") or []
-        if pats:
-            for t in traces:
-                raw_hit = any(_re.search(p, t.final_text, _re.I) for p in pats)
-                deliv_hit = any(_re.search(p, t.content_text, _re.I) for p in pats)
-                if raw_hit and not deliv_hit:
-                    fw_saved += 1
-        # 失败样本：取首个失败 run（per_run_pass 与 traces 同序）的交付文本+原始文本（截断）
-        sample = {}
-        for t, ok in zip(traces, r["per_run_pass"]):
-            if not ok:
-                sample = {
-                    "delivered": (t.content_text or "")[:220],
-                    "raw": (t.final_text or "")[:220],
-                    "tools": t.called_names,
-                }
-                break
-        results.append(
-            {
-                "id": cid,
-                "domain": c.get("domain", "?"),
-                "targets": c.get("targets", []),
-                "case_pass": r["case_pass"],
-                "per_run": r["per_run_pass"],
-                "fails": r["fail_reasons"],
-                "avg_tools": round(sum(tool_counts) / len(tool_counts), 2) if tool_counts else 0.0,
-                "max_tools": max(tool_counts) if tool_counts else 0,
-                "avg_latency": round(sum(latencies) / len(latencies), 1) if latencies else 0.0,
-                "max_latency": round(max(latencies), 1) if latencies else 0.0,
-                "firewall_saved_runs": fw_saved,
-                "sample": sample,
-            }
-        )
-        mark = "PASS" if r["case_pass"] else "FAIL"
-        print(
-            f"[{i:>3}/{len(active)}] [{mark}] {cid:30s} per_run={r['per_run_pass']} "
-            f"tools~{results[-1]['avg_tools']} {results[-1]['avg_latency']}s"
-        )
-        if not r["case_pass"] and r["fail_reasons"]:
-            print(f"        ↳ {str(r['fail_reasons'][0])[:160]}")
-    return results
+    async def _score_one(cid: str) -> dict:
+        nonlocal done
+        case = by_id[cid]
+        traces = traces_by_case[cid] if cid in traces_by_case else []
+        expect = case["expect"] if "expect" in case else {}
+        async with sem:
+            # bot-judge 是同步 httpx；放线程池才能真正并行
+            r = await asyncio.to_thread(score_case_passk, traces, expect, judge)
+        row = _case_score_row(cid, case, traces, r)
+        async with print_lock:
+            done += 1
+            st = r["status"] if "status" in r else ("pass" if r["case_pass"] else "fail")
+            mark = {"pass": "PASS", "fail": "FAIL", "judge_error": "JERR"}.get(st, st.upper())
+            print(
+                f"[{done:>3}/{total}] [{mark}] {cid:30s} per_run={r['per_run_pass']} "
+                f"tools~{row['avg_tools']} {row['avg_latency']}s "
+                f"in={row['input_tokens']} cache={row['cache_rate']:.0%}",
+                flush=True,
+            )
+            if not r["case_pass"] and r["fail_reasons"]:
+                print(f"        ↳ {str(r['fail_reasons'][0])[:160]}", flush=True)
+        return row
+
+    # gather 保输入序，报告仍按用例表顺序；打印按完成先后
+    return list(await asyncio.gather(*[_score_one(cid) for cid in ids]))
 
 
 def main() -> int:
@@ -236,7 +276,37 @@ def main() -> int:
     ap.add_argument("--token", default=os.getenv("GSUID_LOCAL_TEST_TOKEN", ""))
     ap.add_argument("--k", type=int, default=None, help="覆盖 yaml 里的 k（pass^k）")
     ap.add_argument("--wait", type=float, default=85.0, help="批量 B 模式：全部 fire 后只等一次 session_log 落盘秒数")
-    ap.add_argument("--concurrency", type=int, default=3, help="批量并发 run 数（≤3，避免压垮 provider）")
+    ap.add_argument(
+        "--delivery-wait",
+        type=float,
+        default=90.0,
+        help="委派未回灌时额外等待秒数（对齐短应+后台完成合同）",
+    )
+    ap.add_argument(
+        "--concurrency",
+        type=int,
+        default=3,
+        help="回答阶段并发 run 数（已并行；加大可加速，但会压 core/provider）",
+    )
+    ap.add_argument(
+        "--score-concurrency",
+        type=int,
+        default=8,
+        help="打分阶段并发（bot-judge HTTP，与回答阶段独立；judge=off 时几乎无开销）",
+    )
+    ap.add_argument(
+        "--reset-state",
+        dest="reset_state",
+        action="store_true",
+        default=True,
+        help="开跑前取消 eval_ 定时任务并清空 eval_ 记忆/好感（默认开）",
+    )
+    ap.add_argument(
+        "--no-reset-state",
+        dest="reset_state",
+        action="store_false",
+        help="跳过评测前清定时任务",
+    )
     ap.add_argument(
         "--timeout",
         type=float,
@@ -271,6 +341,7 @@ def main() -> int:
         # 生产群聊结构抽象出的合成用例（无真实 ID/原文）
         extra_paths.append(cases_dir / "group_chat_prod_patterns.yaml")
         extra_paths.append(cases_dir / "cognition_hub_mixed.yaml")
+        extra_paths.append(cases_dir / "speaker_slot_recall.yaml")
     if args.extra_cases:
         for p in args.extra_cases.split(","):
             p = p.strip()
@@ -294,6 +365,7 @@ def main() -> int:
 
     print(
         f"用例总数={len(cases)}  运行={len(active)}  跳过(needs_fixture)={len(skipped)}  k(pass^k)={k}  "
+        f"fire_concurrency={args.concurrency}  score_concurrency={args.score_concurrency}  "
         f"judge={args.judge}({'ON' if judge else 'OFF→开放题严格判失败'})\n"
     )
 
@@ -326,8 +398,18 @@ def main() -> int:
         json.dumps({"summary": agg, "results": results}, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print("\n===== 汇总 (pass^k) =====")
-    print(f"总通过率: {agg['passed_cases']}/{agg['total_cases']} = {agg['pass_rate'] * 100:.1f}%")
+    scored = int(agg.get("scored_cases") or agg["total_cases"])
+    n_je = int(agg.get("judge_error_cases") or 0)
+    print(
+        f"总通过率: {agg['passed_cases']}/{scored} = {agg['pass_rate'] * 100:.1f}%"
+        f"  （跑 {agg['total_cases']} 例，judge_error {n_je} 不进分母）"
+    )
     print(f"平均工具数/例: {agg['avg_tools_per_case']}   平均延迟: {agg['avg_latency_s']}s")
+    print(
+        f"token input={agg.get('input_tokens', 0)}  output={agg.get('output_tokens', 0)}  "
+        f"cache_read={agg.get('cache_read_tokens', 0)}  cache_write={agg.get('cache_write_tokens', 0)}  "
+        f"cache_rate={float(agg.get('cache_rate') or 0) * 100:.1f}%"
+    )
     for d, v in agg["by_domain"].items():
         print(f"  {d:20s} {v['pass']}/{v['total']}  ({v['rate'] * 100:.0f}%)")
     print(f"\n报告已写: {args.out}")

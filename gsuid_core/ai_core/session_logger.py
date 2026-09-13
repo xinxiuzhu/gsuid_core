@@ -186,6 +186,9 @@ SESSION_ENTRY_TYPES: frozenset[str] = frozenset(
         "history_reset",
         # 交互模式变化（主动 ↔ 被动），data.mode 区分；data.from 记上一模式
         "mode_change",
+        # 前缀缓存失配探针（每 run 一条，data.reason 见 PrefixBreakReason）
+        "prefix_break",
+        "outbound_audit",
     }
 )
 
@@ -650,8 +653,43 @@ class AISessionLogger:
             self._roll_to_new_file()
 
     def log_system_prompt(self, system_prompt: str) -> None:
-        """记录系统提示词"""
-        self._add_entry("system_prompt", {"content": system_prompt})
+        """记录系统提示词，并附 sha256 指纹（会话内 system 变化次数的观测口径）。"""
+        digest = hashlib.sha256((system_prompt or "").encode("utf-8")).hexdigest()
+        self._add_entry("system_prompt", {"content": system_prompt, "sha256": digest})
+
+    def log_prefix_break(
+        self,
+        reason: str,
+        *,
+        tools_hash: str = "",
+        system_hash: str = "",
+        tools_diff: dict[str, list[str]] | None = None,
+    ) -> None:
+        """记录本 run 相对上一 run 的前缀失配类别。"""
+        data: dict[str, object] = {"reason": reason, "tools_hash": tools_hash, "system_hash": system_hash}
+        if tools_diff is not None:
+            data["tools_diff"] = tools_diff
+        self._add_entry("prefix_break", data)
+
+    def log_outbound_audit(
+        self,
+        *,
+        group_id: str,
+        text: str,
+        image_id: str,
+        topic: str,
+        target_user: str,
+    ) -> None:
+        self._add_entry(
+            "outbound_audit",
+            {
+                "group_id": group_id,
+                "text": text[:200],
+                "image_id": image_id,
+                "topic": topic,
+                "target_user": target_user,
+            },
+        )
 
     def log_user_input(self, user_message: Any) -> None:
         """记录用户输入。
@@ -934,18 +972,21 @@ class AISessionLogger:
                               "proactive_generator"
             persona_name: 被关联 Agent 的 persona_name
             create_by: 被关联 Agent 的 create_by
-            log_file: 被关联 Agent 的日志文件路径（绝对路径或相对路径）
+            log_file: 被关联 Agent 的日志文件路径（落盘为相对 session_logs/ 的 POSIX）
         """
         if self._closed:
             return
 
+        from gsuid_core.ai_core.session_log_path import relative_session_log_path
+
+        stored = relative_session_log_path(log_file) if log_file else log_file
         link_record: LinkedAgentRecord = {
             "agent_type": agent_type,
             "session_id": agent_session_id,
             "session_uuid": agent_session_uuid,
             "persona_name": persona_name,
             "create_by": create_by,
-            "log_file": log_file,
+            "log_file": stored,
             "linked_at": time.time(),
         }
         self.linked_agents.append(link_record)

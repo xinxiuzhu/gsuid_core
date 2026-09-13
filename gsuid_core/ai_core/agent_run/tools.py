@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List
+from typing import Any, List, Sequence
 
 from pydantic_ai import Agent
 from pydantic_ai.settings import ModelSettings, merge_model_settings
@@ -40,13 +40,199 @@ from gsuid_core.ai_core.agent_run.state import (
 from gsuid_core.ai_core.dynamic_toolset import RetrievableToolset
 from gsuid_core.ai_core.agent_run.support import (
     _INTERACTIVE_CREATE_BY,
+    _append_user_text,
     _pool_overlaps_capability_agent,
     _capability_exclusive_tool_names,
     _matched_delegation_only_profile,
 )
 from gsuid_core.ai_core.configs.ai_config import ai_config
+from gsuid_core.ai_core.tool_state_signals import STATE_DRIVEN_FAMILY_DOMAINS
 from gsuid_core.ai_core.configs.attribution import resolve_attribution_settings
 from gsuid_core.ai_core.agent_run.remote_web_search import attach_remote_web_search
+
+_PROGRESS_TOOL = "check_delegation"
+_PINNED_SESSION_TOOLS: tuple[str, ...] = ("find_tools", "create_subagent", "capability_map")
+_SCHED_CREATE_NAMES: frozenset[str] = frozenset({"add_once_task", "add_interval_task"})
+_SCHED_MUTATE_NAMES: frozenset[str] = frozenset(
+    {
+        "list_scheduled_tasks",
+        "query_scheduled_task",
+        "modify_scheduled_task",
+        "cancel_scheduled_task",
+        "pause_scheduled_task",
+        "resume_scheduled_task",
+    }
+)
+
+
+def _session_tool_ceiling() -> int:
+    raw = ai_config.get_config("session_tool_ceiling").data
+    return int(raw) if isinstance(raw, int) else 24
+
+
+def l2_state_driven_wanted(
+    *,
+    addr_gated: bool,
+    is_group: bool,
+    call_to_self: bool,
+    followup_detected: bool,
+) -> bool:
+    """L2 是否加载持久实体对应的非 exclusive 族。群聊须点名或省略跟进；私聊始终 1:1。"""
+    if addr_gated:
+        return False
+    if not is_group:
+        return True
+    return call_to_self or followup_detected
+
+
+def group_idle_request_limit(
+    default_limit: int,
+    *,
+    is_group: bool,
+    followup_detected: bool,
+    has_active_task: bool,
+    idle_cap: int,
+    call_to_self: bool = False,
+) -> int:
+    """旁观收紧 request_limit。点名履约不收。"""
+    if default_limit < 1 or idle_cap < 1:
+        return default_limit
+    if call_to_self:
+        return default_limit
+    if is_group and not followup_detected and not has_active_task:
+        return min(default_limit, idle_cap)
+    return default_limit
+
+
+def snapshot_tool_allowed(
+    name: str,
+    *,
+    create_ok: bool,
+    mutate_ok: bool,
+) -> bool:
+    """是否把该名作为**本轮新 extras**。不用于从 frozen schema 摘名。"""
+    if name in _SCHED_CREATE_NAMES:
+        return create_ok
+    if name in _SCHED_MUTATE_NAMES:
+        return mutate_ok
+    return True
+
+
+def should_skip_tool_search(
+    *,
+    in_flight_short: bool,
+    is_group: bool,
+    followup_detected: bool,
+    has_active_task: bool,
+    has_media: bool,
+    call_to_self: bool,
+    intent: str = "",
+) -> bool:
+    """向量预检索是否跳过。点名必搜；旁观/在途短轮才跳。"""
+    if in_flight_short:
+        return True
+    if followup_detected or has_active_task or has_media or call_to_self:
+        return False
+    if is_group:
+        return True
+    return intent == "闲聊"
+
+
+def _snapshot_visibility_flags(st: RunOnceState) -> tuple[bool, bool]:
+    """从 run_extra 读创建/变更两旗；缺旗偏可见。"""
+    from gsuid_core.ai_core.buildin_tools.visibility import (
+        SCHED_CREATE_OK_KEY,
+        SCHED_MUTATE_OK_KEY,
+    )
+
+    extra = st.run_extra
+    create_ok = True if SCHED_CREATE_OK_KEY not in extra else bool(extra[SCHED_CREATE_OK_KEY])
+    mutate_ok = True if SCHED_MUTATE_OK_KEY not in extra else bool(extra[SCHED_MUTATE_OK_KEY])
+    return create_ok, mutate_ok
+
+
+def is_group_send_extra(name: str) -> bool:
+    """对用户发送 extras（不在通道核）。只许本轮 find_tools 动态暴露。"""
+    return name.startswith("send_") and name not in interaction_scaffold.MAIN_AGENT_CORE_TOOLS
+
+
+# 回想核内只有 search_cognition；attach_article 走 find_tools，避免每轮写工具进 schema。
+_KERNEL_NO_FAMILY_CLOSE_DOMAINS = frozenset({"回想"})
+
+
+def complete_kernel_family_names(core_names: Sequence[str], *, exclusive: set[str]) -> list[str]:
+    """核内已出现的非状态驱动域，把该域非 exclusive、非发送 extras 一并进快照。"""
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _add(name: str) -> None:
+        if not name or name in seen or name in exclusive:
+            return
+        if is_group_send_extra(name) and name not in core_names:
+            return
+        seen.add(name)
+        out.append(name)
+
+    for name in core_names:
+        _add(name)
+    domains: list[str] = []
+    for name in list(out):
+        tb = find_tool_base(name)
+        domain = tb.capability_domain if tb is not None else None
+        if domain and domain not in domains:
+            domains.append(domain)
+    for domain in domains:
+        if domain in STATE_DRIVEN_FAMILY_DOMAINS or domain in _KERNEL_NO_FAMILY_CLOSE_DOMAINS:
+            continue
+        for tb in get_tools_by_capability_domain(domain):
+            _add(tb.name)
+    return out
+
+
+STATE_PERSISTED_FAMILY_HINT = (
+    "\n\n（系统提示：当前会话已有持久条目。变更已有条目请用对应能力族的查询/修改/取消工具，不要再创建一条来代替。）"
+)
+
+
+def stabilize_session_tool_names(
+    frozen: list[str] | None,
+    incoming: Sequence[str],
+    *,
+    exclusive: set[str],
+    ceiling: int,
+    pin: tuple[str, ...] = _PINNED_SESSION_TOOLS,
+) -> list[str]:
+    """Append-only 会话工具名。frozen 空则拍快照；否则只在末尾 append，超顶丢新名。"""
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def _try_add(name: str) -> None:
+        if not name or name in seen or name in exclusive:
+            return
+        if len(out) >= ceiling:
+            return
+        seen.add(name)
+        out.append(name)
+
+    if frozen is None:
+        for name in pin:
+            _try_add(name)
+        for name in incoming:
+            _try_add(name)
+        return out
+
+    for name in frozen:
+        if not name or name in exclusive or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    for name in incoming:
+        _try_add(name)
+    return out
+
+
+def _without_progress_tool(tools: ToolList) -> ToolList:
+    return [t for t in tools if t.name != _PROGRESS_TOOL]
 
 
 def _kernel_owns_tool_assembly() -> bool:
@@ -73,11 +259,42 @@ def _kernel_owns_tool_assembly() -> bool:
 
 
 class ToolsPhase(RunOnceHost):
+    def _stabilize_session_toolset(
+        self,
+        core: ToolList,
+        extras: ToolList,
+        ctx_tags: list[str],
+    ) -> ToolList:
+        """Append-only：首轮拍快照（通道核 ∪ pin）；其后只 append，exclusive 永不进表。"""
+        tags = frozenset(ctx_tags)
+        rebuild = self._session_toolset_frozen is None
+        exclusive = _capability_exclusive_tool_names()
+        incoming: list[str] = []
+        for t in list(core) + list(extras):
+            if t.name not in incoming:
+                incoming.append(t.name)
+        for name in self._session_appended_tools:
+            if name not in incoming:
+                incoming.append(name)
+        names = stabilize_session_tool_names(
+            None if rebuild else self._session_toolset_frozen,
+            incoming,
+            exclusive=exclusive,
+            ceiling=_session_tool_ceiling(),
+        )
+        self._session_toolset_frozen = names
+        self._session_toolset_tags = tags
+        out: ToolList = []
+        for name in names:
+            tb = find_tool_base(name)
+            if tb is not None:
+                out.append(tb.tool)
+        return out
+
     async def _run_once_assemble_tools(self, st: RunOnceState) -> None:
         """工具五层装配 + 去重 + 渐进式暴露。"""
         # 渐进式工具暴露是否在本轮生效（仅自动装配 + 非闲聊轮）。决定是否挂 RetrievableToolset。
         st.expose_dynamic = False
-        st.is_light = st.cheap is interaction_scaffold.CheapGate.LIGHT if st.cheap is not None else False
         # 媒体句柄（event 字段或正文 img_/图片ID 标注）——通道信号，非话题词
         _probe_for_media = ""
         if isinstance(st.user_message, str):
@@ -90,7 +307,6 @@ class ToolsPhase(RunOnceHost):
             image_list=st.ev.image_list if st.ev is not None else None,
             audio_id=st.ev.audio_id if st.ev is not None else None,
         )
-        # light 与 full 群聊均走瘦保底；light 不再清工具，只是少检索 + 短回 hint
         st.group_slim = bool(st.tg is not None and bool(st.tg.is_group) and self.create_by in _INTERACTIVE_CREATE_BY)
 
         # dynamic 能力族门：显式 True/False 优先；None 沿用旧门（agentic 且未传 st.tools）。
@@ -149,18 +365,17 @@ class ToolsPhase(RunOnceHost):
                     elif st.ev is not None:
                         qy = st.ev.raw_text
 
-                # 第一层：保底池。群聊（含 light）瘦保底；私聊/能力代理仍全量。
-                if st.group_slim or st.is_light:
-                    core_tools = []
-                    core_names: set[str] = set()
-                    for _tn in interaction_scaffold.SLIM_GROUP_CORE_TOOLS:
-                        _tb = find_tool_base(_tn)
-                        if _tb is not None and _tn not in core_names:
-                            core_names.add(_tn)
-                            core_tools.append(_tb.tool)
-                else:
-                    core_tools = await get_main_agent_tools()
-                    core_names = {t.name for t in core_tools}
+                # 第一层：群/私同一通道核（创建类提醒钉核；列出/改/删走 L2 / 检索 / find_tools）。
+                core_tools = await get_main_agent_tools()
+                core_names = {t.name for t in core_tools}
+                _fam_exclusive = _capability_exclusive_tool_names()
+                for _tn in complete_kernel_family_names(list(core_names), exclusive=_fam_exclusive):
+                    if _tn in core_names:
+                        continue
+                    _tb = find_tool_base(_tn)
+                    if _tb is not None:
+                        core_names.add(_tn)
+                        core_tools.append(_tb.tool)
 
                 # 调用方显式传入的基础工具（dynamic 节点的 packs+白名单）并入保底
                 for _bt in st.tools:
@@ -169,7 +384,7 @@ class ToolsPhase(RunOnceHost):
                         core_tools.append(_bt)
 
                 # 节点显式白名单：persona 投影节点在 config.json 声明的 st.tool_names 并入保底
-                if self.persona_name and not st.group_slim:
+                if self.persona_name:
                     from gsuid_core.ai_core.agent_node import get_node as _get_agent_node
 
                     _node = _get_agent_node(self.persona_name)
@@ -182,45 +397,50 @@ class ToolsPhase(RunOnceHost):
                                 core_names.add(_tn)
                                 core_tools.append(_tb.tool)
 
-                # 第 1.5 层：状态驱动工具池（L2）
-                _state_pool_names: set[str] = set()
-                try:
-                    from gsuid_core.ai_core.tool_state_signals import get_state_driven_family_tools
+                # L2：有持久实体则补该族非 exclusive 工具（点名/跟进/私聊；旁观不加）
+                extra_tools: ToolList = []
+                _is_group = bool(st.tg is not None and st.tg.is_group)
+                _call_self = bool(st.tg is not None and st.tg.call_to_self)
+                if l2_state_driven_wanted(
+                    addr_gated=st.addr_gated,
+                    is_group=_is_group,
+                    call_to_self=_call_self,
+                    followup_detected=st.followup_detected,
+                ):
+                    try:
+                        from gsuid_core.ai_core.tool_state_signals import (
+                            get_state_driven_families,
+                            get_state_driven_family_tools,
+                        )
 
-                    state_tools = await get_state_driven_family_tools(
-                        st.ev, core_names, has_active_task=st.has_active_task, intent=st.intent
-                    )
-                    if state_tools:
-                        core_tools = core_tools + state_tools
-                        core_names.update(t.name for t in state_tools)
-                        _state_pool_names = {t.name for t in state_tools}
-                except Exception as e:
-                    logger.debug(i18n_t("log.agent.load_state_driven_pool", e=e))
+                        _exclusive_now = _capability_exclusive_tool_names()
+                        _l2_domains = await get_state_driven_families(st.ev, has_active_task=st.has_active_task)
+                        if _l2_domains:
+                            extra_tools += await get_state_driven_family_tools(
+                                st.ev,
+                                exclude_names=core_names | _exclusive_now,
+                                has_active_task=st.has_active_task,
+                            )
+                            st.final_user_message = _append_user_text(
+                                st.final_user_message, STATE_PERSISTED_FAMILY_HINT
+                            )
+                    except Exception as e:
+                        logger.debug(i18n_t("log.agent.load_state_driven_pool", e=e))
 
-                # C-1：跟进补调度族 + 产物族（追问产物需 artifact_get_recent）
-                if st.followup_detected:
-                    for _dom in ("定时任务", "长期任务编排", "产物"):
-                        for _tb in get_tools_by_capability_domain(_dom):
-                            if _tb.name not in core_names:
-                                core_names.add(_tb.name)
-                                core_tools.append(_tb.tool)
-                    logger.debug(i18n_t("log.agent.scaffold_supplemented_scheduled_task"))
-
-                # 第 1.6 层：会话驻留工具池（L3）
+                # L3 不写 core；跨轮靠 find_tools 成功后 append。TTL 仍递减。
+                _interactive = self.create_by in _INTERACTIVE_CREATE_BY
                 if self._recent_tool_families:
-                    for _dom, _ttl in list(self._recent_tool_families.items()):
-                        if _ttl <= 0:
-                            continue
-                        for _tb in get_tools_by_capability_domain(_dom):
-                            if _tb.name not in core_names:
-                                core_names.add(_tb.name)
-                                core_tools.append(_tb.tool)
                     self._recent_tool_families = {
                         _d: _t - 1 for _d, _t in self._recent_tool_families.items() if _t - 1 > 0
                     }
 
-                # 附加工具池 = 语境工具池 + 查询工具池
-                extra_tools: ToolList = []
+                # 交互主人格：进度查询不常挂，追问时经 find_tools 进尾槽。
+                if _interactive:
+                    core_tools = _without_progress_tool(core_tools)
+                    core_names.discard(_PROGRESS_TOOL)
+                    extra_tools = _without_progress_tool(extra_tools)
+
+                # 附加工具池 = L2/跟进尾槽 + 语境 + 查询
                 _ctx_pool_names: set[str] = set()
 
                 # 第二层：语境工具池（群聊瘦模式也保留标签池，上限更紧）
@@ -234,7 +454,7 @@ class ToolsPhase(RunOnceHost):
                     try:
                         ctx_tags = await get_scope_context_tags(ctx_scope_key)
                         if ctx_tags:
-                            _ctx_max = 4 if st.group_slim else 8
+                            _ctx_max = 4 if _is_group else 8
                             ctx_tools = get_tools_by_context_tags(ctx_tags, max_count=_ctx_max)
                             if ctx_tools:
                                 extra_tools += ctx_tools
@@ -249,25 +469,18 @@ class ToolsPhase(RunOnceHost):
                     except Exception as e:
                         logger.debug(i18n_t("log.agent.load_contextual_pool", e=e))
 
-                # 第三层：向量检索。light 或群聊纯闲聊可跳过（保底已含搜/图/渲/调度入口）。
-                # soft_continue / ellipsis 与呼叫跟进同权：不得因 st.intent=闲聊 跳过检索。
+                # 第三层：向量检索。点名必搜；旁观/在途短轮才跳。
                 _recall_limit = int(ai_config.get_config("tool_search_recall").data)
                 max_extra_tools: int = int(ai_config.get_config("tool_extra_pool_max").data)
                 _recall_threshold = float(ai_config.get_config("tool_recall_threshold").data)
-                _soft_cont = bool(st.tg.soft_continue) if st.tg is not None else False
-                _ellip = bool(st.tg.ellipsis_followup) if st.tg is not None else False
-                _skip_search = (
-                    st.is_light
-                    or st.in_flight_short
-                    or (
-                        st.group_slim
-                        and st.intent == "闲聊"
-                        and not st.followup_detected
-                        and not st.has_active_task
-                        and not st.has_media
-                        and not _ellip
-                        and not _soft_cont
-                    )
+                _skip_search = should_skip_tool_search(
+                    in_flight_short=st.in_flight_short,
+                    is_group=_is_group,
+                    followup_detected=st.followup_detected,
+                    has_active_task=st.has_active_task,
+                    has_media=st.has_media,
+                    call_to_self=_call_self,
+                    intent=st.intent or "",
                 )
                 if (
                     st.intent == "闲聊"
@@ -277,8 +490,6 @@ class ToolsPhase(RunOnceHost):
                 ):
                     _recall_limit = max(2, _recall_limit // 2)
                     max_extra_tools = max(3, max_extra_tools // 2)
-                if st.group_slim or st.is_light or st.in_flight_short:
-                    max_extra_tools = min(max_extra_tools, 6)
                 if st.in_flight_short:
                     max_extra_tools = min(max_extra_tools, 2)
                 if qy and not _skip_search:
@@ -286,59 +497,79 @@ class ToolsPhase(RunOnceHost):
                         qy,
                         self._recent_user_texts,
                         ctx_tags,
+                        include_recent=bool(st.followup_detected),
                     )
                     logger.debug(i18n_t("log.agent.attempting_search_tools_query", search_query=search_query))
 
+                    _ignore: tuple[str, ...] = ()
+                    if self.persona_name:
+                        from gsuid_core.ai_core.memory.group_profile import collect_persona_surfaces
+
+                        _ignore = collect_persona_surfaces(self.persona_name)
                     extra_tools += await search_tools_with_entity_routing(
                         query=search_query,
                         route_text=qy,
                         limit=_recall_limit,
-                        non_category=["self", "buildin"],
                         threshold=_recall_threshold,
                         scope_key=ctx_scope_key,
+                        ignore_surfaces=_ignore,
+                        exclude_names=core_names,
                     )
-                    # 补搜索族（瘦保底已含 web_search_tool；再补 fetch/knowledge）
-                    if (st.group_slim or st.is_light) and st.intent in ("工具", "问答"):
-                        for _tn in ("web_fetch_tool", "search_cognition"):
+                    if st.intent in ("工具", "问答"):
+                        for _tn in ("web_search_tool", "web_fetch_tool"):
                             if _tn in core_names:
                                 continue
                             _tb = find_tool_base(_tn)
                             if _tb is not None:
-                                core_names.add(_tn)
-                                core_tools.append(_tb.tool)
+                                extra_tools.append(_tb.tool)
 
-                # 附加池：先按能力族整族展开（L4），再去重/限量。 召回族内任一工具即带出整族（剔除与保底重名/族内重复）
+                # 对用户发送 extras 不进静态附加池；只许本轮 find_tools 动态暴露
+                if st.group_slim or _interactive:
+                    extra_tools = [t for t in extra_tools if not is_group_send_extra(t.name)]
+
+                if _interactive:
+                    extra_tools = _without_progress_tool(extra_tools)
+                _create_ok_ex, _mutate_ok_ex = _snapshot_visibility_flags(st)
+                extra_tools = [
+                    t
+                    for t in extra_tools
+                    if snapshot_tool_allowed(
+                        t.name,
+                        create_ok=_create_ok_ex,
+                        mutate_ok=_mutate_ok_ex,
+                    )
+                ]
                 deduped_extra = expand_tools_to_families(
                     extra_tools,
                     exclude_names=core_names,
                     max_tools=max_extra_tools,
                 )
+                if _interactive:
+                    deduped_extra = _without_progress_tool(deduped_extra)
 
-                # 召回族也写进 L3 驻留：下一轮并入稳定保底段，工具集随对话收敛，
-                # provider 前缀缓存命中↑、跨轮追问免重检索（§cache 54%→更高）。
+                # L3 只记族 TTL，不把专属工具写进 core（exclusive 会闪烁前缀）
                 for _et in deduped_extra:
                     _etb = find_tool_base(_et.name)
                     _edom = _etb.capability_domain if _etb is not None else None
                     if _edom:
                         self._recent_tool_families[_edom] = _STICKY_FAMILY_TURNS
 
-                # §25(3) 工具序稳定化：两段各自按名排序，
-                core_tools.sort(key=lambda _t: _t.name)
-                deduped_extra.sort(key=lambda _t: _t.name)
-                st.tools = core_tools + deduped_extra
+                st.tools = self._stabilize_session_toolset(core_tools, deduped_extra, ctx_tags)
+                if _interactive:
+                    st.tools = _without_progress_tool(st.tools)
 
-                # 委派：剥离能力代理专属工具，逼主人格走 create_subagent
-                # 状态/语境池工具不参与 exclusive 剥离，避免只读能力被误卸
                 _did_strip_exclusive = False
                 if self.create_by in _INTERACTIVE_CREATE_BY:
                     _exclusive = _capability_exclusive_tool_names()
-                    _shielded = _ctx_pool_names | _state_pool_names
-                    _exclusive = _exclusive - _shielded
                     if _exclusive:
                         _before = {t.name for t in st.tools}
                         _stripped = _before & _exclusive
                         if _stripped:
                             st.tools = [t for t in st.tools if t.name not in _exclusive]
+                            if self._session_toolset_frozen is not None:
+                                self._session_toolset_frozen = [
+                                    n for n in self._session_toolset_frozen if n not in _exclusive
+                                ]
                             _did_strip_exclusive = True
                             logger.info(
                                 i18n_t(
@@ -371,7 +602,7 @@ class ToolsPhase(RunOnceHost):
                             )
                         )
 
-                # 渐进式工具暴露：常挂 find_tools + RetrievableToolset（含误判闲聊轮）。
+                # 渐进式工具暴露：PIN 恒在 schema，是否调用交给模型。
                 if ENABLE_PROGRESSIVE_TOOLS:
                     if any(t.name == "find_tools" for t in st.tools):
                         st.expose_dynamic = True

@@ -25,6 +25,7 @@ from gsuid_core.ai_core.memory.ingestion.edge import _DANGLING_FACT_RE
 from .types import Edge, Entity, Episode, Category, RetrievalMeta
 from .system1 import System1Result, system1_search
 from .system2 import System2Result, system2_global_selection
+from .event_time import event_times_in_text
 
 # untrusted 栅栏自身的字符开销：episodes 预算与终装配截断都要预留它，
 # 否则 </untrusted> 闭合标签会被尾截断切掉（评审修复 F9）
@@ -110,15 +111,27 @@ def _fact_mentions_speaker(edge: "Edge", speaker_ids: set) -> bool:
     return False
 
 
+_TS_MAX = 4_102_444_800.0
+
+
+def _ts_to_dt(ts: float | int | None) -> datetime | None:
+    if not isinstance(ts, (int, float)) or ts <= 0 or ts > _TS_MAX:
+        return None
+    return datetime.fromtimestamp(float(ts))
+
+
 def _edge_date_prefix(e: "Edge") -> str:
-    """edge 的 [YYYY-MM-DD] 日期前缀；无 valid_at_ts（旧数据/迁移缺失）返回空串。"""
-    ts = e["valid_at_ts"] if "valid_at_ts" in e else None
-    if not ts:
+    """陈述日必带；原文相对语另标发生日。无 valid_at_ts 返回空串。"""
+    said = _ts_to_dt(e["valid_at_ts"] if "valid_at_ts" in e else None)
+    if said is None:
         return ""
-    try:
-        return f"[{datetime.fromtimestamp(ts).strftime('%Y-%m-%d')}] "
-    except Exception:
-        return ""
+    stamp = f"[{said.strftime('%Y-%m-%d')}] "
+    events = event_times_in_text(e["fact"] or "", said)
+    if events:
+        ev = min(events)
+        if ev.date() != said.date():
+            stamp += f"[发生 {ev.strftime('%Y-%m-%d')}] "
+    return stamp
 
 
 # 时间范围检索：query 中显式出现的日期（ISO / 中文 / 斜杠格式）。命中≥1 个日期视为
@@ -287,6 +300,10 @@ class MemoryContext:
     # 时间范围检索命中标记：query 含显式日期范围时置 True。此时问题是枚举/时序型，
     # 时间线证据在 episodes 里，注入预算向片段倾斜（事实占比 55% → 30%）。
     temporal_mode: bool = False
+    # 评测：dual_route 向量序的前若干条 id，会话排序时压过泛词 LIKE。
+    seed_ids: list[str] = field(default_factory=list)
+    # 评测：会话级向量分（episode id → cosine），主证据会话用这个排，不靠 seed 条数。
+    session_scores: dict[str, float] = field(default_factory=dict)
 
     def to_prompt_text(
         self,
@@ -294,6 +311,7 @@ class MemoryContext:
         priority_speakers: Optional[set] = None,
         current_speaker_ids: Optional[set] = None,
         query: str = "",
+        wrap_recall: bool = True,
     ) -> str:
         """格式化为可注入 System Prompt 的记忆上下文文本。
 
@@ -453,26 +471,59 @@ class MemoryContext:
             ep_budget = max_chars - used
             if ep_budget > 120:
                 eps = self.episodes
+                self_eps = [e for e in eps if (e["scope_key"] or "").startswith("self:")]
+                other_eps = [e for e in eps if not (e["scope_key"] or "").startswith("self:")]
+                # SELF 配额 ≤10%；近 2h 的 SELF/出站豁免（续聊消解）。
+                now = datetime.now()
+                recent_self: list[Episode] = []
+                old_self: list[Episode] = []
+                for ep in self_eps:
+                    ts_raw = (ep["valid_at"] or "").strip()[:19].replace("T", " ")
+                    recent = False
+                    if ts_raw:
+                        try:
+                            ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            try:
+                                ts = datetime.strptime(ts_raw, "%Y-%m-%d %H:%M")
+                            except ValueError:
+                                ts = None
+                        if ts is not None and (now - ts).total_seconds() <= 2 * 3600:
+                            recent = True
+                    if recent:
+                        recent_self.append(ep)
+                    else:
+                        old_self.append(ep)
+                self_budget = min(int(max_chars * 0.10), max(0, ep_budget // 5))
+                recent_budget = min(int(ep_budget * 0.25), 400)
+                other_budget = max(0, ep_budget - self_budget - recent_budget)
                 # temporal_mode：单条上限压到 600，让更多时段进入预算
                 ep_cap = 600 if self.temporal_mode else 1000
-                # 去重 + 过滤极短无信息量片段（纯寒暄/单字），统一时间格式
-                dated: list[str] = []
-                undated: list[str] = []
-                seen_content: set[str] = set()
-                for ep in eps:
-                    raw = (ep["content"] or "").strip()
-                    if len(raw) < 4:
-                        continue
-                    key = raw[:80]
-                    if key in seen_content:
-                        continue
-                    seen_content.add(key)
-                    ts = (ep["valid_at"] or "").strip()[:19].replace("T", " ")
-                    if ts:
-                        dated.append(f"[{ts}] {raw[:ep_cap]}")
-                    else:
-                        undated.append(raw[:ep_cap])
-                taken = _take(dated + undated, ep_budget)
+
+                def _ep_lines(items: list[Episode], *, self_mark: bool) -> list[str]:
+                    dated: list[str] = []
+                    undated: list[str] = []
+                    seen_content: set[str] = set()
+                    for ep in items:
+                        raw = (ep["content"] or "").strip()
+                        if len(raw) < 4:
+                            continue
+                        key = raw[:80]
+                        if key in seen_content:
+                            continue
+                        seen_content.add(key)
+                        prefix = "[我此前说过] " if self_mark else ""
+                        ts = (ep["valid_at"] or "").strip()[:19].replace("T", " ")
+                        if ts:
+                            dated.append(f"[{ts}] {prefix}{raw[:ep_cap]}")
+                        else:
+                            undated.append(f"{prefix}{raw[:ep_cap]}")
+                    return dated + undated
+
+                taken_other = _take(_ep_lines(other_eps, self_mark=False), other_budget)
+                taken_recent = _take(_ep_lines(recent_self, self_mark=True), recent_budget)
+                taken_self = _take(_ep_lines(old_self, self_mark=True), self_budget)
+                taken = taken_other + taken_recent + taken_self
                 if taken:
                     parts.append("【相关对话片段】\n" + "\n".join(taken))
 
@@ -490,7 +541,10 @@ class MemoryContext:
             elif len(recall_text) > _budget:
                 recall_text = recall_text[: _budget - len(_marker)] + _marker
             if recall_text:
-                blocks.append(wrap_untrusted("memory_recall", recall_text))
+                if wrap_recall:
+                    blocks.append(wrap_untrusted("memory_recall", recall_text))
+                else:
+                    blocks.append(recall_text)
         return "\n\n".join(blocks)
 
     def to_memory_text(self, max_chars: int = 24000) -> str:
@@ -630,6 +684,9 @@ async def dual_route_retrieve(
     enable_user_global: bool = True,
     inject_preferences: bool = True,
     preference_contexts: Optional[list[str]] = None,
+    bot_id: str = "",
+    bot_self_id: str = "",
+    include_self: bool = True,
 ) -> MemoryContext:
     """双路检索主入口。在 handle_ai.py 中，AI 准备回复前调用此函数。
 
@@ -687,6 +744,13 @@ async def dual_route_retrieve(
         scope_keys.append(user_scope)
     else:
         user_scope = None
+
+    # SELF 只开读：key 必须是账号 ID（observer C6 写 self:{bot_self_id}）。
+    self_key = bot_self_id.strip()
+    if include_self and self_key:
+        self_scope = make_scope_key(ScopeType.SELF, self_key)
+        if self_scope not in scope_keys:
+            scope_keys.append(self_scope)
 
     # RF-Mem 熟悉度路由（默认关，零影响）：用一次零 LLM 的向量探针的 s̄/熵 逐查询决定
     # "检索多深"，把 System-2 从全局静态开关降为"按不确定性触发"。路由只在"低熟悉/高
@@ -993,6 +1057,13 @@ async def dual_route_retrieve(
                 pref_task.add_done_callback(_on_pref_task_done)
         except Exception as e:
             logger.warning(i18n_t("log.memory.preference_retrieval", e=e))
+
+    # 未落库原文：闲聊进行中要等 idle 才写 SQL，检索必须先看见缓冲。
+    from gsuid_core.ai_core.memory.observer import pending_episodes_for_scopes
+
+    pending = pending_episodes_for_scopes(scope_keys)
+    if pending:
+        ranked_episodes = _merge_episodes(pending, ranked_episodes)
 
     return MemoryContext(
         episodes=ranked_episodes,

@@ -97,13 +97,15 @@ class PreparePhase(RunOnceHost):
         # _prepare_user_message 的图片理解）都按此记账；finally 还原，泄漏至多止于本 task。
         st.budget_scope_token = _current_budget_scope.set(st.budget_scope) if st.budget_scope is not None else None
 
-        st.tool_call_list = []  # 用于记录本次运行中被调用的工具列表，供后续统计使用
+        st.tool_call_list = []
+        st.effectual_mutate = False
         # 同引用暴露给 _execute_run 的干净重试分支：判断失败前是否已有工具副作用（F14）
         self._last_attempt_tool_calls = st.tool_call_list
         self._last_attempt_delegated_render = False
         self._last_attempt_image_sent = False
         self._last_attempt_pending_async = False
         self._last_attempt_has_status_tool = False
+        self._last_attempt_thinking = ""
         st.wall_nudged = False  # C-4 墙钟软预算：每 run 至多注入一次收敛提示
         # 出戏防火墙拦下的文本段（§D.4）：iter 结束后走"提醒→重说→放行"闭环
         st.ooc_blocked = []
@@ -121,6 +123,7 @@ class PreparePhase(RunOnceHost):
         st.same_tool_name = ""
         st.thrash_fused = False
         st.thinking_segments = []  # 累积本轮模型 thinking 文本，供意图-行为一致性检测
+        st.thinking_streamed = False
         # A: 被同 Session 更新消息 supersede 时置位，不写 history、不收尾发
         st.generation_cancelled = False
         st.cancel_ev = self._cancel_generation
@@ -136,7 +139,8 @@ class PreparePhase(RunOnceHost):
         st.in_flight_short = False
         st.render_ack_seen = False
 
-        # 使用自定义迭代次数限制（如果有），否则使用配置默认值
+        # 使用自定义迭代次数限制（如果有），否则使用配置默认值。
+        # 群聊空闲上限在 TurnGraph 建完后再收紧（见下方）。
         if self.max_iterations is not None:
             st.limits = UsageLimits(request_limit=self.max_iterations)
         else:
@@ -177,15 +181,25 @@ class PreparePhase(RunOnceHost):
         st.allow_outbound = self.create_by == "Kanban_Relay" or (
             self.create_by in ("Chat", "Agent", "TEST") and not self.is_subagent
         )
+        from gsuid_core.ai_core.buildin_tools.visibility import MODEL_DECLARES_VIDEO_KEY
+
         st.run_extra = {
             "turn_id": st.turn_id,
             "agent_run_id": st.turn_id,
             "run_sent_texts": self._run_sent_texts,
             # 同引用透传：纠正轮里 dispute_directive 的申辩要能被外层 settle 读到
             DISPUTE_EXTRA_KEY: self._run_disputes,
+            "speech_policy": "free",
+            "has_status_tool": False,
+            "parent_create_by": self.create_by,
+            MODEL_DECLARES_VIDEO_KEY: self._model_declares_video(),
         }
+        if self.persona_name:
+            st.run_extra["persona_name"] = self.persona_name
         if st.user_turn_id:
             st.run_extra["user_turn_id"] = st.user_turn_id
+        if self.turn_clock is not None:
+            st.run_extra["turn_clock"] = self.turn_clock.isoformat(sep=" ", timespec="seconds")
         # 框架身份由**类型**判定（is_framework_injection / <control> 信封），
         # 前缀嗅探只作遗留兼容：靠前缀曾漏掉 `（系统校验·内部轮）` 导致控制面穿数据面。
         st.fw_msg = isinstance(st.user_message, str) and (
@@ -243,7 +257,9 @@ class PreparePhase(RunOnceHost):
         # history：框架注入的 UserPrompt 整段剥掉（不进 B 轨，避免被当成群友）
         # 真人轮才 lean 成精简发言
         if st.fw_msg:
-            st.lean_user_message = ""
+            from gsuid_core.ai_core.utils import lean_delivery_frame
+
+            st.lean_user_message = lean_delivery_frame(st.user_message) if isinstance(st.user_message, str) else ""
         else:
             st.lean_user_message = (
                 list(st.final_user_message) if isinstance(st.final_user_message, list) else st.final_user_message
@@ -290,6 +306,7 @@ class PreparePhase(RunOnceHost):
                 _ut = "direct"
                 if st.ev is not None:
                     _ut = str(st.ev.user_type or ("group" if st.ev.group_id else "direct"))
+                _has_reply = bool(st.ev.reply or st.ev.reply_id) if st.ev is not None else False
                 st.tg = interaction_scaffold.build_turn_graph(
                     _probe or _cur_text,
                     persona_name=self.persona_name or "",
@@ -300,6 +317,7 @@ class PreparePhase(RunOnceHost):
                     recent_tool_call=interaction_scaffold.has_recent_tool_call(self.history),
                     followup_max_len=int(ai_config.get_config("scaffold_followup_max_len").data),
                     ambient_max_len=int(ai_config.get_config("scaffold_ambient_max_len").data),
+                    has_reply=_has_reply,
                 )
             if st.cheap is None:
                 st.cheap = interaction_scaffold.decide_cheap_gate(
@@ -307,7 +325,59 @@ class PreparePhase(RunOnceHost):
                 )
             st.addr_gated = bool(st.tg.address_gated)
             st.followup_detected = bool(st.tg.needs_task_tools)
-            _hints = interaction_scaffold.scaffold_hints_from_graph(st.tg, cheap=st.cheap)
+            from gsuid_core.ai_core.buildin_tools.visibility import (
+                SCHED_CREATE_OK_KEY,
+                SCHED_MUTATE_OK_KEY,
+                sched_tool_visibility,
+            )
+
+            _has_sched = False
+            if st.ev is not None and st.ev.user_id:
+                from gsuid_core.ai_core.tool_state_signals import user_has_active_schedules
+
+                _has_sched = await user_has_active_schedules(st.ev.user_id)
+            _manage_form = interaction_scaffold.is_manage_ellipsis_form(st.tg.message_text)
+            _create_ok, _mutate_ok = sched_tool_visibility(
+                is_group=bool(st.tg.is_group),
+                address_gated=st.addr_gated,
+                call_to_self=bool(st.tg.call_to_self),
+                followup_detected=st.followup_detected,
+                has_active_schedules=_has_sched,
+                manage_form=_manage_form,
+            )
+            st.run_extra[SCHED_CREATE_OK_KEY] = _create_ok
+            st.run_extra[SCHED_MUTATE_OK_KEY] = _mutate_ok
+            from gsuid_core.ai_core.buildin_tools.visibility import visibility_user_hint
+
+            _vh = visibility_user_hint(
+                is_group=bool(st.tg.is_group),
+                call_to_self=bool(st.tg.call_to_self),
+                followup_detected=st.followup_detected,
+                create_ok=_create_ok,
+            )
+            if _vh:
+                st.final_user_message = _append_user_text(st.final_user_message, f"\n{_vh}")
+            if self.max_iterations is None and st.limits is not None:
+                from gsuid_core.ai_core.agent_run.tools import group_idle_request_limit
+
+                _idle_raw = ai_config.get_config("group_idle_max_iterations").data
+                _idle_cap = int(_idle_raw) if isinstance(_idle_raw, int) else 2
+                _capped = group_idle_request_limit(
+                    int(st.limits.request_limit or 0),
+                    is_group=bool(st.tg.is_group),
+                    followup_detected=st.followup_detected,
+                    has_active_task=st.has_active_task,
+                    idle_cap=_idle_cap,
+                    call_to_self=bool(st.tg.call_to_self),
+                )
+                if _capped != st.limits.request_limit:
+                    st.limits = UsageLimits(request_limit=_capped)
+            _hints = interaction_scaffold.scaffold_hints_from_graph(
+                st.tg,
+                cheap=st.cheap,
+                speaker_recall=self.dynamic_tools is not False,
+                intent=str(st.intent or ""),
+            )
             # C-2：≥2 且比上轮增加才保留漂移提醒（hints 里可能已有，按计数裁）
             _pushes = st.tg.style_push_count
             if interaction_scaffold.DRIFT_REMINDER in _hints:
@@ -342,6 +412,7 @@ class PreparePhase(RunOnceHost):
             logger.debug(i18n_t("log.agent.scaffold_ellipsis_style_follow_inject"))
         if not st.fw_msg and st.has_active_task:
             st.in_flight_short = spoken_user_body_len(st.last_user_question) <= 48
+        st.run_extra["speech_policy"] = st.speech_policy
 
         # 先钉一次：本轮 lean 必须带 marker，否则 _relean 会从持久 history 剥掉。
         self._inject_deepseek_rp_marker(st)

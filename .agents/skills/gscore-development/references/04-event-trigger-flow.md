@@ -50,6 +50,11 @@ for sv in SL.lst:
 `_check_command` 内部会校验：SV/插件 `enabled`、用户权限 `user_pm <= sv.pm`、触发器文本匹配。
 有匹配则按 priority 排序执行 `trigger.func(bot, event)`。
 
+命中后按类型分轨：`type == "message"`（`on_message`）另轨入队——**不挡 AI、不进 Trace、
+不调用 `count_data`**（keyword 常为 uuid4，计入命令会污染看板 / `core信息`）。其余触发器才记
+命令统计，并在存在 `command_triggers` 时跳过 AI。启动时 `purge_uuid4_command_stats` 会清掉
+历史 uuid4 伪命令行并回写 `CoreDataSummary.command`。
+
 > **权限不足 = 不匹配 → 落 AI**：若某 SV `pm=2`，而用户 `user_pm=3`（权限更低），该命令
 > "不匹配"，消息落入 AI 流程。如果该触发器声明了 `to_ai`，AI 可能尝试调它对应的工具——
 > 此时**桥接层会再做一次同样的权限检查**并把"权限不足"文本返回给 AI（见 [§07](./07-tool-registry-and-agent.md)）。
@@ -86,6 +91,13 @@ if "提及应答" in ai_mode:
 
 其他模式：`定时巡检`（见 [§08](./08-heartbeat-scheduled-planning.md)）；`趣向捕捉` / `困境救场`
 暂不可用。
+
+## 4.3b HTTP Agent 面（不是 `handle_event`）
+
+`POST /api/v1/agent/chat/stream` **禁止**注入 `handle_event`。开流后只补 H00/A 轨，然后调用
+与适配器同源的 `run_passive_interactive_chat`（H01/长度/预算/session/turn）。`is_http` 的
+`wait_task` 只绑命令路径，不是禁 `handle_event` 的理由。AI 总开关关闭时
+`register_http_agent_routes` 不挂该面。
 
 ## 4.4 `handle_ai_chat` 全链路（`handle_ai.py`）
 

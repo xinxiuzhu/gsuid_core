@@ -1,10 +1,10 @@
 import asyncio
-from types import SimpleNamespace
 from pathlib import Path
 from datetime import timedelta
 
 import pytest
-from fastapi import HTTPException
+from httpx import AsyncClient, ASGITransport
+from fastapi import Depends, FastAPI
 from sqlmodel import SQLModel
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
@@ -44,20 +44,45 @@ def _record(meme_id: str, file_path: str, *, folder: str = "common", status: str
 
 
 def test_require_admin_reads_current_database_role(monkeypatch: pytest.MonkeyPatch) -> None:
-    session = {"email": "owner@example.com", "user": {"email": "owner@example.com", "role": "admin"}}
-    monkeypatch.setattr(web_api, "verify_token", lambda *_args, **_kwargs: session)
-
-    async def demoted_user(**_kwargs):
-        return SimpleNamespace(role="user")
-
+    from gsuid_core.webconsole.session_store import SessionRecord
     from gsuid_core.utils.database.auth_models import WebUser
 
-    monkeypatch.setattr(WebUser, "get_user_by_email", demoted_user)
+    session = SessionRecord(
+        email="owner@example.com",
+        user={"email": "owner@example.com", "role": "admin"},
+        created="2026-09-14T00:00:00",
+        expires="2026-09-16T00:00:00",
+    )
+    current_user: WebUser | None = WebUser(email=session["email"], role="user")
+    queried_emails: list[str] = []
+
+    def verify_token(authorization: str | None = None, token: str | None = None) -> SessionRecord | None:
+        return session if authorization == "Bearer token" else None
+
+    async def get_user_by_email(*, email: str) -> WebUser | None:
+        queried_emails.append(email)
+        return current_user
+
+    monkeypatch.setattr(web_api, "verify_token", verify_token)
+    monkeypatch.setattr(WebUser, "get_user_by_email", get_user_by_email)
+    app = FastAPI()
+
+    @app.get("/admin")
+    async def admin_endpoint(admin: SessionRecord = Depends(web_api.require_admin)) -> str:
+        return admin["email"]
 
     async def run() -> None:
-        with pytest.raises(HTTPException) as exc:
-            await web_api.require_admin(authorization="Bearer token")
-        assert exc.value.status_code == 403
+        nonlocal current_user
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            assert (await client.get("/admin")).status_code == 401
+            assert queried_emails == []
+            headers = {"Authorization": "Bearer token"}
+            assert (await client.get("/admin", headers=headers)).status_code == 403
+            current_user = None
+            assert (await client.get("/admin", headers=headers)).status_code == 403
+            current_user = WebUser(email=session["email"], role="admin")
+            assert (await client.get("/admin", headers=headers)).status_code == 200
+            assert queried_emails == [session["email"]] * 3
 
     asyncio.run(run())
 

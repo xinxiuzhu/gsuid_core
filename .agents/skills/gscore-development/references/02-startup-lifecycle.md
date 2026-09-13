@@ -58,6 +58,7 @@ def on_core_shutdown(func=None, /, priority: int = 0): ...      # 关闭
 | `move_database` | `utils/database/startup.py` | -100 | 旧 `GsData.db` 迁移到新路径 + 清 `global_val/*.json` |
 | `create_core_tables` | `utils/database/startup.py` | -90 | 建核心表（**AI 总开关关闭时跳过 AI 表**） |
 | `trans_adapter` | `utils/database/startup.py` | -80 | 执行 ALTER / CREATE INDEX 等 Schema 升级 |
+| `purge_uuid4_command_stats` | `utils/database/startup.py` | -60 | 删除 `CoreDataAnalysis` 中 on_message uuid4 伪命令并回写 `CoreDataSummary`（须在 load 前） |
 | `load_global_val` | `buildin_plugins/.../command_global_val.py` | 0 | 加载 Bot 流量统计 / QPS 配置 |
 
 > 给已部署用户**补数据库列**（Schema 升级）走这个阶段：插件用 `exec_list`，框架用
@@ -134,6 +135,9 @@ AI 子系统**不再各自** `@on_core_start`，而是由 `ai_core/startup.py` �
 `handle_ai.py` 里 `enable_ai` 改为**函数内动态读取**（`ai_config.get_config("enable").data`），
 不是模块级常量——用户在 WebConsole 切总开关后**无需重启**即生效。
 
+HTTP Agent 路由在 `app_life` 构造 app 时按总开关决定是否 `include_router`（关则不挂；
+再开需重启）。已挂上后关掉总开关，请求仍 404。Admin 建钥走 webconsole 核心篮，不查总开关。
+
 > ⚠️ 改任何 AI 模块的启动钩子 / 定时任务 / 执行器时，**务必保留**这个总开关检查。历史缺陷
 > D-21 就是"AI 关了但启动钩子/定时任务仍跑 AI 逻辑"。详见 [§12](./12-developer-pitfalls.md)。
 
@@ -160,7 +164,7 @@ AI 子系统**不再各自** `@on_core_start`，而是由 `ai_core/startup.py` �
 `app_life.lifespan` 在 uvicorn 内部执行，顺序：
 
 1. `await core_start_before_execute()` —— 阶段一钩子（`move_database` → `create_core_tables`
-   → `trans_adapter` → `load_global_val`）
+   → `trans_adapter` → `purge_uuid4_command_stats` → `load_global_val`）
 2. `asyncio.create_task(check_speed())` —— 后台测速选镜像源
 3. `asyncio.create_task(core_start_execute())` —— **后台异步**跑全部 `@on_core_start`
    （`_start_rm_cleanup` + `init_ai_core`）
@@ -196,5 +200,7 @@ python -m gsuid_core --dev              # 只加载 name.endswith("-dev") 的插
 python -m gsuid_core --port 8888 --host 0.0.0.0
 ```
 
-`load_plugins()` 里 `if dev_mode and not plugin.name.endswith("-dev"): continue`。开发模式
-插件目录命名为 `my_plugin-dev/`。
+`load_plugins()` 里常规插件仍要求 `name.endswith("-dev")`；**基础设施插件（meta plugin）在
+`--dev` 下也会加载**，否则依赖它们的 `-dev` 业务插件会在 import 期找不到
+`from gscore_mail.api import send`。开发模式业务插件目录命名为 `my_plugin-dev/`。
+未带 `-dev` 后缀的 meta 模块名保持 `plugins.<目录>.*`，不会被改成 `*-dev`。

@@ -57,9 +57,12 @@ def session_role(user_data: SessionRecord | None) -> str:
     return role if isinstance(role, str) else ""
 
 
-def require_admin(user_data: SessionRecord = Depends(require_auth)) -> SessionRecord:
-    """须 ``role == admin``。重启 / 装插件 / 改核心配置 / 库 / 备份 / MCP / git。"""
-    if session_role(user_data) != "admin":
+async def require_admin(user_data: SessionRecord = Depends(require_auth)) -> SessionRecord:
+    """每次查询当前数据库角色，避免登录快照让撤权或删除的用户继续执行管理员操作。"""
+    from gsuid_core.utils.database.auth_models import WebUser
+
+    user = await WebUser.get_user_by_email(email=user_data["email"])
+    if user is None or user.role != "admin":
         raise HTTPException(status_code=403, detail="需要管理员权限")
     return user_data
 

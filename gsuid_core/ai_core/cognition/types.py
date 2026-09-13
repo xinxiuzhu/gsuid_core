@@ -7,6 +7,7 @@
 
 from enum import Enum
 from typing import Dict, Tuple, Optional, FrozenSet
+from datetime import datetime
 from dataclasses import dataclass
 
 
@@ -24,7 +25,12 @@ class CogKind(str, Enum):
     RECORD = "record"
     IMAGE = "image"
     MEME = "meme"
+    MEME_KNOWLEDGE = "meme_knowledge"
+    OUTBOUND = "outbound"
 
+
+# 工具回执里单条片段正文上限。专名要留下，邻条闲聊不要整段摊开。
+EPISODE_BODY_BUDGET = 240
 
 # 面向模型的中文标签（进 prompt 的那一份）
 KIND_LABEL: Dict[CogKind, str] = {
@@ -39,6 +45,8 @@ KIND_LABEL: Dict[CogKind, str] = {
     CogKind.RECORD: "业务记录",
     CogKind.IMAGE: "图片",
     CogKind.MEME: "表情",
+    CogKind.MEME_KNOWLEDGE: "梗知识",
+    CogKind.OUTBOUND: "出站",
 }
 
 # ⑧ 每轮自动注入的默认切片：与改造前一致（记忆 + 偏好），延迟不回退。
@@ -48,6 +56,13 @@ KNOWLEDGE_KINDS: FrozenSet[CogKind] = frozenset({CogKind.KNOWLEDGE})
 WORK_KINDS: FrozenSet[CogKind] = frozenset({CogKind.TOOL_OUTPUT, CogKind.ARTIFACT})
 MEDIA_KINDS: FrozenSet[CogKind] = frozenset({CogKind.IMAGE, CogKind.MEME})
 ALL_KINDS: FrozenSet[CogKind] = frozenset(CogKind)
+# 工具未声明 kinds 时的默认面：记忆+知识+落盘。图片/表情/出站/业务记录须显式打开。
+DEFAULT_RECALL_KINDS: FrozenSet[CogKind] = MEMORY_KINDS | KNOWLEDGE_KINDS | WORK_KINDS
+# query 点名当前说话人 ID：只查身上的记忆（片段+实体+事实+偏好）。
+# 不开放知识库/落盘/近窗。近窗只在 DEFAULT_RECALL_KINDS ⊆ kinds 时开，加 EPISODE 不会误开。
+SPEAKER_RECALL_KINDS: FrozenSet[CogKind] = frozenset(
+    {CogKind.EPISODE, CogKind.ENTITY, CogKind.FACT, CogKind.PREFERENCE}
+)
 
 
 @dataclass(frozen=True)
@@ -56,6 +71,8 @@ class CogScope:
 
     user_id: str
     bot_id: str = ""
+    # SELF 记忆用账号 ID，不是平台 ID（onebot 这类会把多账号写成同一个 key）。
+    bot_self_id: str = ""
     # 私聊必须是 None。回退成 user_id 只会去查一个空的幻影 group:{user_id}。
     group_id: Optional[str] = None
     # 开发文档库（source=skill_doc）不对普通用户暴露
@@ -63,6 +80,10 @@ class CogScope:
     # 语义性开关，由调用方从配置显式表态（不在这里给默认真值）
     enable_system2: bool = False
     enable_user_global: bool = True
+    # LongMem 证据转储（format_eval_memory）。默认关，生产/Agent 评测不得打开。
+    memory_eval: bool = False
+    # 评测 HTTP clock_at。None=检索用墙上时钟；禁止从用户原文解析。
+    clock_at: Optional[datetime] = None
 
     @property
     def is_private(self) -> bool:
@@ -93,9 +114,13 @@ class CognitiveHit:
 
     def render_line(self, index: int) -> str:
         """单行渲染。空结果只回一行，绝不再拼双段「未找到 + 无匹配 + 长说明」。"""
-        parts = [f"{index}. [{self.label}] {self.title or self.summary[:40]}"]
-        if self.summary and self.title:
-            parts.append(self.summary[:120].replace("\n", " "))
+        # 片段无 title：40 字会切掉专名，800 字会把邻条闲聊整段摊开。
+        body_budget = EPISODE_BODY_BUDGET if self.kind is CogKind.EPISODE else 160
+        head_src = (self.title or self.summary).replace("\n", " ").strip()
+        parts = [f"{index}. [{self.label}] {head_src[:body_budget]}"]
+        extra = self.summary.replace("\n", " ").strip() if self.summary and self.title else ""
+        if extra and extra not in head_src:
+            parts.append(extra[:body_budget])
         meta: Tuple[str, ...] = tuple(
             x
             for x in (

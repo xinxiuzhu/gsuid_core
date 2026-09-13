@@ -33,6 +33,7 @@ GsCore（早柚核心 / `gsuid-core`）是 **FastAPI + WebSocket + APScheduler**
 │   ├── core.py               # 进程入口
 │   ├── app_life.py           # FastAPI lifespan / 两阶段钩子
 │   ├── server.py / gss.py    # 插件加载、连接、钩子注册表
+│   ├── meta_plugins.py       # 基础设施插件先加载，并把 <包>.api 挂到 sys.modules
 │   ├── handler.py            # handle_event：命令匹配 + AI 分流
 │   ├── bot.py                # _Bot（底层）/ Bot（高层）
 │   ├── sv.py / trigger.py    # Plugins / SV / 触发器
@@ -116,7 +117,8 @@ uv run core --port 8765
 
 ## Testing
 
-- 测试在 `tests/`，`pytest`，文件 `test_*.py`。
+- 测试在 `tests/`，`pytest`，文件 `test_*.py`。默认收集面必须离线、无 LLM。
+- 需要已启动 core 的 WS/HTTP 脚本放 `eval/manual/`（不要 `test_` 前缀）或 `eval/agent/`；禁止再往 `tests/` 加。
 - 类型：basedpyright / pyright，`typeCheckingMode=basic`；`gsuid_core/plugins` 与 `data` 已排除。
 - 行宽 120（ruff）；`#` 注释更严，见 §1.6。
 - 改交互脚手架必须跑 `tests/test_interaction_scaffold.py`（正反双向）。
@@ -264,6 +266,39 @@ deleted = result.rowcount if isinstance(result, CursorResult) else 0
 `object` 当「万能袋」、裸 `dict` / `list` 当业务数据，等同于 Any，同样禁止。
 测试里的假对象用 `Protocol` 或显式 stub 类，不要 `MagicMock` + `Any` 糊弄生产签名。
 
+### 1.9 禁止人格锁定 / 能力锁定（通用框架）
+
+GsCore 是**通用框架**：部署者自己写人格卡、自己装插件。框架运行时**不得**假定某个具体人格或某个业务垂直存在。
+
+**人格锁定（禁止）**：框架代码、用户可见兜底、闸门、脚手架、分类器、规划提示 **不得**写死某个角色的姓名、口癖、自称、出身或道具梗（如「早柚」「唔…」「呼」「zzz」「卷轴」「本貉」）。口癖配额 / 结尾语气词必须从**当前人格卡**解析（Tone Markers 等）；卡上没有就当无口癖。末端兜底必须人格中性，禁止用默认角色的口头禅冒充中性。
+
+**能力锁定（禁止）**：框架意图分类 / 规划 / 路由 / 提示词 **不得**内置业务垂直词表（游戏练度/圣遗物/命座、股票/研报/模拟盘、把某城市天气写进核心特判等）。插件能力只许插件自己声明：`covers` / 带领域前缀的 `aliases` / `capability_domain` / `ai_entity` / `ai_alias`。框架只做确定性查表 + 向量召回，不在核心维护「这个词属于哪款游戏 / 哪条业务线」。禁止为某个业务域写栏目词表、猜分隔约定、把插件名写进装配路径。
+
+```python
+# ❌ 框架把默认人格的口癖写进运行时
+if text.endswith(("zzz", "呼", "唔")): ...
+PERSONA_FALLBACK_TEXT = "唔…这个不太想说呢…"
+
+# ❌ 框架意图词表收插件专属域词
+KNOWLEDGE_NOUNS = {"圣遗物", "命座", "元素精通", "模拟盘"}
+
+# ✅ 口癖从当前人格卡解析；兜底中性
+markers = get_tone_markers(persona_name)
+PERSONA_FALLBACK_TEXT = "这个不太想说呢。"
+
+# ✅ 垂直能力由插件自描述，框架不内置词表
+@ai_tools(covers=["…"], aliases=["领域A·能力X"], capability_domain="…")
+```
+
+**允许（不是锁定）**：
+
+- 产品品牌「早柚核心」出现在日志 / WebConsole / 更新文案。
+- 仓库可附带一份**默认人格卡**（`sayu_persona_prompt`；目录为空时种子一份）。运行时仍按当前启用人格工作，不把该卡的口癖抄进框架。
+- 框架一等能力节点（`render_agent` / `research_agent` 等）是通用基础设施。
+- 插件代码；评测 / 单测用某个已启用人格名做寻址 fixture；历史事故注释点名具体插件。
+- HTML 模板库的通用版式名（metrics / ranking / weather 卡片）是可视化原语，不是路由特判。
+- 遗留的游戏 UID / Cookie / Enka 工具在 `utils/`，服务已装插件，不进 AI 路由词表。
+
 ---
 
 ## 二、类型提示规范
@@ -393,29 +428,30 @@ class MemeRecord(SQLModel, table=True):
 3. **禁止**使用 `__tablename__` 覆盖
 4. 如果需要自定义表名约束（如索引），使用 `__table_args__`
 
-### 3.2 @with_session 装饰器的使用
+### 3.2 `@with_session` / `@with_read_session`
 
-所有数据库类方法必须使用 `@with_session` 装饰器，它会自动：
+所有数据库类方法必须挂其中一个装饰器：
 
-- 创建 session
-- 处理事务提交
-- 异常时回滚
-- 归还连接池
+- `@with_session`：写入 / 读后写 / 删除（SQLite 走写槽）
+- `@with_read_session`：纯 SELECT（SQLite 走独立读槽，不跟大写抢）
+
+二者都会自动创建 session、提交、异常回滚、归还连接池。
 
 ```python
-from gsuid_core.utils.database.base_models import with_session
+from gsuid_core.utils.database.base_models import with_session, with_read_session
 from sqlalchemy.ext.asyncio import AsyncSession
 
 class User(BaseModel):
     @classmethod
-    @with_session
+    @with_read_session
     async def get_user_by_name(cls, session: AsyncSession, name: str) -> User | None:
         stmt = select(cls).where(cls.name == name)
         result = await session.execute(stmt)
         return result.scalar_one_or_none()
 ```
 
-**注意**：使用 `@with_session` 时，函数签名必须包含 `session: AsyncSession` 参数作为第二个参数（紧跟 cls 或 self）。
+**注意**：签名必须包含 `session: AsyncSession` 作为第二个参数（紧跟 cls 或 self）。
+插件侧完整说明见 `gscore-plugin-development` §5.3。
 
 ### 3.3 复杂场景下的 async_maker()
 
@@ -536,7 +572,7 @@ AI 核心模块，位于 `gsuid_core/ai_core/`，包含：
 | `scheduled_task/` | 定时任务系统 |
 | `persona/` | 人设系统 |
 | `history/` | 对话历史管理 |
-| `web_search/` | 统一网页搜索（Tavily/Jina/Exa/MCP + 多源策略） |
+| `web_search/` | 统一网页搜索（Tavily/Jina/Exa/AnySearch/Firecrawl/MCP + 多源策略） |
 | `web_fetch/` | 网页抓取转 Markdown（Jina Reader / local + 多源策略） |
 
 ### 5.2 webconsole 模块
@@ -697,10 +733,11 @@ bot = Bot(_bot, mock_ev)
 编辑本项目代码时，记住以下优先级：
 
 1. **类型问题 → 从类型标注和代码逻辑解决，不使用兜底语法；禁止 `Any`，运行时变量类型必须可追踪（§1.8）**
-2. **数据库操作 → 继承基类 + @with_session 装饰器**
-3. **异步要求 → 所有可能阻塞的方法都用 async def**
-4. **代码组织 → 相关方法封装在类中，使用 dataclass/TypedDict 定义数据结构**
-5. **Bot 类型 → 插件/触发器用 `Bot`（高层），框架内部用 `_Bot`（底层），禁止混用**
-6. **注释精简 → `#` 注释最多两行、每行 ≤88 字，只写「为什么/坑/边界」，不复述代码**
+2. **人格 / 能力锁定 → 框架不写死某个人格的口癖，也不内置业务垂直词表（§1.9）**
+3. **数据库操作 → 继承基类 + `@with_session`（写）/ `@with_read_session`（纯 SELECT）**
+4. **异步要求 → 所有可能阻塞的方法都用 async def**
+5. **代码组织 → 相关方法封装在类中，使用 dataclass/TypedDict 定义数据结构**
+6. **Bot 类型 → 插件/触发器用 `Bot`（高层），框架内部用 `_Bot`（底层），禁止混用**
+7. **注释精简 → `#` 注释最多两行、每行 ≤88 字，只写「为什么/坑/边界」，不复述代码**
 
 专题细节按 Skills 表按需加载，不要把整本 `references/` 一次读完。

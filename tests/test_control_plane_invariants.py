@@ -19,6 +19,10 @@ from gsuid_core.bot import Bot
 from gsuid_core.ai_core.utils import SILENCE_MARKERS, is_silence_marker
 from gsuid_core.ai_core.agent_run import loop as loop_mod, settle as settle_mod
 from gsuid_core.ai_core.agent_run.state import RunOnceState
+from gsuid_core.ai_core.agent_run.support import (
+    _claims_deferred_work,
+    _claims_missing_offered_tool,
+)
 from gsuid_core.ai_core.control.directive import (
     Evidence,
     Directive,
@@ -28,7 +32,9 @@ from gsuid_core.ai_core.control.directive import (
 )
 from gsuid_core.ai_core.control.corrections import (
     status_zero_tool_directive,
+    addressed_silence_directive,
     render_obligation_directive,
+    missing_offered_tool_directive,
 )
 from gsuid_core.ai_core.agent_run.speech_policy import should_block_user_visible_text
 
@@ -154,7 +160,10 @@ def test_inv3_render_correction_is_gated_on_provenance() -> None:
 
 def test_inv2_settle_corrections_declare_framework_injection() -> None:
     src = inspect.getsource(settle_mod)
-    assert src.count("is_framework_injection=True") >= 4, "四处纠正重跑都须声明框架身份"
+    helper = inspect.getsource(settle_mod.SettlePhase._try_correction_pass)
+    assert "is_framework_injection=True" in helper
+    assert src.count("_try_correction_pass(") >= 4, "结构/缺工具/静音/进度/出图纠正须走同一 helper"
+    assert "is_framework_injection=True" in src, "假完成纠正仍须声明框架身份"
 
 
 def test_inv2_directive_is_not_wrapped_as_user_speech() -> None:
@@ -458,7 +467,15 @@ def test_slim_group_pool_carries_control_tools() -> None:
     from gsuid_core.ai_core.interaction_scaffold import SLIM_GROUP_CORE_TOOLS
 
     assert "dispute_directive" in SLIM_GROUP_CORE_TOOLS
-    assert "check_delegation" in SLIM_GROUP_CORE_TOOLS
+    assert "check_delegation" not in SLIM_GROUP_CORE_TOOLS
+    assert "find_tools" in SLIM_GROUP_CORE_TOOLS
+    assert "create_subagent" in SLIM_GROUP_CORE_TOOLS
+    assert "send_meme" in SLIM_GROUP_CORE_TOOLS
+    assert "capability_map" in SLIM_GROUP_CORE_TOOLS
+    assert "web_search_tool" not in SLIM_GROUP_CORE_TOOLS
+    assert "add_once_task" in SLIM_GROUP_CORE_TOOLS
+    assert "add_interval_task" in SLIM_GROUP_CORE_TOOLS
+    assert "list_scheduled_tasks" not in SLIM_GROUP_CORE_TOOLS
 
 
 def test_control_tools_are_registered_buildin() -> None:
@@ -467,7 +484,7 @@ def test_control_tools_are_registered_buildin() -> None:
     from gsuid_core.ai_core.register import find_tool_base
 
     for name in ("dispute_directive", "check_delegation"):
-        assert find_tool_base(name) is not None, f"{name} 未注册，slim 池会静默丢掉它"
+        assert find_tool_base(name) is not None, f"{name} 未注册"
 
 
 # ── 邮箱：兄弟 root 不得互相抽走投递 ──
@@ -552,6 +569,38 @@ def test_correction_deliverability_rejects_silence_and_dirty() -> None:
     assert settle_mod._correction_is_deliverable("查过了，没有公开数值。")
 
 
+def test_missing_offered_tool_and_addressed_silence_are_wired() -> None:
+    src = inspect.getsource(settle_mod)
+    assert "missing_offered_tool_directive" in src
+    assert "addressed_silence_directive" in src
+    assert "_claims_missing_offered_tool" in src
+    assert "_claims_deferred_work" in src
+    offered = ["list_scheduled_tasks", "cancel_scheduled_task"]
+    assert _claims_missing_offered_tool("没有对应工具可以改", offered)
+    assert _claims_missing_offered_tool("没有对应工具可以改", ["web_search_tool"])
+    assert not _claims_missing_offered_tool("没有对应工具可以改", [])
+    assert not _claims_missing_offered_tool("没有办法改这个", offered)
+    miss_idx = src.index("missing_offered_tool_directive(tool_pool_size=")
+    miss_block = src[miss_idx - 600 : miss_idx + 80]
+    assert "task_management" in miss_block
+    assert _claims_deferred_work("太困了明天再查吧")
+    assert _claims_deferred_work("等我回头再查")
+    assert not _claims_deferred_work("太困了…")
+    assert not _claims_deferred_work("等我醒")
+    assert not _claims_deferred_work("好，现在就查。")
+    d_miss = missing_offered_tool_directive(tool_pool_size=4)
+    assert d_miss.reason_code == "missing_offered_tool"
+    d_sil = addressed_silence_directive()
+    assert d_sil.reason_code == "addressed_silence"
+    assert d_sil.obligations[0].must == "deliver"
+
+
+def test_zero_tool_correction_includes_deferred_work() -> None:
+    src = inspect.getsource(settle_mod._zero_tool_needs_correction)
+    assert "_claims_deferred_work" in src
+    assert "task_management" in src
+
+
 # ── 协议标记归一化 ──
 
 
@@ -567,6 +616,9 @@ def test_protocol_silence_variants_are_parsed() -> None:
         "<silence>\n</silence>",
         "<SILENCE></SILENCE>",
         "<silence>  </silence>",
+        "ILENCE>",
+        "SILENCE>",
+        "<SILENCE",
     ):
         assert is_silence_marker(raw), raw
     for raw in (
@@ -585,6 +637,7 @@ def test_protocol_silence_variants_are_parsed() -> None:
         assert not is_silence_marker(raw), raw
     assert is_silence_marker("<SILENCE>...")
     assert is_silence_marker("<silence>……</silence>")
+    assert not is_silence_marker("请输出 `<SILENCE>` 三个字")
 
 
 def test_protocol_legacy_marker_set_still_parses() -> None:

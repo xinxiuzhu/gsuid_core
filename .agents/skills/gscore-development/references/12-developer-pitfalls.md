@@ -18,8 +18,9 @@
    `key in d` 显式取值。结构化数据用 `TypedDict`/`@dataclass`/`NamedTuple`。
 5. **禁止 `Any`** ——运行时变量（参数 / 返回值 / 属性 / 跨语句局部量）必须有完整、可追踪的类型；
    第三方 stub 的 `Any` 在调用点收窄，不写进本仓库签名（见 `AGENTS.md` §1.8）。
-6. **完全类型提示** ——所有函数参数/返回值都有注解，且注解不是 `Any`。
-7. **全异步** ——可能阻塞的都 `async def`；同步 CPU 用 `@to_thread`/专用线程池。
+6. **禁止人格锁定 / 能力锁定** ——框架不得写死某个角色的口癖/自称，也不得把游戏/股票等垂直词表写进分类器或路由（见 `AGENTS.md` §1.9）。
+7. **完全类型提示** ——所有函数参数/返回值都有注解，且注解不是 `Any`。
+8. **全异步** ——可能阻塞的都 `async def`；同步 CPU 用 `@to_thread`/专用线程池。
 
 > 注释规范：`#` 注释**不超过两行、每行 ≤88 字**，精简直白，用最精确的注释给指导，而不是长篇
 > 大论。详见 `AGENTS.md`。
@@ -38,6 +39,7 @@ Core 是**单进程单事件循环**。以下状态都是**进程内存 / 单进
 | AI Session 注册表 | `AISessionRegistry._ai_sessions` |
 | 记忆观察队列 | `memory/observer.py` 的 `queue.Queue` |
 | 各类 Semaphore / mtime 缓存 | 全局模块变量 |
+| HTTP Agent 钥 / 限流槽 / 幂等 | `ai_core/http_agent/` |
 
 > **当前单进程事件循环模型下符合预期**。若将来要水平扩展，这些都需要外部化（Redis/DB/共享
 > 存储）。现在写新状态时，默认"只有一个进程"，但心里要清楚这是个约束。
@@ -101,6 +103,8 @@ AI 关闭时**不该有任何 AI 逻辑在跑**。改 AI 模块时务必保留�
 - `scheduled_task/executor.py`、`heartbeat/inspector.py` 执行前查总开关。
 - `create_core_tables` 跳过 AI 表创建。
 - `handle_ai` 里 `enable_ai` **函数内动态读取**（不要缓存进模块级常量，否则切开关要重启）。
+- HTTP Agent：`register_http_agent_routes` 总开关关则不 `include_router`（再开需重启）。
+  已挂上后关掉仍 404。Admin 建钥不走 Agent 面、不查总开关。
 
 ## 12.5 Bot 类型混淆（D-5）
 
@@ -206,7 +210,7 @@ Agent 达 `UsageLimitExceeded`（思考轮数上限）时的 fallback 不能让 
 
 - 新配置项放进对应 `setup_config()`/`CONFIG_DEFAULT`，消费侧"每次用时读"即自动热重载（见
   [§03](./03-plugin-loading-and-config.md)）。
-- SQLModel 不写 `__tablename__`；数据库方法写类里、用 `@with_session`；Schema 升级走
+- SQLModel 不写 `__tablename__`；数据库方法写类里、用 `@with_session`（写）/ `@with_read_session`（纯 SELECT）；Schema 升级走
   `on_core_start_before` 的 `exec_list`/`trans_adapter`（见 [§11](./11-statistics-webconsole-database.md)）。
 - AI 表要挂到受总开关控制的建表路径，不要无条件建。
 - **ORM 查询类型安全**（别用 `cast`/`type:ignore`/`getattr` 糊弄 basedpyright，见
@@ -391,15 +395,16 @@ BEAM-10M / LongMemEval 这类"单题灌数百~上千 turn"的大语料，会撞�
 ### 🔴 策略分档：不是一律「命中即封禁」
 
 - **尖括号**：同 turn 最多 3 次 REWRITE → FUSE（静默 + scrub）；无「第二次放行」。
-- **OOC 工具路径**：「提醒一次 → 重说 → 放行」（never-release 除外）；误杀代价≈多一次生成。
-- **OOC 主路径**：defer → run 末轻量重写；`machine_dump` → FALLBACK 短句；
-  **`delivery_narration` → FUSE 静默**（2026-08-10，交付已完成，重说无意义）。
-- 勿改成「命中即永久硬替换且无重说」，会复现「早餐吃了个豆包」类事故。
+- **软出戏（主/工具同一套）**：命中 → 系统提醒（可能出戏，请自判）→ 模型下一句正文作准。
+  不强制剥模型名，不「同一句再发一次就放行」。无下一轮时 run 末自判发送。
+- **OOC 硬档**：`machine_dump` → FALLBACK 短句；**`delivery_narration` → FUSE**；
+  资金 / 机器腔 never-release 持续打回。
+- 勿改成「命中即永久硬替换且无提醒」，会复现「早餐吃了个豆包」类事故。
 
 | 路径 | 检测点 | 命中行为 |
 |------|--------|----------|
-| 主输出（`gs_agent` TextPart） | `pre_send_gate(channel="main")` | 尖括号 REWRITE/FUSE；OOC defer → `_ooc_rewrite_and_send`；machine_dump → FALLBACK；delivery_narration → FUSE |
-| 工具发送（`send_message_by_ai`） | `tool_gate_feedback`（历史别名 `gate_warn_once`） | OOC 首次警告、再命中非 never-release 放行（`GateBag.ooc_warned_turn_ids`）；尖括号与 never-release 持续打回 |
+| 主输出（`gs_agent` TextPart） | `pre_send_gate(channel="main")` | 尖括号 REWRITE/FUSE；软 OOC 注入系统提醒，提醒后放行下一句；无下一轮 → 自判发送；machine_dump → FALLBACK；delivery_narration → FUSE |
+| 工具发送（`send_message_by_ai`） | `tool_gate_feedback`（历史别名 `gate_warn_once`） | 软 OOC 系统提醒、不二次放行（改用正文）；尖括号与 never-release 持续打回 |
 | 无重说通道（proactive 等默认 `send_chat_result`） | 末端 `check_ooc` + 尖括号 sanitize | 替换 `PERSONA_FALLBACK_TEXT` / 删非法标签 |
 
 - **DELIVERED 终局态（2026-08-10）在 gate 之前**：`send_message_by_ai` 带台词成功交付 →
@@ -458,12 +463,17 @@ BEAM-10M / LongMemEval 这类"单题灌数百~上千 turn"的大语料，会撞�
   改自我认知学习路径时必须想"攻击者能否借这条路径持久化"；人设卡（persona.md）的触发表
   是**行为指令**不是风味描述——"被要求X→睡觉"就是在教模型拒活。
 
-### 🔴 框架代码禁止硬编码具体人格台词
+### 🔴 框架禁止人格锁定 / 能力锁定（`AGENTS.md` §1.9）
 
 历史事故 ×2：内容闸门拒绝文案写死"早柚才不记呢"（生产 persona 是达妮娅→自我指涉错乱）；
-框架级前摇台词模块（已整体移除，见下）。规矩：**框架层给用户的文本要么人格中性，要么是
-"给 Agent 的指令"让它自己组织语言**（工具 return 天然是反馈通道）。唯一例外是
-`PERSONA_FALLBACK_TEXT` 这类语气中性的末端兜底。
+框架级前摇台词模块（已整体移除，见下）。规矩：
+
+- **框架层给用户的文本要么人格中性，要么是"给 Agent 的指令"让它自己组织语言**
+  （工具 return 天然是反馈通道）。末端兜底（`PERSONA_FALLBACK_TEXT`）必须中性，
+  禁止抄默认人格口癖（唔/呼/zzz/卷轴）。
+- 口癖配额从当前人格卡 Tone Markers 解析，禁止 `endswith(("zzz","呼","唔"))`。
+- 意图分类 / 规划词表禁止收插件专属域词（圣遗物/命座/模拟盘/研报）。垂直能力靠插件
+  `covers` / 带前缀 `aliases` / `ai_entity` 自描述。
 
 ### 工具"前摇台词"模块已整体移除（2026-07-08）
 
@@ -770,14 +780,15 @@ memory / statistics / planning / meme / favor_decay 每次启动都初始化两�
 1. 类型：无 `try/except` 兜底（除不可信外部输入）、无 `cast`、无 `type:ignore`、无 `getattr/
    dict.get` 兜底、无 `Any`（含 `dict[str, Any]`），参数返回值与运行时变量类型可追踪。
 2. 异步：可能阻塞的都 `async def`，CPU 密集走 `to_thread`/线程池，没在事件循环里同步跑。
-3. AI 总开关：新加的 AI 初始化/定时任务/建表都查了 `enable`。
+3. AI 总开关：新加的 AI 初始化/定时任务/建表/HTTP 面都查了 `enable`。
 4. 状态：新加的进程内存状态知道多实例不共享；没碰 IngestionWorker 的独立线程禁区。
 5. Bot：取 `_Bot` 用 `WS_BOT_ID`；需要 `Bot` 的地方没传裸 `_Bot`。
 6. 历史/记忆：截断保留 ToolCall/ToolReturn 配对；记忆改动没踩 D-12~D-19。
 7. 注释：`#` 注释 ≤2 行、每行 ≤88 字，精简直白。
 8. 输出链路：新「打回/熔断」挂 `output_gate.pre_send_gate`，呈现变换挂 `send_chat_result`；
-   `ooc_check=False` 仅限已过 gate / 重说产物；框架层文本人格中性；词库加词先过规范化
+   `ooc_check=False` 仅限已过 gate / 重说产物；框架层文本人格中性（§1.9）；词库加词先过规范化
    碰撞 + 误杀回归；尖括号假阳性集（比较式 / 泛型 / 邮箱）与 br 非法一并锁（§12.22 / §7.12）。
+   新分类器词 / 规划提示 / 用户可见兜底不得绑某个角色口癖或某个业务垂直。
 9. 防线改动：注入/出戏/假完成相关的正则或词库改动，坏样本（eval inj_*/adv_*）与好样本
    （良性误杀集）**两个方向都要跑**（§12.22b）；处理用户文本的标注函数保持幂等。
 10. 交互脚手架（§12.22d）：C-1~C-4 只对交互式主 Agent 生效；判据只用结构/语言学范畴、
@@ -790,6 +801,33 @@ memory / statistics / planning / meme / favor_decay 每次启动都初始化两�
     调语气的档位都带履约地板；没有依据（未打分 / 无数据）时不注入。
 14. 单测全绿不等于没回归：碰了装配 / 闸门 / 每轮注入 / 启动顺序的改动，跑一轮
     `eval/agent` 群聊基准并与上一份报告逐例对比（`--concurrency 1` 排除争用）。
+
+## 12.25 HTTP 流式 Agent API（2026-08-26）
+
+生产面 `POST /api/v1/agent/chat/stream`（包 `ai_core/http_agent/`）：
+
+- **禁止**调用 `handle_event`（会进命令匹配 / `_Bot.queue` / 适配器黑白名单）。只走
+  `msg_process` + H00/A 轨 + **`run_passive_interactive_chat`**。
+- **H01 / 长度 / 预算**在共用被动入口内，不要在 bridge 再手搓一套。
+- 独立限流槽，**不**占 `handle_ai._ai_semaphore`；断连必须 `finally` 还槽。
+- Session 私聊：`HTTP_AGENT:{bot_id}:{key_id}_{client_session}:private:{user_id}`
+  （多钥不共享 Agent）。群聊：`HTTP_AGENT:{bot_id}:g_{client_session}:group:{group_id}`
+  （同 bot_id + session + group 共享；`group_id` 是房间口令）。
+  同 `user_id` 多钥仍可能共享预算 / `USER_GLOBAL` 记忆 / 好感。
+- 出站是否流式由入口参数 ``outbound_stream`` 决定，与 pydantic-ai ``node.stream()``（TTFT/TPS）正交。
+  HTTP 默认 True；IM 默认 False。loop 只看这个开关，不 ``isinstance(CaptureBot)``。
+  Bot 上流式钩子默认 no-op（等完整 TextPart）；CaptureBot / 未来流式 IM 覆盖。
+- HTTP 用量 ``chat_type=Http_Chat``（``HTTP_STATS_CHAT_TYPE``），与 IM 的 ``Chat`` 分开。
+  ``create_by`` 仍是 ``Chat``（工具装配 / 话术门与 IM 相同）。
+- v1 SSE 只有 `run.start` / `text` / `attachment` / `run.done` / `run.error`（无 tool/thinking）。
+- v1 同 session **抢答**：新流 `register_run` 后 `cancel_session_runs(..., except_run_id=自己)`，
+  先到的 SSE 应 `run.done cancelled`。`on_busy=queue` / shield 还没做。
+- 关闸 / 鉴权 **先于** 读 body；实读字节计数 cap（缺 `Content-Length` 也算）。
+- 鉴权封禁：公网按 IP；loopback/私网按 Bearer 哈希，避免 nginx 一把封死整条代理。
+- 上行 `images[]` 只收 `data:image` / `base64://`，禁止 URL（Bearer 面 SSRF）。
+- AI 总开关关：启动时不挂 `agent_router`（再开需重启）。已挂上后关掉 AI 仍 404。
+  `enable_http_agent_api` 关闸是运行时 404，路由仍在。Admin 建钥两开关都无关。
+  客户端对接：[`docs/HTTP_AGENT_API.md`](../../../../docs/HTTP_AGENT_API.md)。
 
 ## 12.24 认知枢纽（2026-08-16）
 

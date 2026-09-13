@@ -7,6 +7,7 @@
 
 from enum import Enum
 from typing import TYPE_CHECKING, Set, Dict, List, Tuple, Union, Callable, Optional, Awaitable
+from datetime import datetime
 from dataclasses import field, dataclass
 
 from gsuid_core.bot import Bot
@@ -71,6 +72,10 @@ class AgentHookContext:
     prev_turn_used_tools: bool = False
     recent_report_titles: Tuple[str, ...] = ()
     memory_guide: str = ""
+    # LongMem 证据转储 / 禁工具指令；不得用「有 memory_guide」当门。
+    memory_eval: bool = False
+    # 本轮显式时钟（评测 HTTP clock_at）。None=墙上时钟。
+    clock_at: Optional[datetime] = None
     relationship: Optional["RelationshipView"] = None
     cheap_gate: str = ""
     prior_user_turns: List[str] = field(default_factory=list)
@@ -96,6 +101,9 @@ class AgentHookContext:
     decision_reason: str = ""
     correction_requested: bool = False
     correction_reason: str = ""
+    thinking_text: str = ""
+    tool_names_called: Tuple[str, ...] = ()
+    result_text: str = ""
     # dispatcher 在调用每个 hook 前写入，用于 hint 归属与日志
     current_kit_id: Optional[str] = None
 
@@ -206,6 +214,12 @@ class AgentHookContext:
         if self.bot is not None:
             return self.bot.bot_id
         return str(self.ev.bot_id) if self.ev is not None else ""
+
+    @property
+    def bot_self_id(self) -> str:
+        if self.bot is not None:
+            return str(self.bot.bot_self_id)
+        return str(self.ev.bot_self_id) if self.ev is not None else ""
 
     def hint_text(self) -> str:
         return "\n".join(self.hints)

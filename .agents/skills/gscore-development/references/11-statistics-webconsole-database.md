@@ -51,6 +51,16 @@ active-users / trigger-distribution / intent-distribution / errors / heartbeat /
 
 ## 11.2 网页控制台（`gsuid_core/webconsole/`）
 
+Hub 静态资源由 `webconsole/static_serve.py::build_frontend_router` 挂在 `/app/`：
+
+- 带 hash 的 `assets/**`：`Cache-Control: public, max-age=31536000, immutable`
+- `index.html` / `version.json`：`no-cache`（禁止长期缓存 HTML，否则升级后会请求已删除的旧 hash）
+- 若存在 `.br` / `.gz` 且 `Accept-Encoding` 允许，按 Brotli 优先返回并设 `Content-Encoding` + `Vary: Accept-Encoding`
+- 缺失的 js/css/图片 **404**，不要 SPA 回落成 `index.html`（否则浏览器把 HTML 当 JS 解析）
+- `GZipMiddleware`（`app_life.py`）给未预压的文本响应做动态 gzip；已有 `Content-Encoding` 的预压文件不会再压
+
+前端构建（gsuid_hub `precompressDist`）负责写出 `.gz` / `.br`。只改 Vite 插件、不改本文件的协商逻辑，浏览器看不到压缩。
+
 FastAPI 路由，全部走鉴权依赖：
 
 ```python
@@ -83,7 +93,9 @@ async def example(_user: Dict = Depends(require_auth)): ...
 > 必要时手工清理该表让用户额度立即恢复正常。
 
 > 插件也可复用 `gsuid_core.webconsole.app_app.app` 挂自己的 `/api/<插件名>/...` 路由 +
-> `Depends(require_auth)`。详见 `gscore-plugin-development` 的 FastAPI 插件 API 章。
+> `Depends(require_auth)`。前端页用 `register_plugin_page`（`webconsole/plugin_page.py`），
+> 静态资源 `/plugin-pages/<plugin_id>/<page_id>/`，列表字段 `pages`。
+> 详见 `gscore-plugin-development` §19 / §22。
 
 ### 评测端点 `/api/chat_with_history`（本地测试专用，默认 404）
 
@@ -145,15 +157,17 @@ BaseIDModel              # 最基础，只有 id
 
 1. **不写 `__tablename__`**：表名 = 类名全小写无下划线（`AiMemeRecord` → `aimemerecord`）。
    自定义约束/索引用 `__table_args__`。
-2. **数据库方法写在模型类里**，用 `@with_session`（自动建 session / 提交 / 异常回滚 / 归还连接池）。
-   签名第二参必须是 `session: AsyncSession`（紧跟 cls/self）。
+2. **数据库方法写在模型类里**，用 `@with_session`（写 / 混合）或 `@with_read_session`（纯 SELECT；
+   SQLite 走独立读槽）。自动建 session / 提交 / 异常回滚 / 归还连接池。
+   签名第二参必须是 `session: AsyncSession`（紧跟 cls/self）。插件侧完整说明见
+   [gscore-plugin-development §5.3](../../gscore-plugin-development/references/05-database.md#53-with_session--with_read_session)。
 3. 复杂场景手动管理用 `async_maker()`。
 4. 全异步；CPU 密集用 `to_thread`。
 
 ```python
 class CoreUser(BaseBotIDModel, table=True):
     @classmethod
-    @with_session
+    @with_read_session
     async def get_user_by_name(cls, session: AsyncSession, name: str) -> "CoreUser | None":
         stmt = select(cls).where(cls.name == name)
         return (await session.execute(stmt)).scalar_one_or_none()

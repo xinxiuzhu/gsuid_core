@@ -140,7 +140,6 @@ def scan_signals(
     *,
     intent: str,
     effective: bool,
-    is_light: bool,
     is_master: bool,
     guard: Optional["GuardFlags"] = None,
     meaningful_min_len: int = 12,
@@ -149,7 +148,7 @@ def scan_signals(
 
     ``meaningful`` 的操作定义（必须写死，避免又变成「每句都 meaningful」）：
     ``effective`` 且 ``intent ∈ {问答, 工具}``；或 ``effective`` 且闲聊但
-    非 LIGHT、长度 ≥ 阈值、**未**命中问候词表。
+    长度 ≥ 阈值、**未**命中问候词表。
     「今天是否首次」由引擎按 DB 日状态判定，不在纯函数里。
     """
     body = (text or "").strip()
@@ -170,7 +169,7 @@ def scan_signals(
     if effective:
         if intent in ("问答", "工具"):
             meaningful = True
-        elif intent == "闲聊" and not is_light and len(body) >= meaningful_min_len and not greeting:
+        elif intent == "闲聊" and len(body) >= meaningful_min_len and not greeting:
             meaningful = True
 
     care = bool(effective and _CARE_RE.search(body))

@@ -36,6 +36,53 @@ from gsuid_core.ai_core.capability_agents.delegation_contracts import (
     tool_call_targets_render_agent as _tool_call_targets_render_agent_core,
 )
 
+# 写入类日程工具：PIN 拒绝或失败不算生效。list 只读，不算。
+_EFFECTUAL_WRITE_TOOLS: frozenset[str] = frozenset(
+    {
+        "add_once_task",
+        "add_interval_task",
+        "modify_scheduled_task",
+        "cancel_scheduled_task",
+        "pause_scheduled_task",
+        "resume_scheduled_task",
+    }
+)
+
+
+def _tool_return_is_effectual_write(name: str, content: str, *, failed: bool) -> bool:
+    """日程写入是否真正改了世界。闸门拒绝文案不算。"""
+    if failed or name not in _EFFECTUAL_WRITE_TOOLS:
+        return False
+    from gsuid_core.ai_core.buildin_tools.visibility import tool_return_is_gate_reject
+
+    return not tool_return_is_gate_reject(content)
+
+
+# 须与 capability_agents.runner.CAPABILITY_AGENT_ERROR_PREFIX 同前缀，供看板认失败。
+_MAX_ITER_INTERNAL = "⚠️ 能力代理执行失败: 已达最大思考轮数，未能在限定步数内完成本任务。中间产物已留在工作区。"
+_MAX_ITER_VISIBLE = (
+    "⚠️ 已达最大思考轮数，未能在限定步数内完成本任务。"
+    "中间产物（如已写入的文件 / artifact）已留在工作区，未回传以避免刷屏。"
+)
+
+
+def usage_limit_return_payload(
+    *,
+    create_by: str,
+    is_subagent: bool,
+    delegated_render: bool,
+    image_sent: bool,
+) -> str:
+    """return 模式超轮数回给调用方。评测静音；能力代理必须是可识别失败。"""
+    if delegated_render and not image_sent:
+        return "<SILENCE>"
+    if create_by in ("TEST", "EvalJudge"):
+        return "<SILENCE>"
+    if is_subagent or create_by in ("CapabilityAgent", "AutoPlanner"):
+        return _MAX_ITER_INTERNAL
+    return _MAX_ITER_VISIBLE
+
+
 # 假完成闸——**结构判据**：动作完成声明 + 本轮零工具调用。声明的识别只用
 # 闭类完成动词 + 第一人称施动锚点（语言学范畴，非业务域词表）
 _FAKE_DONE_RE = re.compile(
@@ -126,16 +173,13 @@ def _ensure_inner_os_on_first_user(
     *,
     is_framework: bool,
 ) -> Tuple[UserTurnText, UserTurnText, InnerOsInjectWhere]:
-    """把 inner_os marker 永久钉在会话第一条真人 user message 末尾。"""
+    """INNER_OS 只往当前 request 追加，禁止改 history[0]。"""
     if not marker:
         return current, lean, "skipped"
 
     first = _first_real_user_prompt_part(history)
-    if first is not None:
-        if _user_content_contains(first.content, _INNER_OS_NEEDLE):
-            return current, lean, "already"
-        first.content = _append_user_text(_as_user_turn_text(first.content), marker)
-        return current, lean, "history"
+    if first is not None and _user_content_contains(first.content, _INNER_OS_NEEDLE):
+        return current, lean, "already"
 
     if is_framework:
         return current, lean, "skipped"
@@ -152,7 +196,7 @@ _INTERACTIVE_CREATE_BY = ("Chat", "Agent", "TEST", "CapabilityAgent")
 _MAIN_PERSONA_CREATE_BY = frozenset({"Chat", "Agent", "Plan"})
 
 # on_trace 轨迹事件类型：模型推理段 / 工具调用（见 GsCoreAIAgent._emit_trace）
-TraceKind = Literal["thinking", "tool"]
+TraceKind = Literal["thinking", "thinking_delta", "tool", "tool_result"]
 
 _FAKE_DONE_NUDGE = (
     "（系统校验：你上一条回复声称已完成某个操作，但本轮没有任何工具调用记录，该声明是编造的。"
@@ -160,6 +204,31 @@ _FAKE_DONE_NUDGE = (
     "就如实向用户说明「刚才说错了，还没有做」。绝不允许再输出不带工具调用支撑的完成话术。"
     "本校验轮禁止抱怨式闲聊；做不到就角色短句或 <SILENCE>。）"
 )
+
+_SCHED_MUTATE_TOOLS: frozenset[str] = frozenset(
+    {
+        "list_scheduled_tasks",
+        "cancel_scheduled_task",
+        "modify_scheduled_task",
+        "pause_scheduled_task",
+        "resume_scheduled_task",
+    }
+)
+_MISSING_OFFERED_TOOL_RE = re.compile(r"没有.{0,16}工具")
+_DEFER_WORK_RE = re.compile(r"明天再|等我.{0,8}再(查|设|弄|翻)")
+
+
+def _claims_missing_offered_tool(text: str, offered: Sequence[str]) -> bool:
+    """声称没有工具，但本轮 schema 非空。"""
+    if not _MISSING_OFFERED_TOOL_RE.search(text or ""):
+        return False
+    return bool(offered)
+
+
+def _claims_deferred_work(text: str) -> bool:
+    """把该办的事推到明天或「等我…再动手」。"""
+    return bool(_DEFER_WORK_RE.search(text or ""))
+
 
 # 结构假完成：被呼叫 + 池内有工具 + 零调用 + 非沉默/非极短寒暄（不解析用户话题词）
 _STRUCTURAL_ZERO_TOOL_NUDGE = (
@@ -191,17 +260,21 @@ def _correction_nudge_markers() -> tuple[str, ...]:
 
 
 _RENDER_TOOL_NAMES = frozenset({"render_html_to_image", "render_card", "render_markdown_to_image"})
-# 只读检索类工具的空转阈值更严：它们**没有副作用也没有新信息源**，连打 2 轮就已经是空转。
-# find_tools 与认知检索都属此列（后者收成单一动词后，「换个说法再搜」的成本全压在它身上）。
+# find_tools 连打 2 轮即空转。search_cognition 换槽位词会召回不同片段，不能按同名 2 轮熔断。
 _FIND_TOOLS_THRASH_LIMIT = 2
-_READONLY_RETRIEVAL_TOOLS = frozenset({"find_tools", "search_cognition"})
+_SEARCH_COGNITION_THRASH_LIMIT = 8
+_READONLY_RETRIEVAL_TOOLS = frozenset({"find_tools"})
 # 搜索/拉取类返回「够长+多行」即视为可出图材料（不靠业务词）
 _SEARCHISH_TOOL_HINTS = ("search", "web_", "fetch", "knowledge")
 
 
 def thrash_limit_for(tool_name: str) -> int:
-    """该工具的同名连打熔断阈值。只读检索类更严（2 轮），其余 4 轮。"""
-    return _FIND_TOOLS_THRASH_LIMIT if tool_name in _READONLY_RETRIEVAL_TOOLS else _THRASH_SAME_TOOL_LIMIT
+    """该工具的同名连打熔断阈值。find_tools 更严（2 轮），search_cognition 8 轮，其余 4 轮。"""
+    if tool_name == "search_cognition":
+        return _SEARCH_COGNITION_THRASH_LIMIT
+    if tool_name in _READONLY_RETRIEVAL_TOOLS:
+        return _FIND_TOOLS_THRASH_LIMIT
+    return _THRASH_SAME_TOOL_LIMIT
 
 
 # 同工具空转熔断（形状信号，非业务词）：
@@ -310,9 +383,19 @@ def _capability_exclusive_tool_names() -> set[str]:
     走「直接调专业工具」捷径。共享集合 = task_basics + 保底分类(self/buildin/meta)
     + 与主人格日常对话重叠的 common 基建（提醒管理/审批/表情等）——
     能力代理可复用这些工具，但不得把它们从主人格池里「独占剥离」。
+    节点域下非 shared 工具全部 exclusive（含未写入 tool_names 的同域名）。
     """
-    from gsuid_core.ai_core.register import get_registered_tools
-    from gsuid_core.ai_core.agent_node import TASK_BASICS_PACK, list_nodes, resolve_pack_tool_names
+    from gsuid_core.ai_core.register import (
+        find_tool_base,
+        get_registered_tools,
+        get_tools_by_capability_domain,
+    )
+    from gsuid_core.ai_core.agent_node import (
+        DYNAMIC_PACK,
+        TASK_BASICS_PACK,
+        list_nodes,
+        resolve_pack_tool_names,
+    )
 
     shared: set[str] = set(resolve_pack_tool_names([TASK_BASICS_PACK]))
     registered = get_registered_tools()
@@ -333,6 +416,25 @@ def _capability_exclusive_tool_names() -> set[str]:
             continue
         owned = set(resolve_pack_tool_names(node.tool_packs) + list(node.tool_names))
         exclusive |= owned - shared
+        domains: set[str] = set()
+        for pack in node.tool_packs:
+            if pack in (DYNAMIC_PACK, TASK_BASICS_PACK):
+                continue
+            domain_tools = get_tools_by_capability_domain(pack)
+            if domain_tools:
+                domains.add(pack)
+        for name in owned:
+            tb = find_tool_base(name)
+            if tb is not None:
+                dom = tb.capability_domain
+                if dom:
+                    domains.add(dom)
+        for dom in domains:
+            if dom in _daily_common_domains:
+                continue
+            for tb in get_tools_by_capability_domain(dom):
+                if tb.name not in shared:
+                    exclusive.add(tb.name)
     return exclusive
 
 

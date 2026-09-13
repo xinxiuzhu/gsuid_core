@@ -185,6 +185,27 @@ def test_intent_values_are_constrained() -> None:
         ctx.set_intent("胡说")
 
 
+def test_classify_can_set_actionable() -> None:
+    """H03 可写 has_actionable，供第一道 CheapGate 看见在途 Kanban。"""
+    ctx = AgentHookContext(point=AgentHookPoint.CLASSIFY)
+    ctx.set_has_actionable(True)
+    assert ctx.has_actionable is True
+    assert HookCapability.SET_ACTIONABLE in spec_for(AgentHookPoint.CLASSIFY).capabilities
+
+
+def test_reused_context_switches_capability_with_fire_point() -> None:
+    """外环复用同一 Context：fire 时必须把 point 切到本次点位，否则 CLASSIFY 写不进 intent。"""
+
+    @on_agent_hook(AgentHookPoint.CLASSIFY, priority=50)
+    async def classify(ctx: AgentHookContext) -> None:
+        ctx.set_intent("问答")
+
+    ctx = AgentHookContext(point=AgentHookPoint.BEFORE_AI_CHAT)
+    _run(fire_hooks(AgentHookPoint.CLASSIFY, ctx))
+    assert ctx.point is AgentHookPoint.CLASSIFY
+    assert ctx.intent == "问答"
+
+
 def test_h29_only_fires_while_building_a_session() -> None:
     """运行中禁止改 system：H29 在非建 session 阶段被硬拒（否则前缀缓存全废）。"""
     fired: List[int] = []

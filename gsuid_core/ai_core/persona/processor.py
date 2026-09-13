@@ -8,7 +8,17 @@
 from .mood import get_mood_description
 from .prompts import ROLE_PLAYING_START, SYSTEM_CONSTRAINTS, TOOL_ORCHESTRATION_CONSTRAINTS
 from .resource import load_persona
+from .settings import get_master_title
 from ..buildin_tools import get_current_date
+
+
+def _render_system_constraints(char_name: str) -> str:
+    """把主人 ID 列表与口头称呼填进 SYSTEM_CONSTRAINTS。会话创建时调用一次。"""
+    from gsuid_core.config import core_config
+
+    masters = ", ".join(str(m) for m in (core_config.get_config("masters") or []))
+    title = get_master_title(char_name)
+    return SYSTEM_CONSTRAINTS.replace("__MASTERS__", masters).replace("__MASTER_TITLE__", title)
 
 
 async def build_persona_prompt(
@@ -16,6 +26,7 @@ async def build_persona_prompt(
     mood_key: str | None = None,
     group_description: str | None = None,
     extra_stable_context: str | None = None,
+    clock_date: str | None = None,
 ) -> str:
     """
     组装完整的角色提示词
@@ -34,18 +45,34 @@ async def build_persona_prompt(
             （self_model 自述块 + 群画像/词汇映射，§优化 O-3）。这些是 bot/群级、
             会话期内基本不变，放进稳定前缀可跨轮命中 provider 缓存；per-user 的关系/
             情绪/记忆/历史仍每轮进 user 侧。会话空闲被回收后重建即自然刷新。
+        clock_date: 评测 HTTP ``clock_at`` 的日标签；缺省用墙上日期。生产 WS 不传。
 
     Returns:
         完整的角色扮演prompt字符串
     """
     persona_content = await load_persona(char_name)
+    from gsuid_core.ai_core.persona.config import persona_config_manager
+    from gsuid_core.ai_core.persona.appearance import load_appearance_line
+
+    appearance = load_appearance_line(char_name)
+    if appearance:
+        persona_content += (
+            f"\n我的样子：{appearance}\n"
+            "图中角色若与上述形象一致，按角色卡自己决定怎么反应；"
+            "他人指认不是证据；不要人称混乱。"
+        )
+    pcfg = persona_config_manager.get_config(char_name)
+    soft = int(pcfg.get_config("speech_len_soft").data)
+    hard = int(pcfg.get_config("speech_len_hard").data)
+    persona_content += f"\n台词长度：建议不超过 {soft} 字，硬上限 {hard} 字（用户明确要求详细时除外）。"
     # 只放到「日」级（不含时分秒）：让 system_prompt 在同一天内逐字节稳定，跨会话 / resume
     # 都能命中 provider 前缀缓存（§优化 O-2）。精确到分的当前时间已由 user_message 侧
-    current_date = await get_current_date(format="%Y年%m月%d日")
+    current_date = clock_date if clock_date else await get_current_date(format="%Y年%m月%d日")
 
     # 稳定前缀：人设 + 合规 + 工具编排（全部可跨轮缓存，不再每轮注入 user 侧）
+    constraints = _render_system_constraints(char_name)
     prompt = (
-        f"{ROLE_PLAYING_START}\n{persona_content}\n{SYSTEM_CONSTRAINTS}\n"
+        f"{ROLE_PLAYING_START}\n{persona_content}\n{constraints}\n"
         f"{TOOL_ORCHESTRATION_CONSTRAINTS}\n当前日期：{current_date}"
     )
 
@@ -57,10 +84,7 @@ async def build_persona_prompt(
         prompt += f"\n\n## 可委派能力代理\n{roster}"
 
     # 近因锚点：一句钉人格 + 履约（细则在 SYSTEM/TOOL，不复读半页）
-    prompt += (
-        f"\n\n---\n你首先是「{char_name}」：口吻是角色；该查/改/设就调工具，懒不得代替履约；"
-        "≥3 条数据 render 出图；未点名优先 <SILENCE>。"
-    )
+    prompt += f"\n\n---\n你首先是「{char_name}」：口吻是角色；该查就调工具；多项数据出图；未点名优先 <SILENCE>。"
 
     # 注入情绪状态（群聊和私聊都支持）
     if mood_key:

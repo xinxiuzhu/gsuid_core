@@ -140,6 +140,7 @@ async def send_message_by_ai(
     **资源 ID 必须来自上下文**：image_id / video_id / audio_id 只能填本轮对话中
     实际出现过的 ID（如 `img_xxxxxxxx`），**禁止自行构造或猜测**——凭空编造的 ID
     必然发送失败（§13 生产实录：编造 32 位 hex ID 被拒）。没有可用资源就只发 text。
+    image_id 是平台资源句柄，不是文件路径；登记产物用 payload 传引用，不要把路径当 image_id。
 
     Args:
         ctx: 工具执行上下文（包含bot和ev对象）
@@ -184,19 +185,73 @@ async def send_message_by_ai(
             "（框架会自动发出，并自动处理换行分条 / 长文转图）。本轮请勿再调用本工具。"
         )
 
+    extra = tool_ctx.extra
+    pol = extra["speech_policy"] if "speech_policy" in extra and isinstance(extra["speech_policy"], str) else ""
+    has_st = extra["has_status_tool"] is True if "has_status_tool" in extra else False
+    has_media = bool(image_id or video_id or audio_id)
+    if pol == "status_ok" and not has_st and not has_media:
+        return "⚠️ 用户在追问进度：先 list_my_kanban_tasks / artifact_get_recent 查状态，再发。禁止空口报完成。"
+
     # 统一输出闸门（尖括号 + OOC …）：打回则 return feedback，放行继续发
     if text:
         from gsuid_core.ai_core.output_gate import tool_gate_feedback
+        from gsuid_core.ai_core.agent_run.speech_policy import (
+            strip_open_solicitations,
+            should_block_user_visible_text,
+        )
 
+        text = strip_open_solicitations(text)
         _ev_text = tool_ctx.ev.raw_text if tool_ctx.ev is not None and tool_ctx.ev.raw_text else ""
-        _gate_fb = tool_gate_feedback(text, tool_ctx.extra, user_text=_ev_text)
-        if _gate_fb is not None:
-            return _gate_fb
+        if text:
+            _gate_fb = tool_gate_feedback(text, tool_ctx.extra, user_text=_ev_text)
+            if _gate_fb is not None:
+                if has_media:
+                    text = ""
+                else:
+                    return _gate_fb
+        if text:
+            _blk, _why = should_block_user_visible_text(
+                pol or "free",
+                text,
+                pending_async=False,
+                image_sent=has_media,
+                has_status_tool=has_st,
+                tool_calls_so_far=["send_message_by_ai"],
+            )
+            if _blk:
+                if has_media:
+                    # 图仍发；被拦的台词不出站（与 TextPart 同一套 should_block）
+                    text = ""
+                else:
+                    return "⚠️ 台词被话术闸拦住。改成角色短句，或只发媒体、不要邀约再问。"
 
     # 目标用户（§E.3）：默认当前对话者；Event 保证 user_id 存在，不用 getattr 兜底
     ev = tool_ctx.ev
     target_id = user_id or (str(ev.user_id) if ev is not None else "")
+    session_id = str(ev.session_id) if ev is not None else (tool_ctx.parent_session_id or "")
+    if image_id.startswith("dlg_"):
+        return (
+            "❌ 这是委派句柄（dlg_），不是图片句柄。"
+            "请用交付帧里的 res_ 或 artifact_get_recent 取图后再发；"
+            "没有 res_ 说明出图未成功，需重新委派 render_agent。"
+        )
+    occupied = False
+    if image_id.startswith("res_"):
+        from gsuid_core.ai_core.outbound import try_claim_image_delivery
 
+        claim = await try_claim_image_delivery(ev, image_id, session_id=session_id)
+        if claim.refuse is not None:
+            return claim.refuse
+        occupied = claim.occupied
+
+    async def _abort_send(msg: str) -> str:
+        if occupied:
+            from gsuid_core.ai_core.outbound import release_image_delivery
+
+            await release_image_delivery(ev, image_id)
+        return msg
+
+    sent = False
     try:
         media_parts: List[Message] = []
         if image_id:
@@ -224,13 +279,13 @@ async def send_message_by_ai(
                         if "找不到资源" in str(e):
                             # 交付校验（方案九）：句柄失效给出可执行出路——重委派渲染，
                             # 而不是死胡同文案让模型卡在原地或谎报已发。
-                            return (
+                            return await _abort_send(
                                 f"❌ 资源ID: {image_id} 无法解析（artifact 不存在或已过期，"
                                 f"可能是渲染子任务未真正出图）。请重新 "
                                 f'create_subagent(agent_profile="render_agent", task=原事实包) '
                                 f"再委派一次出图；勿再发送该 ID，勿向用户声称已发图。"
                             )
-                        return f"❌ 资源ID: {image_id} 数据转换失败: {e}"
+                        return await _abort_send(f"❌ 资源ID: {image_id} 数据转换失败: {e}")
                 elif isinstance(kanban_payload, bytes):
                     # 文件类 artifact：转 RM 自动注册一次（便于后续重复发送），然后直接发 bytes
                     new_rm_id = RM.register(kanban_payload)
@@ -244,7 +299,7 @@ async def send_message_by_ai(
                     media_parts.append(MessageSegment.image(kanban_payload))
                 else:
                     # 文本 / 非图片 artifact（含落盘 markdown）：不能当 image 发
-                    return (
+                    return await _abort_send(
                         f"❌ 资源ID: {image_id} 是文本类 Kanban artifact（非图片字节），"
                         f"请用 artifact_get('{image_id}') 取原文后："
                         f"短文用 text 参数发送，长文/多数据用 render_html_to_image 出图。"
@@ -259,9 +314,9 @@ async def send_message_by_ai(
                     logger.warning(t("log.ai.buildintools_rm_get_image_id", image_id=image_id, e=e))
                     # 区分"资源不存在"和"资源转换失败"
                     if "找不到资源" in str(e):
-                        return f"❌ 找不到资源ID: {image_id}，可能已过期或ID不正确。"
+                        return await _abort_send(f"❌ 找不到资源ID: {image_id}，可能已过期或ID不正确。")
                     else:
-                        return f"❌ 资源ID: {image_id} 数据转换失败: {e}"
+                        return await _abort_send(f"❌ 资源ID: {image_id} 数据转换失败: {e}")
 
         if video_id:
             try:
@@ -308,20 +363,35 @@ async def send_message_by_ai(
                     _sent_registry.add(text.strip())
                 _at_uid = None  # 文本已 @，媒体不再重复
         if media_parts:
+            from gsuid_core.ai_core.outbound import (
+                topic_from_extra,
+                set_outbound_image_label,
+                reset_outbound_image_label,
+                format_outbound_image_placeholder,
+            )
+
+            _label = format_outbound_image_placeholder(topic_from_extra(tool_ctx.extra), image_id)
+            _tok = set_outbound_image_label(_label)
             _out = list(media_parts)
             if _at_uid:
                 _out = [MessageSegment.at(_at_uid), *_out]
-            await bot.send(_out if len(_out) > 1 else _out[0])
+            try:
+                await bot.send(_out if len(_out) > 1 else _out[0])
+                sent = True
+            finally:
+                reset_outbound_image_label(_tok)
+        elif text:
+            sent = True
 
         # 计数放在真正发出之后：媒体解析报错的早退不占额度
         if throttle_key is not None:
             _PER_TURN_SEND_MESSAGE_COUNT[throttle_key] = _PER_TURN_SEND_MESSAGE_COUNT.get(throttle_key, 0) + 1
 
-        # 交付终局信号：**台词**已随工具发出（media-only 不算，留一句收尾额度）。
-        # loop 据此把本 run 置为 delivered 终局态——交付后对用户只许 <SILENCE>，
-        # 杜绝「任务已完成…」状态汇报 OOC（结构信号，非文本关键词判定）。
-        if text:
-            tool_ctx.extra["delivered_with_speech"] = True
+        # 交付终局：媒体配台词，或非等待纯文本。等待句不置位，避免掐死本轮工具。
+        from gsuid_core.ai_core.agent_run.speech_policy import should_mark_speech_delivered
+
+        if should_mark_speech_delivered(text=text, has_media=has_media):
+            extra["delivered_with_speech"] = True
 
         content_desc = []
         if text:
@@ -348,8 +418,50 @@ async def send_message_by_ai(
                     source="tool",
                     trigger_reason="send_message_by_ai",
                 )
+        from gsuid_core.ai_core.outbound import record_outbound, topic_from_extra, write_decision_memo
+
+        _topic = topic_from_extra(tool_ctx.extra)
+        _tname = ""
+        if ev is not None and ev.sender:
+            raw_nick = ev.sender["nickname"] if "nickname" in ev.sender else None
+            raw_card = ev.sender["card"] if "card" in ev.sender else None
+            if isinstance(raw_nick, str) and raw_nick:
+                _tname = raw_nick
+            elif isinstance(raw_card, str) and raw_card:
+                _tname = raw_card
+        await record_outbound(
+            ev=ev,
+            session_id=session_id,
+            text=text,
+            image_id=image_id,
+            topic=_topic,
+            target_user=target_id,
+            target_name=_tname,
+        )
+        if tool_ctx.parent_session_id:
+            from gsuid_core.ai_core.session_registry import get_ai_session_registry
+
+            _sess = get_ai_session_registry().get_ai_session(tool_ctx.parent_session_id)
+            if _sess is not None and _sess._session_logger is not None:
+                _sess._session_logger.log_outbound_audit(
+                    group_id=str(ev.group_id) if ev is not None and ev.group_id else "",
+                    text=text,
+                    image_id=image_id,
+                    topic=_topic,
+                    target_user=target_id,
+                )
+        _bot_self = str(ev.bot_self_id) if ev is not None and ev.bot_self_id else ""
+        await write_decision_memo(
+            bot_self_id=_bot_self,
+            text=f"已发 {(_topic or '图')[:12]} {image_id or text[:20]}".strip(),
+            ref=f"decision:send:{session_id}:{image_id or 't'}"[:160],
+            handle=image_id,
+            owner_user_id=target_id,
+        )
         return f"消息已发送给用户 {target_id}"
 
     except Exception as e:
         logger.exception(t("log.ai.buildintools_event", e=e))
-        return f"发送失败：{str(e)}"
+        if sent:
+            return f"发送失败：{str(e)}"
+        return await _abort_send(f"发送失败：{str(e)}")

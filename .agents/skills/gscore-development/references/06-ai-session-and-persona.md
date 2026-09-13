@@ -14,6 +14,9 @@
       例: "ws-onebot:onebot:bot_001:group:789012"
 私聊: f"{WS_BOT_ID}:{bot_id}:{bot_self_id}:private:{user_id}"
       例: "ws-onebot:onebot:bot_001:private:345678"
+HTTP Agent:
+      `HTTP_AGENT:{bot_id}:{key_id}_{client_session}:private:{key.user_id}`
+      同 user_id 多钥不共享 Agent/history，共享预算与 USER_GLOBAL 记忆/好感。
 ```
 
 > **群聊 Session ID 不含 `user_id`**——群内所有用户共享同一个 Session 与记忆。这是历史致命
@@ -111,9 +114,12 @@ def _check_persona_changed(session, persona_name) -> bool:
 
 ```
 RESOURCE_PATH/persona/{persona_name}/
-├── config.json          # Persona 配置（不含 introduction）
+├── config.json          # Persona 配置（启用范围 / 巡检 / 工具装配）
+├── persona.json         # 称呼与用户可见短句（GSC，控制台「人格设定」）
 ├── persona.md           # 角色设定（Markdown）
 ├── avatar.png / image.png   # 头像 / 立绘（可选）
+├── appearance.txt           # 视觉指纹（启动识图；system 只吃摘要）
+├── self_refs/               # 可选：表情包/变体，只入库 pHash
 └── audio.{mp3,ogg,wav,m4a,flac}   # 音频（可选，优先级 mp3 > ogg > wav > m4a > flac）
 ```
 
@@ -152,6 +158,24 @@ RESOURCE_PATH/persona/{persona_name}/
 `PersonaConfigManager` 提供 `set_scope` / `set_target_groups` / `set_ai_mode` /
 `set_inspect_interval` / `set_keywords` 等方法，全部即时持久化。
 
+### `persona.json`（`persona/settings.py`）
+
+与 `config.json` 分开：这里只放「这个人格怎么叫主人、失败时说什么」。模板
+`DEFAULT_PERSONA_SETTINGS` 是 `Dict[str, GSC]`，WebConsole
+`GET/PUT /api/persona/{name}/settings` 按插件配置同构返回（title/desc/type/value），
+前端 `/persona-config` 的【人格设定】页签三列自适应渲染，加项不用改前端。
+
+运行时用 `get_persona_setting(persona_name, key)` / `get_master_title`；人格不存在或值为空时回退模板默认。`SYSTEM_CONSTRAINTS` 里 `__MASTER_TITLE__` 在 `build_persona_prompt` 时填入。改 `persona.json` 会触达目录 mtime，下一轮会话热重载。
+
+| 键 | 默认 | 用途 |
+|----|------|------|
+| `master_title` | `主人` | 对 `core_config.masters` 的口头称呼 |
+| `error_generic` | `这条消息我处理失败了，稍后再试一次吧` | 执行失败 / 无结果 |
+| `error_timeout` | `刚才网络太慢处理超时了，稍后再试试吧` | 超时 |
+| `error_content_policy` | `这条消息触发了内容安全策略，我没法处理` | 内容安全 |
+| `fallback_ooc` | `这个不太想说呢。` | 出戏拦截兜底 |
+| `fallback_machine` | `额…出错了，稍后再试` | 技术堆栈熔断 |
+
 ### Persona 配置热重载特殊处理
 
 - 改 `ai_mode` 含"定时巡检" → 调 `start_heartbeat_inspector()` 启动巡检。
@@ -165,6 +189,7 @@ RESOURCE_PATH/persona/{persona_name}/
 | 情绪状态机 | `persona/mood.py` | 角色情绪状态 |
 | 群聊适应性 | `persona/group_context.py` | 按群画像调整口吻 |
 | 自我认知 | `ai_core/self_cognition.py` | `self_model` 演化层（`commitments`/`preferences_learned`/`recurring_topics`/`self_notes`）。**O-3 之后（2026-07）注入拆成两半**：self_model 自述块（bot/scope 级慢变）随 session 固化进 **system_prompt 稳定前缀**（`context_assembly.build_stable_context`，含群画像/词汇映射）；per-user 的关系行由 `build_relationship_context` **每轮注入用户消息侧**（群共享 session，关系随对话者变、不能冻进共享前缀）——每轮动态注入的顺序唯一定义在 `context_assembly.assemble_dynamic_context`（handle_ai 与评测端点共同消费） |
+| 视觉指纹 | `persona/appearance.py` | 启动识图写 `appearance.txt`（摘要进 system，全文只在看图时对照）。`read_image` 对人格目录受信任图做 dHash，命中则钉死「这是你」。不打破惰性；群友口头不入库。 |
 
 > `voice_anchor` 是逐轮口吻锚点（旁路字段），Persona 启动迁移会处理它。
 

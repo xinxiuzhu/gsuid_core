@@ -25,6 +25,10 @@
 ├── __init__.py                        # 插件入口（可留空）
 ├── __nest__.py                        # 空文件，标记启用嵌套加载
 ├── pyproject.toml                     # 插件依赖声明
+├── ruff.toml                          # 插件自己的 Ruff（必带，见 §1.7）
+├── .vscode/                           # 独立打开本目录时用（见 §1.7）
+│   ├── extensions.json
+│   └── settings.json
 ├── README.md
 ├── LICENSE
 ├── ICON.png                           # 插件图标（帮助 / webconsole）
@@ -69,7 +73,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from gsuid_core.webconsole.mount_app import PageSchema, GsAdminModel, site
-from gsuid_core.utils.database.base_models import BaseModel, with_session
+from gsuid_core.utils.database.base_models import (
+    BaseModel,
+    with_session,
+    with_read_session,
+)
 
 
 class MyGameBind(BaseModel, table=True):
@@ -80,7 +88,7 @@ class MyGameBind(BaseModel, table=True):
     server: str = Field(default="cn", title="服务器")
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_bind(
         cls, session: AsyncSession, user_id: str, bot_id: str
     ) -> Optional["MyGameBind"]:
