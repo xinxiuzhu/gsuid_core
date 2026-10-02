@@ -343,9 +343,7 @@ class BudgetManager:
         include_exempt = bool(budget_config.get_config("count_exempt_usage").data)
         return await self._rule_status(rule, int(time.time()), include_exempt, with_reset, effective_group_id)
 
-    async def group_each_usage_summary(
-        self, rule: AIBudgetRule, with_reset: bool = True
-    ) -> GroupEachUsageSummary:
+    async def group_each_usage_summary(self, rule: AIBudgetRule, with_reset: bool = True) -> GroupEachUsageSummary:
         """计算 group_each 的跨群摘要；账本只遍历一次，每个群仍独立判限。"""
         if rule.scope_type != "group_each":
             raise ValueError("usage_summary 仅适用于 group_each 规则")

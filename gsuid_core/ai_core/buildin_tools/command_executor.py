@@ -18,8 +18,7 @@ from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
-from gsuid_core.ai_core.check_func import check_pm
-from gsuid_core.ai_core.buildin_tools.visibility import visible_to_admin
+from gsuid_core.ai_core.tool_risk import check_high_risk_operator, visible_to_master_operator
 
 # Windows 分支是历史兜底：宿主曾切 SelectorEventLoop（不支持 asyncio 子进程）。
 # 现为 ProactorEventLoop，子进程已可用；分支保留无害，新代码勿照抄。见 dev §12.3。
@@ -322,7 +321,11 @@ def _get_safe_environment() -> dict:
 
 
 # 参数 timeout 最大 300s，外层包装需 ≥ 该上限，否则会被默认 60s 误杀。
-@ai_tools(check_func=check_pm, visible_when=visible_to_admin, timeout=300.0)
+@ai_tools(
+    check_func=check_high_risk_operator,
+    visible_when=visible_to_master_operator,
+    timeout=300.0,
+)
 async def execute_shell_command(
     ctx: RunContext[ToolContext],
     command: str,
@@ -438,7 +441,8 @@ async def execute_shell_command(
         try:
             from gsuid_core.ai_core.planning.workspace import snapshot_workspace
 
-            pre_snapshot = snapshot_workspace(work_path)
+            # rglob 全量遍历，扔线程池避免阻塞事件循环
+            pre_snapshot = await asyncio.to_thread(snapshot_workspace, work_path)
         except ImportError:
             pre_snapshot = None
 
@@ -570,7 +574,7 @@ def _resolve_workspace_cwd() -> Optional[Path]:
         return None
 
 
-async def _register_workspace_changes(workspace: Path, before_snapshot: dict) -> None:
+async def _register_workspace_changes(workspace: Path, before_snapshot: dict[str, float]) -> None:
     """命令执行后扫描 workspace 变更，把新增 / 修改的文件登记为 workspace_file artifact。"""
     try:
         from gsuid_core.ai_core.planning.runtime import get_plan_context
@@ -582,7 +586,7 @@ async def _register_workspace_changes(workspace: Path, before_snapshot: dict) ->
         plan_ctx = get_plan_context()
         if plan_ctx is None or not plan_ctx.root_task_id:
             return
-        changes = scan_workspace_changes(workspace, before_snapshot)
+        changes = await asyncio.to_thread(scan_workspace_changes, workspace, before_snapshot)
         if not changes:
             return
         await register_workspace_artifacts(

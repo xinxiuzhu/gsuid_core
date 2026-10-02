@@ -30,6 +30,7 @@ from pydantic_ai import RunContext
 
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
+from gsuid_core.models import Event
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.rag.tools import search_tools
@@ -210,6 +211,20 @@ _TRANSIENT_DEFAULT_PROFILES = frozenset(
 )
 
 
+def _caller_persona_name(ctx: RunContext[ToolContext] | None) -> str:
+    """主人格名：从父 session 的 Agent 读，评测强制 persona 也走这里。"""
+    if ctx is None or ctx.deps is None:
+        return ""
+    sid = ctx.deps.parent_session_id or ""
+    if not sid:
+        return ""
+    agent = get_ai_session_registry().get_ai_session(sid)
+    if agent is None:
+        return ""
+    name = agent.persona_name
+    return str(name) if name else ""
+
+
 @ai_tools(
     category="common",
     capability_domain="长期任务编排",
@@ -228,8 +243,8 @@ async def create_subagent(
 
     ## 路由（agent_profile 填 node_id，禁止自造名）
     - ``research_agent``：外部检索 / 综合分析 → **只交事实包**（来源+时点）
-    - ``render_agent``：把**已有**事实包渲成美观信息图（多项数据出图**必走**；主人格禁自渲）
-    - ``code_agent``：写代码 / PIL·脚本真文件产物（不是 HTML 信息卡）
+    - ``render_agent``：把**已有**事实包渲成信息图（花名册启用时多项数据交给它；主人格禁自渲）
+    - ``code_agent``：写代码 / PIL·脚本真文件产物（不是 HTML 信息卡；仅主人可委派）
     - ``internal_reporter`` / ``memory_curator`` / ``scheduler_assistant`` / …
       见本轮 system 能力清单
 
@@ -239,17 +254,29 @@ async def create_subagent(
     - 出图：粘贴完整事实包（或 res_ 句柄）+ 可选版式偏好；写明**禁止再检索**。
     - 禁止把「漂亮出图」派给 research；禁止主人格自己写 HTML 调 render_*。
     - 接任务应走主通道 TextPart（或框架兜底）；本工具回执不对用户播报过程。
+    - 多个互不依赖的对象：同一次回复并列多次调用，各写各的 task；不要等上一个回执再派下一个。
+    - 下一步要看本次结果才能选（自己答 / render_agent）：只派当前这步，等回灌。
+      不要提前派 render，也不要在等待时逐个补派。
 
     Args:
         ctx: 工具执行上下文
         task: 任务全文（事实包请直接写进 task，勿只写「帮我出图」）。
         agent_profile: 必填 node_id（或可 resolve 的自然语言）；禁止空、禁止自造名。
-        transient: True 仅纯 lookup；出图/落盘/改状态必须 False（默认）。
+        transient: 仅 lookup 白名单节点生效。交互主人格传入 True 也会改走看板后台。
 
     **何时不要用 create_subagent**：
     - ≥2 能力接力或周期任务 → ``register_kanban_task``。
     - 要事后追溯产物 → 默认 transient=False。
     """
+    from gsuid_core.ai_core.capability_agents.delegation_contracts import (
+        PENDING_DELEGATION_HOLD,
+        delegation_is_inflight,
+    )
+
+    # 回执之后再补派只会串行。并列窗口在第一次 deferred ack 之前。
+    if ctx.deps is not None and delegation_is_inflight(ctx.deps.extra):
+        return PENDING_DELEGATION_HOLD
+
     # 子代理墙钟不计入主人格 soft budget（research 常 >45s，否则触发禁工具→无法 render）
     from gsuid_core.ai_core.wall_clock import pause_wall_clock
 
@@ -262,6 +289,10 @@ async def create_subagent(
             agent_profile=agent_profile,
             transient=transient,
         )
+        if ctx is not None and ctx.deps is not None:
+            from gsuid_core.ai_core.history_format import note_thread_handles_in_text
+
+            note_thread_handles_in_text(ctx.deps, raw)
         head = (task or "").strip().split("\n", 1)[0][:80]
         if ctx.deps is not None:
             from gsuid_core.ai_core.outbound import write_decision_memo, remember_outbound_topic
@@ -307,7 +338,7 @@ async def summarize_long_input(text: str, *, max_tokens: int = 18000) -> str:
             None,
             task=f"请总结以下用户输入，保留关键信息：\n\n{text}",
             max_tokens=max_tokens,
-            max_iterations=15,
+            max_iterations=int(ai_config.get_config("task_max_iterations").data),
             agent_profile="",
             transient=True,
         )
@@ -329,20 +360,55 @@ async def _create_subagent_impl(
 
         pid = resolve_node(agent_profile)
         if not pid:
-            from gsuid_core.ai_core.agent_node import list_nodes
+            from gsuid_core.ai_core.agent_node.registry import list_persona_capability_nodes
 
-            ids = [n.node_id for n in list_nodes() if n.source != "persona" and n.node_id != "capability_evaluator"][:8]
+            _pn = _caller_persona_name(ctx)
+            ids = [n.node_id for n in list_persona_capability_nodes(_pn)][:8]
             listed = "、".join(ids) if ids else "（花名册为空）"
             return f"未匹配到能力节点 `{agent_profile.strip()}`。可用 node_id：{listed}"
-        use_transient = transient or pid in _TRANSIENT_DEFAULT_PROFILES
+        from gsuid_core.ai_core.agent_node.registry import persona_allows_capability_agent
+
+        _pn = _caller_persona_name(ctx)
+        if not persona_allows_capability_agent(_pn, pid):
+            from gsuid_core.ai_core.agent_node.registry import list_persona_capability_nodes
+
+            ids = [n.node_id for n in list_persona_capability_nodes(_pn)][:8]
+            listed = "、".join(ids) if ids else "（无）"
+            return f"当前人格未启用能力代理 `{pid}`。可用 node_id：{listed}"
+        from gsuid_core.ai_core.tool_risk import refuse_master_only_node
+        from gsuid_core.ai_core.agent_node import get_node
+
+        blocked = refuse_master_only_node(ctx.deps.ev, get_node(pid))
+        if blocked:
+            return blocked
+        _extra = ctx.deps.extra
+        _wake = _extra["delivery_wake"] if "delivery_wake" in _extra else False
+        if _wake is True and pid != "render_agent":
+            if persona_allows_capability_agent(_pn, "render_agent"):
+                return (
+                    '⚠️ 本轮是任务交付回灌，只可 create_subagent(agent_profile="render_agent") 出图，'
+                    "或 send_message_by_ai 发送已有的图。不要新开查询。"
+                )
+            return "⚠️ 本轮是任务交付回灌。当前人格未启用出图代理，请直接用已有事实作答，不要新开查询。"
+        _follow = _extra["turn_followup"] is True if "turn_followup" in _extra else False
+        if pid != "render_agent" and not _follow and ctx.deps.ev is not None:
+            _ground = turn_ground_source(ctx.deps.ev)
+            if _ground and not delegation_grounded(task, _ground):
+                return (
+                    "⚠️ 这个任务对不上本轮说话人的原话。"
+                    "群历史里别人的话题不能派成他的任务；只处理他这一句，或引用里点名的内容。"
+                )
+        use_transient = pid in _TRANSIENT_DEFAULT_PROFILES
+        if not use_transient and transient and not ctx.deps.allow_user_outbound:
+            use_transient = True
         if use_transient:
             return await _dispatch_transient_capability_agent(ctx, task, agent_profile)
         return await _dispatch_via_kanban(ctx, task, agent_profile)
 
     if ctx is not None and not agent_profile:
-        from gsuid_core.ai_core.agent_node import list_nodes
+        from gsuid_core.ai_core.agent_node.registry import list_persona_capability_nodes
 
-        ids = [n.node_id for n in list_nodes() if n.source != "persona" and n.node_id != "capability_evaluator"][:8]
+        ids = [n.node_id for n in list_persona_capability_nodes(_caller_persona_name(ctx))][:8]
         listed = "、".join(ids) if ids else "（花名册为空）"
         return f"未指定 agent_profile。请从花名册填写 node_id：{listed}"
 
@@ -355,8 +421,10 @@ async def _create_subagent_impl(
             limit=8,
             non_category="self",
         )
-        # 子Agent不能再创建子Agent，防止递归爆炸
-        tools = [t for t in tools if t.name != "create_subagent"]
+        # 子Agent不能再创建子Agent，防止递归爆炸。内核摘要没有说话人，高危工具一律拿掉。
+        from gsuid_core.ai_core.tool_risk import strip_high_risk_tools
+
+        tools = strip_high_risk_tools([t for t in tools if t.name != "create_subagent"], None)
         logger.debug(i18n_t("log.ai.subagent_tool_list", p0=[tool.name for tool in tools]))
 
         # ✨ 内置一个 Plan-and-Solve System Prompt
@@ -584,6 +652,133 @@ async def _dispatch_transient_capability_agent(
     return f"{prefix_note}\n\n{raw_result}{note}"
 
 
+_TURN_GLUE = frozenset(
+    {
+        "帮我",
+        "帮忙",
+        "一下",
+        "看看",
+        "看下",
+        "分析",
+        "比较",
+        "对比",
+        "怎么",
+        "什么",
+        "还是",
+        "可以",
+        "这个",
+        "那个",
+        "现在",
+        "今天",
+        "麻烦",
+        "给我",
+    }
+)
+_CONTENT_CHUNK_RE = re.compile(r"[0-9A-Za-z]{3,}|[\u4e00-\u9fff]+")
+_ASCII_ANCHOR_STOP = frozenset(
+    {
+        "the",
+        "and",
+        "with",
+        "this",
+        "that",
+        "from",
+        "have",
+        "been",
+        "your",
+        "what",
+        "when",
+        "where",
+        "which",
+        "would",
+        "could",
+        "should",
+        "about",
+        "there",
+        "their",
+        "them",
+        "then",
+        "than",
+        "into",
+        "over",
+        "also",
+        "just",
+        "some",
+        "more",
+        "help",
+        "please",
+        "today",
+    }
+)
+
+
+def _glue_span(span: str) -> bool:
+    if span in _TURN_GLUE:
+        return True
+    if len(span) < 4:
+        return False
+    return all(span[i : i + 2] in _TURN_GLUE for i in range(len(span) - 1))
+
+
+def turn_content_anchors(text: str) -> list[str]:
+    """原话里能锚定任务的片段。英文至少 4 字且不是功能词；中文滑窗至少 4 字。"""
+    seen: set[str] = set()
+    anchors: list[str] = []
+    for chunk in _CONTENT_CHUNK_RE.findall(text or ""):
+        if chunk.isascii():
+            token = chunk.lower()
+            if len(token) < 4 or token in _ASCII_ANCHOR_STOP or token in seen:
+                continue
+            seen.add(token)
+            anchors.append(token)
+            continue
+        n = len(chunk)
+        if 2 <= n <= 3 and chunk not in _TURN_GLUE and chunk not in seen:
+            seen.add(chunk)
+            anchors.append(chunk)
+        for size in range(min(8, n), 3, -1):
+            for i in range(0, n - size + 1):
+                span = chunk[i : i + size]
+                if span in seen or _glue_span(span):
+                    continue
+                seen.add(span)
+                anchors.append(span)
+                if len(anchors) >= 40:
+                    return anchors
+    return anchors
+
+
+def delegation_grounded(task: str, ground: str) -> bool:
+    """任务要含原话里的一个长锚，或两个标点切开的短锚。对不上就拒绝。"""
+    anchors = turn_content_anchors(ground)
+    if not anchors:
+        return False
+    hay = task or ""
+    hay_low = hay.lower()
+    short_hits = 0
+    for span in anchors:
+        found = span in hay_low if span.isascii() else span in hay
+        if not found:
+            continue
+        if len(span) >= 4:
+            return True
+        short_hits += 1
+        if short_hits >= 2:
+            return True
+    return False
+
+
+def turn_ground_source(ev: Event) -> str:
+    parts: list[str] = []
+    if ev.raw_text:
+        parts.append(ev.raw_text)
+    elif ev.text:
+        parts.append(ev.text)
+    if ev.reply:
+        parts.append(ev.reply)
+    return "\n".join(parts)
+
+
 async def _dispatch_via_kanban(
     ctx: RunContext[ToolContext],
     task: str,
@@ -608,6 +803,12 @@ async def _dispatch_via_kanban(
     from gsuid_core.ai_core.agent_node import get_node, resolve_node
 
     pid = resolve_node(agent_profile)
+    _wake = ctx.deps.extra["delivery_wake"] if "delivery_wake" in ctx.deps.extra else False
+    if _wake is True and pid != "render_agent":
+        return (
+            '⚠️ 本轮是任务交付回灌，只可 create_subagent(agent_profile="render_agent") 出图，'
+            "或 send_message_by_ai 发送已有的图。不要新开查询。"
+        )
     profile = get_node(pid)
     if profile is None:
         from gsuid_core.ai_core.agent_node import list_nodes
@@ -720,16 +921,11 @@ async def _dispatch_via_kanban(
                     "请只输出 <SILENCE>，勿向用户说话、勿重复 create_subagent。"
                 )
         else:
-            return (
-                f"⏳ 子任务后台执行中（将自动回灌）。"
-                f"task#{root.ordinal} / {pid} / 句柄 {handle}\n"
-                "本 tool_return 不是终局结论。"
-                "对用户默认 <SILENCE>"
-                "（禁止过程动词、任务编号、句柄、编排词、叙述第二个执行者）。"
-                "禁止再 create_subagent 同任务。\n"
-                "完成后自动回灌。用户之后追问进度时，用 find_tools 召回 check_delegation"
-                "（句柄只进工具参数，绝不写进给用户看的台词）。"
+            from gsuid_core.ai_core.capability_agents.delegation_contracts import (
+                format_deferred_subagent_ack,
             )
+
+            return format_deferred_subagent_ack(ordinal=root.ordinal, pid=pid, handle=handle)
 
     # 抓 artifact（最新一份用作产物展示）
     arts = await AIAgentArtifact.list_for_task(final.id)

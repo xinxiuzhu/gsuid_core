@@ -1,6 +1,9 @@
 import asyncio
 import sqlite3
 import threading
+import contextlib
+import contextvars
+from types import TracebackType
 from typing import (
     Any,
     Dict,
@@ -13,9 +16,12 @@ from typing import (
     Awaitable,
     overload,
 )
+from pathlib import Path
 from functools import wraps
+from collections.abc import Coroutine, AsyncIterator
 from typing_extensions import ParamSpec, Concatenate
 
+import aiosqlite
 from sqlmodel import Field, SQLModel, col, and_, delete, select, update
 from sqlalchemy import MetaData, exc, text, event, inspect, create_engine
 from sqlalchemy.exc import OperationalError
@@ -34,6 +40,7 @@ from sqlalchemy.sql.expression import func, null, true
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
 from gsuid_core.data_store import get_res_path
+from gsuid_core.utils.database.write_gate import WriteGateTimeout, sqlite_write_gate
 from gsuid_core.utils.plugins_config.gs_config import database_config
 
 T_BaseModel = TypeVar("T_BaseModel", bound="BaseModel")
@@ -76,61 +83,6 @@ server_engine = None
 _db_init_lock = asyncio.Lock()
 _db_initialized = False
 sqlite_semaphore = None
-sqlite_write_lock = None
-
-
-class _CrossLoopAsyncLock:
-    """可跨线程和事件循环等待的可重入异步锁。"""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._state_lock = threading.Lock()
-        self._owner: tuple[int, asyncio.Task[Any]] | None = None
-        self._depth = 0
-
-    @staticmethod
-    def _current_owner() -> tuple[int, asyncio.Task[Any]]:
-        task = asyncio.current_task()
-        if task is None:
-            raise RuntimeError("数据库异步锁必须在 asyncio Task 中使用")
-        return threading.get_ident(), task
-
-    async def acquire(self) -> None:
-        owner = self._current_owner()
-        with self._state_lock:
-            if self._owner == owner:
-                self._depth += 1
-                return
-
-        acquire_task = asyncio.create_task(asyncio.to_thread(self._lock.acquire))
-        try:
-            await asyncio.shield(acquire_task)
-        except asyncio.CancelledError:
-            await acquire_task
-            self._lock.release()
-            raise
-
-        with self._state_lock:
-            self._owner = owner
-            self._depth = 1
-
-    def release(self) -> None:
-        owner = self._current_owner()
-        with self._state_lock:
-            if self._owner != owner:
-                raise RuntimeError("数据库异步锁只能由持有者释放")
-            self._depth -= 1
-            if self._depth > 0:
-                return
-            self._owner = None
-        self._lock.release()
-
-    async def __aenter__(self):
-        await self.acquire()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        self.release()
 
 
 class _CrossLoopAsyncSemaphore:
@@ -139,7 +91,7 @@ class _CrossLoopAsyncSemaphore:
     def __init__(self, value: int) -> None:
         self._semaphore = threading.BoundedSemaphore(value)
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "_CrossLoopAsyncSemaphore":
         acquire_task = asyncio.create_task(asyncio.to_thread(self._semaphore.acquire))
         try:
             await asyncio.shield(acquire_task)
@@ -149,11 +101,46 @@ class _CrossLoopAsyncSemaphore:
             raise
         return self
 
-    async def __aexit__(self, exc_type, exc, tb) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self._semaphore.release()
 
 
-sqlite_read_semaphore = None
+sqlite_read_semaphore: _CrossLoopAsyncSemaphore | None = None
+
+# 建连超时。journal_mode 只在启动时设一次，避免每条连接在别人持写锁时立刻失败。
+_SQLITE_BUSY_MS = 5000
+_SQLITE_TIMEOUT_S = 5.0
+_UPSERT_CHUNK = 400
+
+
+class _WriteBinding:
+    __slots__ = ("session", "owner")
+
+    def __init__(self, session: AsyncSession, owner: object) -> None:
+        self.session = session
+        self.owner = owner
+
+
+_write_session: contextvars.ContextVar[_WriteBinding | None] = contextvars.ContextVar(
+    "gsuid_sqlite_write_session",
+    default=None,
+)
+
+
+def _owned_write_session() -> AsyncSession | None:
+    active = _write_session.get()
+    if active is None:
+        return None
+    # create_task 会拷贝 context，子任务不能和父任务共用一条 AsyncSession。
+    if asyncio.current_task() is not active.owner:
+        return None
+    return active.session
+
 
 if _db_type == "sqlite":
     sync_url = "sqlite:///"
@@ -178,9 +165,133 @@ else:
     db_url = db_custom_url
 
 
+def _writer_is_core(func: Callable[..., object]) -> bool:
+    module = func.__module__
+    return isinstance(module, str) and module.startswith("gsuid_core.")
+
+
+@contextlib.asynccontextmanager
+async def sqlite_gated_write() -> AsyncIterator[None]:
+    """SQLite 占住单写者闸门。其它后端不加这把锁。"""
+    if _db_type != "sqlite":
+        yield
+        return
+    async with sqlite_write_gate.hold(core=True):
+        yield
+
+
+_ModelT = TypeVar("_ModelT", bound=SQLModel)
+
+
+def _mapped_column(model: type[_ModelT], name: str) -> InstrumentedAttribute[object]:
+    mapper = inspect(model)
+    if name not in mapper.attrs:
+        raise ValueError(f"{model.__name__} has no column {name}")
+    attr = mapper.attrs[name].class_attribute
+    if isinstance(attr, InstrumentedAttribute):
+        return attr
+    raise TypeError(f"{model.__name__}.{name} is not a mapped column")
+
+
+def _enable_sqlite_wal(db_path: str) -> None:
+    # 每条连接再设 journal_mode 会在别人持写锁时立刻 database is locked。
+    conn = sqlite3.connect(db_path, timeout=_SQLITE_TIMEOUT_S)
+    try:
+        conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_MS}")
+        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.commit()
+    finally:
+        conn.close()
+    mode = ""
+    if row is not None:
+        cell = row[0]
+        if isinstance(cell, str):
+            mode = cell
+    if mode.lower() != "wal":
+        raise RuntimeError("sqlite journal_mode did not switch to wal")
+
+
+def is_sqlite_backend() -> bool:
+    """当前是否使用 SQLite 后端（决定备份是否需要走在线备份 API）。"""
+    return _db_type == "sqlite"
+
+
+def is_live_sqlite(path: Path) -> bool:
+    """该路径是否就是当前运行的 SQLite 主库（WAL 模式下备份需要一致性快照）。"""
+    if not is_sqlite_backend():
+        return False
+    return path.resolve() == DB_PATH.resolve()
+
+
+def _sqlite_sidecars(dest: Path) -> tuple[Path, Path]:
+    return Path(str(dest) + "-wal"), Path(str(dest) + "-shm")
+
+
+def _discard_sqlite_snapshot(dest: Path) -> None:
+    """删掉目标主库和旁边的 WAL 边车，避免半截文件或共享内存被当成备份。"""
+    if dest.is_file():
+        dest.unlink()
+    for sidecar in _sqlite_sidecars(dest):
+        if sidecar.is_file():
+            sidecar.unlink()
+
+
+def sqlite_consistent_snapshot(src: Path, dest: Path) -> None:
+    """用 SQLite 在线备份 API 把 ``src`` 导出一致快照到 ``dest``。
+
+    WAL 模式下最近一次 checkpoint 之后的数据还在 ``GsData.db-wal`` 里，
+    直接 ``copy2`` 主库文件会漏掉它们。这里走 ``Connection.backup``：
+    它会等写锁释放并把 WAL 内容合并进目标库，产出可独立打开的完整副本。
+    ``connect(dest)`` 会先创建空文件；失败时把该文件和边车一起删掉。
+
+    ``src`` 必须显式传入。活库快照源就是 ``DB_PATH``，但把源藏在函数里会让
+    调用方误以为可以快照任意库——普通拷贝路径必须先过 ``is_live_sqlite``。
+    """
+    if dest.resolve() == src.resolve():
+        # ValueError 在打包循环里表示前缀不匹配，会跳过并仍报成功。
+        raise RuntimeError("snapshot destination must differ from source")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _discard_sqlite_snapshot(dest)
+
+    src_conn = sqlite3.connect(str(src), timeout=_SQLITE_TIMEOUT_S)
+    out: sqlite3.Connection | None = None
+    try:
+        src_conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_MS}")
+        out = sqlite3.connect(str(dest))
+        src_conn.backup(out)
+    except Exception:
+        # 先关句柄再删，Windows 上文件仍被连接占用时 unlink 会失败。
+        if out is not None:
+            out.close()
+        _discard_sqlite_snapshot(dest)
+        raise
+    else:
+        if out is not None:
+            out.close()
+    finally:
+        src_conn.close()
+    # 目录拷贝留下的 -wal/-shm 不能跟独立快照一起打包。
+    for sidecar in _sqlite_sidecars(dest):
+        if sidecar.is_file():
+            sidecar.unlink()
+
+
+def _set_sqlite_connect_pragmas(dbapi_connection: sqlite3.Connection, _connection_record: object) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_MS}")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.close()
+
+
+async def _mark_read_only(session: AsyncSession) -> None:
+    if _db_type != "sqlite":
+        return
+    await session.execute(text("PRAGMA query_only=ON"))
+
+
 async def init_database():
-    global _db_initialized, engine, finally_url, async_maker
-    global sqlite_semaphore, sqlite_read_semaphore, sqlite_write_lock
+    global _db_initialized, engine, finally_url, async_maker, sqlite_read_semaphore
 
     if _db_initialized:
         return
@@ -193,42 +304,25 @@ async def init_database():
 
         try:
             if _db_type == "sqlite":
-                # ⚠️ SQLAlchemy 2.0 对「文件型」sqlite+aiosqlite 的默认池是
-                # AsyncAdaptedQueuePool(size=5, max_overflow=10, timeout=30)，
-                # 并不是历史文档里写的 NullPool。生成任务 / 协作等业务高并发下
-                # 很容易打满 15 槽 → QueuePool timeout 雪崩(2026-07 线上事故)。
-                # SQLite 单写者本就串行，用 QueuePool 只会让连接在等锁时占着槽。
-                # 显式 NullPool：每次 checkout 新建连接，并发上限交给下方 semaphore。
+                # 默认 QueuePool 会在等写锁时占满槽（2026-07 雪崩）。NullPool + 单写者闸门。
+                # sqlite3.connect 会堵满 busy_timeout，不能占着事件循环。
+                await asyncio.to_thread(_enable_sqlite_wal, db_url)
                 db_config.update(
                     {
                         "connect_args": {
                             "check_same_thread": False,
-                            "timeout": 30.0,
+                            "timeout": _SQLITE_TIMEOUT_S,
                         },
                         "poolclass": NullPool,
                     }
                 )
-
-                # journal_mode 是数据库级持久配置，只在初始化时设置一次。
-                # 若在 NullPool 的每次新连接上执行，高并发写入期间该 PRAGMA
-                # 自身也可能参与锁竞争，并且发生在 busy_timeout 生效之前。
-                with sqlite3.connect(db_url, timeout=30.0) as sqlite_connection:
-                    sqlite_connection.execute("PRAGMA journal_mode=WAL")
-
                 engine = create_async_engine(f"{base_url}{db_url}", **db_config)
                 finally_url = f"{base_url}{db_url}"
 
-                @event.listens_for(engine.sync_engine, "connect")
-                def set_sqlite_pragma(dbapi_connection: sqlite3.Connection, connection_record):
-                    cursor = dbapi_connection.cursor()
-                    cursor.execute("PRAGMA busy_timeout=30000")
-                    cursor.execute("PRAGMA synchronous=NORMAL")
-                    cursor.close()
+                event.listens_for(engine.sync_engine, "connect")(_set_sqlite_connect_pragmas)
 
-                # 跨事件循环限流；独立读槽避免写事务阻塞 WAL 读取。
-                sqlite_semaphore = _CrossLoopAsyncSemaphore(8)
+                # 读不占写闸门。写不再用信号量，避免 8 条连接同时去抢 SQLite。
                 sqlite_read_semaphore = _CrossLoopAsyncSemaphore(24)
-                sqlite_write_lock = _CrossLoopAsyncLock()
             else:
                 db_config.update(
                     {
@@ -305,66 +399,226 @@ def _is_transient_db_error(err: BaseException) -> bool:
     return "database is locked" in msg or "database table is locked" in msg or "busy" in msg or "disk i/o error" in msg
 
 
+# 从拿到写槽开始计。超时后取消并关连接，避免一个插件占住 SQLite 写锁。
+_WRITE_BUDGET_S = 10.0
+_WRITE_ABORT_GRACE_S = 1.0
+# close() 排队在卡住的 sqlite 线程后面时不能一直占着闸门。
+_CLOSE_DEADLINE_S = 2.0
+
+
+class DatabaseWriteTimeout(Exception):
+    """一次 ``@with_session`` 超过写预算。写槽已释放，这次写入失败。"""
+
+
+class _SqliteDriverLease:
+    __slots__ = ("connection",)
+
+    def __init__(self) -> None:
+        self.connection: aiosqlite.Connection | None = None
+
+
+def _budget_label(seconds: float) -> str:
+    if seconds.is_integer():
+        return str(int(seconds))
+    return str(seconds)
+
+
+def _consume_task_exception(task: asyncio.Task[object]) -> None:
+    if task.cancelled():
+        return
+    task.exception()
+
+
+async def _capture_sqlite_driver(session: AsyncSession, lease: _SqliteDriverLease) -> None:
+    conn = await session.connection()
+    raw = await conn.get_raw_connection()
+    driver = raw.driver_connection
+    if isinstance(driver, aiosqlite.Connection):
+        lease.connection = driver
+
+
+async def _interrupt_driver(driver: aiosqlite.Connection) -> None:
+    # 会话退出路径可能已经关掉连接。
+    try:
+        await driver.interrupt()
+    except ValueError:
+        return
+
+
+async def _close_driver(driver: aiosqlite.Connection) -> None:
+    # 取消未完成的 close 会在闸门交出后仍占着 SQLite 写锁。
+    try:
+        await driver.close()
+    except ValueError:
+        return
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.error(i18n_t("log.database.write_timeout_close_fail", e=exc))
+
+
+_LINGERING_CLOSES: set[asyncio.Task[None]] = set()
+
+
+def _track_close(task: asyncio.Task[None]) -> None:
+    _LINGERING_CLOSES.add(task)
+    task.add_done_callback(_LINGERING_CLOSES.discard)
+    task.add_done_callback(_consume_task_exception)
+
+
+async def _run_driver_op(label: str, op: Coroutine[object, object, None]) -> asyncio.Task[None] | None:
+    """驱动调用超过期限就先返回。没跑完的收尾留在后台，不能占着写闸门。"""
+    op_task: asyncio.Task[None] = asyncio.create_task(op)
+    done, _pending = await asyncio.wait({op_task}, timeout=_CLOSE_DEADLINE_S)
+    if op_task in done:
+        _consume_task_exception(op_task)
+        return None
+    logger.error(i18n_t("log.database.write_timeout_close_hung", step=label))
+    _track_close(op_task)
+    return op_task
+
+
+async def _close_driver_bounded(driver: aiosqlite.Connection) -> None:
+    await _run_driver_op("close", _close_driver(driver))
+
+
+async def _stop_write_task(task: asyncio.Task[object], lease: _SqliteDriverLease) -> bool:
+    """取消写任务。返回协程是否在宽限后仍活着。"""
+    if task.done():
+        _consume_task_exception(task)
+        return False
+    task.cancel()
+    driver = lease.connection
+    hung_interrupt: asyncio.Task[None] | None = None
+    if driver is not None:
+        hung_interrupt = await _run_driver_op("interrupt", _interrupt_driver(driver))
+    _done, _pending = await asyncio.wait({task}, timeout=_WRITE_ABORT_GRACE_S)
+    if task.done():
+        _consume_task_exception(task)
+        return False
+    # interrupt 还挂着时不能对同一条连接再 close。
+    if driver is not None and (hung_interrupt is None or hung_interrupt.done()):
+        await _close_driver_bounded(driver)
+    task.add_done_callback(_consume_task_exception)
+    return True
+
+
+async def _retry_db(call: Callable[[], Awaitable[R]]) -> R:
+    max_retries = 3
+    last_err: BaseException | None = None
+    for attempt in range(max_retries):
+        try:
+            return await call()
+        except (DatabaseWriteTimeout, WriteGateTimeout):
+            raise
+        except Exception as e:
+            last_err = e
+            if _is_pool_timeout(e):
+                logger.error(i18n_t("log.database.connect_timeout_stop", e=e))
+                raise
+            if isinstance(e, OperationalError) and "unable to open database file" in str(e):
+                logger.error(i18n_t("log.database.stop_retry"))
+                raise
+            if _is_transient_db_error(e) and attempt < max_retries - 1:
+                logger.warning(i18n_t("log.database.retry_fail_2", p0=attempt + 1, e=e))
+                await asyncio.sleep(0.5 * (2**attempt))
+                continue
+            if attempt >= max_retries - 1 and _is_transient_db_error(e):
+                logger.error(i18n_t("log.database.retry_fail", e=e), exc_info=True)
+            raise
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(i18n_t("[数据库] with_session 未知失败"))
+
+
 def _session_wrapper(
     func: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]],
     *,
     read_only: bool,
-    write: bool = False,
 ) -> Callable[Concatenate[T, P], Awaitable[R]]:
     @wraps(func)
     async def wrapper(self: T, *args: P.args, **kwargs: P.kwargs) -> R:
-        max_retries = 3
-        last_err: BaseException | None = None
-        for attempt in range(max_retries):
+        operation = func.__qualname__
+        # 复用本任务的连接，避免嵌套写再开一条连接去抢锁。
+        # savepoint 失败只回滚这一层，外层 commit 带不走半截语句。
+        if not read_only:
+            active = _owned_write_session()
+            if active is not None:
+                bound = active
+
+                async def _nested() -> R:
+                    async with bound.begin_nested():
+                        return await func(self, bound, *args, **kwargs)
+
+                return await _retry_db(_nested)
+
+        async def _run_in_session(lease: _SqliteDriverLease | None) -> R:
+            async with async_maker() as session:
+                token: contextvars.Token[_WriteBinding | None] | None = None
+                marked_read = False
+                try:
+                    if not read_only:
+                        current = asyncio.current_task()
+                        if current is not None:
+                            token = _write_session.set(_WriteBinding(session, current))
+                    if lease is not None:
+                        await _capture_sqlite_driver(session, lease)
+                    if read_only:
+                        await _mark_read_only(session)
+                        marked_read = _db_type == "sqlite"
+                    data = await func(self, session, *args, **kwargs)
+                    await session.commit()
+                    return data
+                finally:
+                    if token is not None:
+                        _write_session.reset(token)
+                    # StaticPool 会把连接还回去；query_only 留在连接上会让下一笔写失败。
+                    if marked_read:
+                        await session.execute(text("PRAGMA query_only=OFF"))
+
+        async def _budgeted_write() -> R:
+            # 预算不含等槽时间，只限制已经占住写槽的这一次调用。
+            lease = _SqliteDriverLease()
+            task: asyncio.Task[R] = asyncio.create_task(
+                _run_in_session(lease),
+                name=f"db-write:{operation}",
+            )
             try:
-
-                async def run_with_session() -> R:
-                    sem = sqlite_read_semaphore if read_only else sqlite_semaphore
-                    if sem:
-                        async with sem:
-                            async with async_maker() as session:
-                                data = await func(self, session, *args, **kwargs)
-                                await session.commit()
-                                return data
-                    async with async_maker() as session:
-                        data = await func(self, session, *args, **kwargs)
-                        await session.commit()
-                        return data
-
-                if write and sqlite_write_lock:
-                    async with sqlite_write_lock:
-                        return await run_with_session()
-                else:
-                    return await run_with_session()
-            except Exception as e:
-                last_err = e
-                if _is_pool_timeout(e):
-                    logger.error(
-                        i18n_t(
-                            "log.database.connect_timeout_stop",
-                            e=e,
-                        )
-                    )
-                    raise
-                if isinstance(e, OperationalError) and "unable to open database file" in str(e):
-                    logger.error(i18n_t("log.database.stop_retry"))
-                    raise
-                if _is_transient_db_error(e) and attempt < max_retries - 1:
-                    logger.warning(i18n_t("log.database.retry_fail_2", p0=attempt + 1, e=e))
-                    await asyncio.sleep(0.5 * (2**attempt))
-                    continue
-                # 业务异常 / 不可恢复：直接抛，禁止静默 return None
-                if attempt >= max_retries - 1 and _is_transient_db_error(e):
-                    logger.error(
-                        i18n_t("log.database.retry_fail", e=e),
-                        exc_info=True,
-                    )
+                done, _pending = await asyncio.wait({task}, timeout=_WRITE_BUDGET_S)
+            except asyncio.CancelledError:
+                await _stop_write_task(task, lease)
                 raise
+            if task in done:
+                if task.cancelled():
+                    raise asyncio.CancelledError
+                return task.result()
+            lingered = await _stop_write_task(task, lease)
+            # 宽限内已经正常返回（含 commit）时，调用方应看到成功。
+            if task.done() and not task.cancelled():
+                return task.result()
+            message = i18n_t(
+                "log.database.write_timeout",
+                budget=_budget_label(_WRITE_BUDGET_S),
+                operation=operation,
+            )
+            logger.error(message)
+            if lingered:
+                logger.error(i18n_t("log.database.write_timeout_linger", operation=operation))
+            raise DatabaseWriteTimeout(message)
 
-        # 理论上到不了这里；兜底保证不返回 None
-        if last_err is not None:
-            raise last_err
-        raise RuntimeError(i18n_t("[数据库] with_session 未知失败"))
+        async def _once() -> R:
+            if read_only:
+                sem = sqlite_read_semaphore
+                if _db_type == "sqlite" and sem is not None:
+                    async with sem:
+                        return await _run_in_session(None)
+                return await _run_in_session(None)
+            if _db_type == "sqlite":
+                async with sqlite_write_gate.hold(core=_writer_is_core(func)):
+                    return await _budgeted_write()
+            return await _run_in_session(None)
+
+        return await _retry_db(_once)
 
     return wrapper
 
@@ -396,7 +650,7 @@ def with_session(
     def decorate(
         wrapped: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]],
     ) -> Callable[Concatenate[T, P], Awaitable[R]]:
-        return _session_wrapper(wrapped, read_only=False, write=write)
+        return _session_wrapper(wrapped, read_only=False)
 
     if func is None:
         return decorate
@@ -406,7 +660,7 @@ def with_session(
 def with_read_session(
     func: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]],
 ) -> Callable[Concatenate[T, P], Awaitable[R]]:
-    """SELECT 走独立读槽，不跟大写抢 sqlite_semaphore。WAL 下可读。"""
+    """SELECT 走独立读槽。SQLite 读连接是 query_only，不进写闸门。"""
     return _session_wrapper(func, read_only=True)
 
 
@@ -469,7 +723,7 @@ class BaseIDModel(SQLModel):
     id: int = Field(default=None, primary_key=True, title="序号")
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_distinct_list(
         cls,
         session: AsyncSession,
@@ -480,26 +734,50 @@ class BaseIDModel(SQLModel):
         return r
 
     @classmethod
-    @with_session(write=True)
     async def batch_insert_data(
+        cls,
+        datas: Sequence["BaseIDModel"],
+    ) -> None:
+        if not datas:
+            return
+        rows = list(datas)
+        for start in range(0, len(rows), _UPSERT_CHUNK):
+            await cls._add_chunk(rows[start : start + _UPSERT_CHUNK])
+
+    @classmethod
+    @with_session
+    async def _add_chunk(
         cls,
         session: AsyncSession,
         datas: Sequence["BaseIDModel"],
-    ):
+    ) -> None:
         session.add_all(datas)
 
     @classmethod
-    @with_session(write=True)
     async def batch_insert_data_with_update(
+        cls,
+        datas: Sequence["BaseIDModel"],
+        update_key: List[str],
+        index_elements: List[str],
+    ) -> None:
+        """
+        MySQL需要预先定义约束条件！！
+        """
+        if not datas:
+            return
+        rows = list(datas)
+        for start in range(0, len(rows), _UPSERT_CHUNK):
+            await cls._upsert_chunk(rows[start : start + _UPSERT_CHUNK], update_key, index_elements)
+
+    @classmethod
+    @with_session
+    async def _upsert_chunk(
         cls,
         session: AsyncSession,
         datas: Sequence["BaseIDModel"],
         update_key: List[str],
         index_elements: List[str],
-    ):
-        """
-        MySQL需要预先定义约束条件！！
-        """
+    ) -> None:
         if not datas:
             return
 
@@ -532,7 +810,7 @@ class BaseIDModel(SQLModel):
         await session.execute(update_stmt, values_to_insert)
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def update_data_by_data(
         cls,
         session: AsyncSession,
@@ -617,7 +895,7 @@ class BaseIDModel(SQLModel):
         return col_name
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def full_insert_data(cls, session: AsyncSession, **data) -> int:
         """📝简单介绍:
 
@@ -640,7 +918,7 @@ class BaseIDModel(SQLModel):
         return 0
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def delete_row(
         cls: Type[T_BaseIDModel],
         session: AsyncSession,
@@ -661,7 +939,7 @@ class BaseIDModel(SQLModel):
             return 0
 
     @classmethod
-    @with_session
+    @with_read_session
     async def select_rows(
         cls: Type[T_BaseIDModel],
         session: AsyncSession,
@@ -739,7 +1017,7 @@ class BaseBotIDModel(BaseIDModel):
     bot_id: str = Field(title="平台")
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def update_data_by_uid_without_bot_id(
         cls,
         session: AsyncSession,
@@ -778,7 +1056,7 @@ class BaseBotIDModel(BaseIDModel):
         return -1
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def update_data_by_xx(
         cls,
         session: AsyncSession,
@@ -816,7 +1094,7 @@ class BaseBotIDModel(BaseIDModel):
         return -1
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def update_data_by_uid(
         cls,
         session: AsyncSession,
@@ -852,11 +1130,14 @@ class BaseBotIDModel(BaseIDModel):
             🔸`int`: 成功为`0`, 失败为`-1`
         """
         uid_name = cls.get_gameid_name(game_name)
-        if not await cls.data_exist(**{uid_name: uid}):
+        uid_col = _mapped_column(cls, uid_name)
+        found = await session.execute(select(cls).where(col(uid_col) == uid))
+        if found.scalars().first() is None:
+            # 同任务复用外层 session，不再另开一条写连接。
             data[uid_name] = uid
             return await cls.full_insert_data(bot_id=bot_id, **data)
 
-        sql = update(cls).where(and_(getattr(cls, uid_name) == uid))
+        sql = update(cls).where(col(uid_col) == uid)
 
         if bot_id is not None:
             sql = sql.where(and_(cls.bot_id == bot_id))
@@ -869,7 +1150,7 @@ class BaseBotIDModel(BaseIDModel):
         return -1
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_all_data(
         cls: Type[T_BaseIDModel],
         session: AsyncSession,
@@ -887,7 +1168,7 @@ class BaseModel(BaseBotIDModel):
     ################################
 
     @classmethod
-    @with_session
+    @with_read_session
     async def select_data_list(
         cls: Type[T_BaseModel],
         session: AsyncSession,
@@ -952,7 +1233,7 @@ class BaseModel(BaseBotIDModel):
         return data[0] if data else None
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def insert_data(
         cls: Type[T_BaseModel],
         session: AsyncSession,
@@ -995,7 +1276,7 @@ class BaseModel(BaseBotIDModel):
         return 0
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def delete_data(
         cls: Type[T_BaseModel],
         session: AsyncSession,
@@ -1027,7 +1308,7 @@ class BaseModel(BaseBotIDModel):
         return 0
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def update_data(
         cls: Type[T_BaseModel],
         session: AsyncSession,
@@ -1309,7 +1590,7 @@ class Bind(BaseModel):
         return 0
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_all_uid_list_by_game(
         cls: Type[T_Bind],
         session: AsyncSession,
@@ -1428,7 +1709,7 @@ class Bind(BaseModel):
         return data[0] if data else None
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_group_all_uid(cls: Type[T_Bind], session: AsyncSession, group_id: str):
         """根据传入`group_id`获取该群号下所有绑定`uid`列表"""
         result = await session.scalars(select(cls).where(col(cls.group_id).contains(group_id)))
@@ -1444,7 +1725,7 @@ class User(BaseModel):
     sign_switch: str = Field(default="off", title="自动签到")
 
     @classmethod
-    @with_session
+    @with_read_session
     async def select_data_by_uid(
         cls: Type[T_User],
         session: AsyncSession,
@@ -1477,7 +1758,7 @@ class User(BaseModel):
         return data[0] if data else None
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_user_all_data_by_user_id(cls: Type[T_User], session: AsyncSession, user_id: str):
         """📝简单介绍:
 
@@ -1561,7 +1842,7 @@ class User(BaseModel):
         return getattr(result, attr) if result else None
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def mark_invalid(cls: Type[T_User], session: AsyncSession, cookie: str, mark: str):
         """令一个cookie所对应数据的`status`值为传入的mark
 
@@ -1616,7 +1897,7 @@ class User(BaseModel):
             return False
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_switch_open_list(cls: Type[T_User], session: AsyncSession, switch_name: str) -> List[T_User]:
         """📝简单介绍:
 
@@ -1648,7 +1929,7 @@ class User(BaseModel):
         return [user for user in data_list]
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_all_user(
         cls: Type[T_User],
         session: AsyncSession,
@@ -1824,7 +2105,7 @@ class User(BaseModel):
             return None
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def delete_user_data_by_uid(cls, session: AsyncSession, uid: str, game_name: Optional[str] = None) -> bool:
         """根据给定的`uid`获取数据后, 删除整行数据
 
@@ -1841,7 +2122,7 @@ class Cache(BaseIDModel):
     cookie: str = Field(default=None, title="Cookie")
 
     @classmethod
-    @with_session
+    @with_read_session
     async def select_cache_cookie(
         cls: Type[T_Cache],
         session: AsyncSession,
@@ -1855,7 +2136,7 @@ class Cache(BaseIDModel):
         return data[0].cookie if len(data) >= 1 else None
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def delete_error_cache(cls: Type[T_Cache], session: AsyncSession, user: Type["User"]) -> bool:
         """根据给定的`user`模型中, 查找该模型所有数据的status
 
@@ -1872,7 +2153,7 @@ class Cache(BaseIDModel):
         return True
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def delete_all_cache(cls, session: AsyncSession, user: Type["User"]) -> bool:
         """删除整个表的数据
 
@@ -1894,14 +2175,14 @@ class Cache(BaseIDModel):
         return True
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def refresh_cache(cls, session: AsyncSession, uid: str, game_name: Optional[str] = None) -> bool:
         """删除指定`uid`的数据行"""
         await session.execute(delete(cls).where(getattr(cls, cls.get_gameid_name(game_name)) == uid))
         return True
 
     @classmethod
-    @with_session(write=True)
+    @with_session
     async def insert_cache_data(cls, session: AsyncSession, cookie: str, **data) -> bool:
         """新增指定`cookie`的数据行, `**data`为数据"""
         new_data = cls(cookie=cookie, **data)
@@ -1911,7 +2192,7 @@ class Cache(BaseIDModel):
 
 class Push(BaseBotIDModel):
     @classmethod
-    @with_session
+    @with_read_session
     async def select_data_by_uid(
         cls: Type[T_Push],
         session: AsyncSession,

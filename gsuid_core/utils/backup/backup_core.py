@@ -1,12 +1,106 @@
 import shutil
+import asyncio
+import threading
 from typing import List, Optional
+from _thread import LockType
 from pathlib import Path
 from datetime import datetime
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.data_store import backup_path, gs_data_path
+from gsuid_core.utils.database.base_models import (
+    DB_PATH,
+    is_live_sqlite,
+    is_sqlite_backend,
+    sqlite_consistent_snapshot,
+)
 from gsuid_core.utils.plugins_config.gs_config import backup_config
+
+# 同一目录的第二次调用直接失败。排队会让后一次 rmtree 掉前一次正在写的树。
+_backup_guard = threading.Lock()
+_backup_inflight: dict[str, LockType] = {}
+
+
+def _try_begin_backup(dest: Path) -> LockType | None:
+    key = str(dest)
+    with _backup_guard:
+        slot = _backup_inflight.get(key)
+        if slot is None:
+            slot = threading.Lock()
+            _backup_inflight[key] = slot
+        if not slot.acquire(blocking=False):
+            return None
+        return slot
+
+
+def _end_backup(dest: Path, slot: LockType) -> None:
+    key = str(dest)
+    with _backup_guard:
+        slot.release()
+        current = _backup_inflight.get(key)
+        if current is slot and not slot.locked():
+            del _backup_inflight[key]
+
+
+def resolve_backup_src(p: str | Path, root: Path | None = None) -> Path:
+    """Join a configured backup entry onto ``gs_data_path`` the same way copy does."""
+    base = root if root is not None else gs_data_path
+    path = Path(p)
+    if not path.is_absolute() or not path.is_relative_to(base):
+        path = base / path
+    return path
+
+
+def backup_dir_covers_path(target: Path, config_paths: Optional[List[str]] = None) -> bool:
+    """True if user-selected ``backup_dir`` already copies ``target`` (file or ancestor dir)."""
+    paths: List[str]
+    if config_paths is not None:
+        paths = config_paths
+    else:
+        raw = backup_config.get_config("backup_dir").data
+        if isinstance(raw, list):
+            paths = [str(x) for x in raw]
+        else:
+            paths = []
+    try:
+        target_res = target.resolve()
+    except OSError:
+        return False
+    for raw in paths:
+        path = resolve_backup_src(raw)
+        try:
+            selected = path.resolve()
+        except OSError:
+            selected = path
+        if selected == target_res:
+            return True
+        try:
+            if selected.is_dir() and target_res.is_relative_to(selected):
+                return True
+        except (ValueError, OSError):
+            continue
+    return False
+
+
+async def backup_and_package(file_id: Optional[str] = None) -> int:
+    """``copy_and_rebase_paths`` 的异步入口：复制 + zip 打包都是阻塞 I/O，丢线程池。"""
+    return await asyncio.to_thread(copy_and_rebase_paths, None, file_id)
+
+
+def _refresh_copied_sqlite(dest_dir: Path) -> None:
+    """目录拷贝后，用在线备份 API 覆写其中的主库副本，补回 WAL 里的数据。"""
+    if not is_sqlite_backend():
+        return
+    if not dest_dir.is_dir():
+        return
+    try:
+        rel = DB_PATH.relative_to(gs_data_path)
+    except ValueError:
+        return
+    copied_db = dest_dir / rel
+    if copied_db.exists():
+        sqlite_consistent_snapshot(DB_PATH, copied_db)
 
 
 def copy_and_rebase_paths(_paths_to_copy: Optional[List[Path]] = None, file_id: Optional[str] = None) -> int:
@@ -18,13 +112,7 @@ def copy_and_rebase_paths(_paths_to_copy: Optional[List[Path]] = None, file_id: 
     if _paths_to_copy is None:
         # 获取配置中的路径，并确保它们是相对于gs_data_path的完整路径
         config_paths = backup_config.get_config("backup_dir").data
-        paths_to_copy: List[Path] = []
-        for p in config_paths:
-            path = Path(p)
-            # 如果路径不是绝对路径，或者不是以gs_data_path开头的，就拼接上gs_data_path
-            if not path.is_absolute() or not path.is_relative_to(gs_data_path):
-                path = gs_data_path / path
-            paths_to_copy.append(path)
+        paths_to_copy = [resolve_backup_src(p) for p in config_paths]
     else:
         paths_to_copy = _paths_to_copy
 
@@ -37,7 +125,22 @@ def copy_and_rebase_paths(_paths_to_copy: Optional[List[Path]] = None, file_id: 
         file_id = file_id.strip()
 
     final_backup_dir = backup_path / f"{file_id}-{date_str}"
+    slot = _try_begin_backup(final_backup_dir)
+    if slot is None:
+        logger.warning(t("log.backup.already_running", final_backup_dir=final_backup_dir))
+        return -7
 
+    try:
+        return _copy_and_rebase_locked(paths_to_copy, prefix_to_remove, final_backup_dir)
+    finally:
+        _end_backup(final_backup_dir, slot)
+
+
+def _copy_and_rebase_locked(
+    paths_to_copy: List[Path],
+    prefix_to_remove: Path,
+    final_backup_dir: Path,
+) -> int:
     if final_backup_dir.exists():
         logger.warning(t("log.backup.final_backup_dir", final_backup_dir=final_backup_dir))
         # 确认一下这个目录是否是backup_path开头的
@@ -63,6 +166,7 @@ def copy_and_rebase_paths(_paths_to_copy: Optional[List[Path]] = None, file_id: 
         return -5
 
     # 4. 遍历并复制路径
+    copy_failed = False
     for src_path in paths_to_copy:
         try:
             relative_path = src_path.relative_to(prefix_to_remove)
@@ -71,11 +175,16 @@ def copy_and_rebase_paths(_paths_to_copy: Optional[List[Path]] = None, file_id: 
 
             if src_path.is_file():
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_path, dest_path)
+                if is_live_sqlite(src_path):
+                    sqlite_consistent_snapshot(src_path, dest_path)
+                else:
+                    shutil.copy2(src_path, dest_path)
                 logger.success(t("log.backup.src_path_dest", src_path=src_path, dest_path=dest_path))
 
             elif src_path.is_dir():
                 shutil.copytree(src_path, dest_path, dirs_exist_ok=True)
+                # copytree 只是普通文件拷贝，主库在 WAL 下会漏数据，这里对目标补一次一致快照
+                _refresh_copied_sqlite(dest_path)
                 logger.success(t("log.backup.src_path_dest_2", src_path=src_path, dest_path=dest_path))
 
             else:
@@ -90,7 +199,14 @@ def copy_and_rebase_paths(_paths_to_copy: Optional[List[Path]] = None, file_id: 
                 )
             )
         except Exception as e:
+            copy_failed = True
             logger.warning(t("log.backup.src_path_error", src_path=src_path, e=e))
+
+    # 半截快照已删；失败再打包会让接口和定时任务把空库报成成功。
+    if copy_failed:
+        # 半截目录留着会让下次清理/保留期统计失真，直接按未完成处理掉。
+        shutil.rmtree(final_backup_dir, ignore_errors=True)
+        return -6
 
     # 最后, 打zip压缩包
     try:

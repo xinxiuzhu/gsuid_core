@@ -13,6 +13,7 @@
 3. ``http://`` / ``https://`` / ``base64://``——直接走 ``MessageSegment.image``。
 """
 
+import asyncio
 from typing import TYPE_CHECKING, Dict, List, Tuple, Union, Optional
 from pathlib import Path
 
@@ -100,10 +101,10 @@ async def _resolve_kanban_artifact(res_id: str) -> Optional[Union[bytes, str]]:
 
     if art.payload_path:
         p = Path(art.payload_path)
-        if not p.exists():
+        if not await asyncio.to_thread(p.exists):
             logger.debug(t("log.ai.buildintools_kanban_artifact_res", res_id=res_id, p0=art.payload_path))
             return None
-        data = p.read_bytes()
+        data = await asyncio.to_thread(p.read_bytes)
         # 以魔数为准：只有真图返回 bytes（mime 标 image/* 内容却是 md 时也拒）
         if _looks_like_image_bytes(data):
             return data
@@ -203,6 +204,16 @@ async def send_message_by_ai(
         text = strip_open_solicitations(text)
         _ev_text = tool_ctx.ev.raw_text if tool_ctx.ev is not None and tool_ctx.ev.raw_text else ""
         if text:
+            from gsuid_core.ai_core.angle_bracket_guard import (
+                has_illegal_angle_tags,
+                sanitize_illegal_angle_tags,
+            )
+
+            if has_illegal_angle_tags(text):
+                cleaned = sanitize_illegal_angle_tags(text)
+                if cleaned:
+                    text = cleaned
+        if text:
             _gate_fb = tool_gate_feedback(text, tool_ctx.extra, user_text=_ev_text)
             if _gate_fb is not None:
                 if has_media:
@@ -228,6 +239,13 @@ async def send_message_by_ai(
     # 目标用户（§E.3）：默认当前对话者；Event 保证 user_id 存在，不用 getattr 兜底
     ev = tool_ctx.ev
     target_id = user_id or (str(ev.user_id) if ev is not None else "")
+    if text:
+        from gsuid_core.ai_core.persona.settings import persona_name_from_event
+        from gsuid_core.ai_core.agent_run.speech_policy import title_mentioned, non_master_title
+
+        _ban = non_master_title(target_id, persona_name_from_event(ev))
+        if title_mentioned(_ban, text):
+            return f"⚠️ 接收人不是主人，台词不能出现「{_ban}」。改写后再发，不要用这个称呼。"
     session_id = str(ev.session_id) if ev is not None else (tool_ctx.parent_session_id or "")
     if image_id.startswith("dlg_"):
         return (
@@ -350,6 +368,7 @@ async def send_message_by_ai(
         _at_uid = str(_at_raw) if isinstance(_at_raw, str) and _at_raw else None
         if text:
             from gsuid_core.ai_core.utils import send_chat_result
+            from gsuid_core.ai_core.agent_run.support import turn_reply_metadata
 
             # run 级发送去重（与 gs_agent 主循环共用 extra 里的同一集合）：干净历史重试 /
             # 模型重复调用不再把同一段话发两遍，媒体不受影响（评审修复 F14）
@@ -358,7 +377,26 @@ async def send_message_by_ai(
                 logger.info(t("log.ai.buildintools_skipping_duplicate_run_skip"))
                 text = ""
             else:
-                await send_chat_result(bot, text, ev=ev, ooc_check=False, at_user_id=_at_uid)
+                _mention_raw = tool_ctx.extra["mention_names"] if "mention_names" in tool_ctx.extra else None
+                _mentions: dict[str, str] = {}
+                if isinstance(_mention_raw, dict):
+                    for _mk, _mv in _mention_raw.items():
+                        if isinstance(_mk, str) and isinstance(_mv, str) and _mk and _mv:
+                            _mentions[_mk] = _mv
+                # 显式 @ 了别人就记给别人，否则记当前说话人；名字对不上目标，必须去掉
+                _meta = turn_reply_metadata(ev)
+                if _at_uid:
+                    _meta["reply_to_user_id"] = _at_uid
+                    _meta.pop("reply_to_user_name", None)
+                await send_chat_result(
+                    bot,
+                    text,
+                    ev=ev,
+                    ooc_check=False,
+                    at_user_id=_at_uid,
+                    mention_names=_mentions,
+                    extra_metadata=_meta,
+                )
                 if isinstance(_sent_registry, set):
                     _sent_registry.add(text.strip())
                 _at_uid = None  # 文本已 @，媒体不再重复
@@ -382,6 +420,13 @@ async def send_message_by_ai(
                 reset_outbound_image_label(_tok)
         elif text:
             sent = True
+
+        if sent:
+            from gsuid_core.ai_core.history_format import note_thread_handle
+
+            for hid in (image_id, video_id, audio_id):
+                if hid:
+                    note_thread_handle(tool_ctx, hid)
 
         # 计数放在真正发出之后：媒体解析报错的早退不占额度
         if throttle_key is not None:

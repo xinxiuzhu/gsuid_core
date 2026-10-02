@@ -5,6 +5,7 @@
 各套件只填命名块，不得自己拼接顺序——否则第 12 个块会插到身份锚前面。
 """
 
+import re
 from typing import Tuple, Mapping, Callable, Optional, Awaitable, FrozenSet
 from dataclasses import dataclass
 
@@ -31,15 +32,16 @@ CONTEXT_BLOCK_ORDER: Tuple[str, ...] = (
     "plugin_hints",
 )
 
-# 单轮动态块合计目标 ≤2000 字：join 时按块截断并 warning。
+# 长库时 800 字会把专名/数字切掉；join 仍按块截断。memory 不在此表：
+# 它的帽只能来自 inject_memory_cap，表里再写一个 8000 会让配置形同虚设。
 BLOCK_CHAR_BUDGET: Mapping[str, int] = {
     "mood": 80,
     "relationship": 100,
     "voice_anchor": 180,
     "identity": 80,
-    "history": 600,
+    # 同人线程 14 条 + 旁人 6 条；600 会从尾部截掉最新出站句柄。
+    "history": 4000,
     "group_context": 200,
-    "memory": 800,
     "task": 250,
     "plan_hint": 250,
     "chitchat_style": 160,
@@ -56,44 +58,85 @@ _KNOWN_BLOCKS: FrozenSet[str] = frozenset(CONTEXT_BLOCK_ORDER) | STABLE_BLOCK_NA
 # 口吻 / 口气 / 身份是同一组角色提示，拼在一起中间不要空行。
 _CUE_BLOCK_CLUSTER: FrozenSet[str] = frozenset({"voice_anchor", "identity"})
 
+# 记忆块里出现这么多份不同来源的入库文档，就按宽帽收，而不是默认帽。
+_MEMORY_WIDE_MIN_DOC_SOURCES = 2
+_DOC_HEAD_RE = re.compile(r"【文档】\s*([^\n]{1,120})")
+
+
+def count_document_sources(text: str) -> int:
+    """记忆块里 `【文档】<标题>` 的不同来源数。"""
+    seen: set[str] = set()
+    for m in _DOC_HEAD_RE.finditer(text):
+        seen.add(m.group(1).strip())
+    return len(seen)
+
+
+def inject_memory_cap(query: str, *, covered: bool = False, n_doc_sources: int = 0) -> int:
+    """记忆整块总帽的**唯一**出口：pack 与 join 都调这里，两边不会各抬一个数。
+
+    只按「有没有逐份材料覆盖 / 问句是不是长时序或跨文档比较」选档。覆盖守卫
+    （scope、≥2 份、栏目实词、df）决定摘哪些行，留在检索侧，不搬进预算函数。
+    """
+    from gsuid_core.ai_core.memory.config import memory_config
+    from gsuid_core.ai_core.memory.retrieval.lexical import wants_parallel_document_coverage
+    from gsuid_core.ai_core.memory.retrieval.event_time import (
+        looks_like_span_query,
+        looks_like_order_query,
+        looks_like_summary_query,
+    )
+
+    default = int(memory_config.memory_inject_max_chars)
+    wide = max(default, int(memory_config.memory_inject_wide_chars))
+    multi_source = n_doc_sources >= _MEMORY_WIDE_MIN_DOC_SOURCES
+    timeline = looks_like_order_query(query) or looks_like_span_query(query) or looks_like_summary_query(query)
+    if covered or multi_source or timeline or wants_parallel_document_coverage(query):
+        return wide
+    return default
+
 
 def is_known_block(name: str) -> bool:
     """块名白名单校验。未知名一律拒绝，防套件私自插块。"""
     return name in _KNOWN_BLOCKS
 
 
-def _apply_block_budget(name: str, text: str) -> str:
+def _apply_block_budget(name: str, text: str, *, budget: int | None = None) -> str:
     """超 per-block 预算则截断。预算表缺名时不截（稳定块不在此表）。"""
-    if name not in BLOCK_CHAR_BUDGET:
+    cap = budget
+    if cap is None:
+        if name not in BLOCK_CHAR_BUDGET:
+            return text
+        cap = BLOCK_CHAR_BUDGET[name]
+    if len(text) <= cap:
         return text
-    budget = BLOCK_CHAR_BUDGET[name]
-    if len(text) <= budget:
-        return text
-    logger.warning(t("log.agent.context_block_truncated", name=name, before=len(text), after=budget))
-    return text[: max(0, budget - 1)] + "…"
+    logger.warning(t("log.agent.context_block_truncated", name=name, before=len(text), after=cap))
+    return text[: max(0, cap - 1)] + "…"
 
 
 def join_named_blocks(
     blocks: Mapping[str, str],
     *,
-    create_by: str = "Chat",
-    skip_memory_cap: bool = False,
+    query: str = "",
+    memory_budget: int | None = None,
 ) -> str:
     """按 ``CONTEXT_BLOCK_ORDER`` 拼装；口吻/口气/身份连成一段，其余块仍 ``\\n\\n``。
 
-    评测跳过 800 字帽须显式 ``skip_memory_cap``（Chat + memory_eval）。
-    ``create_by=TEST`` 不再自动免帽，以免评测走 TEST 改掉生产装配。
+    记忆块的帽由调用方从 :func:`inject_memory_cap` 取（生产与评测同一条函数）；
+    不传就按问句 + 块里来源数现算一次，免得绕过预算。
     """
     pieces: list[str] = []
     cues: list[str] = []
-    _ = create_by
     for name in CONTEXT_BLOCK_ORDER:
         if name not in blocks:
             continue
         text = blocks[name]
         if not text:
             continue
-        if not (skip_memory_cap and name == "memory"):
+        if name == "memory":
+            cap = memory_budget
+            if cap is None:
+                cap = inject_memory_cap(query, n_doc_sources=count_document_sources(text))
+            text = _apply_block_budget(name, text, budget=cap)
+        else:
             text = _apply_block_budget(name, text)
         if name in _CUE_BLOCK_CLUSTER:
             cues.append(text)

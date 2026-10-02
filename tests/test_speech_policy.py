@@ -14,6 +14,8 @@ from gsuid_core.ai_core.agent_run.speech_policy import (
     content_is_render_candidate,
     has_orchestration_narration,
     should_mark_speech_delivered,
+    looks_like_capability_absence,
+    looks_like_stale_present_tense,
     should_block_user_visible_text,
     looks_like_inflight_quota_speech,
 )
@@ -205,14 +207,21 @@ def test_process_meta_and_empty_handoff_gates() -> None:
     assert looks_like_process_meta("…时效存疑，自己再验。")
     assert looks_like_process_meta("唔…数据没刷出来，没法给你编数字。")
     assert looks_like_process_meta("…先眯会儿，回炉了你再戳我。")
+    # 已反转（群聊 OOC 事故 2026-09）：检索腔（没查到 / 没翻到）**不是**「诚实失败」。
+    # 原断言把它锁成合格样例，等于教模型用检索语汇当记忆说话；它已不再被祝福为失败说法。
     assert not looks_like_process_meta("…没查到具体数字。…困。")
+    from gsuid_core.ai_core.persona.prompts import SYSTEM_CONSTRAINTS
+
+    assert "只说没查到" not in SYSTEM_CONSTRAINTS, "prompt 仍在教模型用检索腔认输"
+    assert "此刻翻不到" not in SYSTEM_CONSTRAINTS, "prompt 仍规定「翻不到」这句固定说法"
     assert looks_like_process_meta(
         "The sub-agent is running in the background. I should not narrate the process to the user."
     )
     assert not looks_like_process_meta("https://wiki.biligame.com/ys/some-long-page-name-here")
 
-    # 无事实包：诚实失败允许（不再误武装 render）
-    honest = "唔…翻了好几页，具体数字没翻到。…好困。"
+    # 诚实失败仍放行——只是必须用人的说法：给结论，不解释这份「不知道」的形状。
+    honest = "唔…那个数字我真记不清了。…好困。"
+    # 无事实包：诚实失败允许（不再误武装 render）；措辞已从检索腔换成人的说法。
     blk, why = should_block_user_visible_text(
         "free",
         honest,
@@ -269,6 +278,9 @@ def test_wall_clock_pipeline_branch() -> None:
     assert "SILENCE" in pipe
     # 有事实包时必须硬开 render 例外
     assert ("禁止" in pipe and "停工具" in pipe) or ("硬例外" in pipe)
+    blocked = wall_clock_nudge_for(need_render_pipeline=True, allow_render=False)
+    assert "render_agent" not in blocked
+    assert "不要再发起新的工具调用" in blocked
 
 
 def test_report_speech_and_solicitation() -> None:
@@ -371,7 +383,17 @@ def test_empty_handoff_and_wait_comfort() -> None:
     )[0]
 
 
+def test_ack_plus_find_tools_is_not_terminal() -> None:
+    from gsuid_core.ai_core.agent_run.speech_policy import batch_still_working
+
+    assert batch_still_working(["send_message_by_ai", "find_tools"])
+    assert batch_still_working(["find_tools"])
+    assert not batch_still_working(["send_message_by_ai"])
+    assert not batch_still_working(["send_meme"])
+
+
 def test_wait_comfort_does_not_mark_delivered() -> None:
+    assert not should_mark_speech_delivered(text="唔…深塔啊…等我去翻卷轴…zzz", has_media=False)
     assert not should_mark_speech_delivered(text="马上好。", has_media=False)
     assert not should_mark_speech_delivered(text="这就去办", has_media=False)
     assert should_mark_speech_delivered(text="查到了，出门带伞。", has_media=False)
@@ -414,10 +436,11 @@ def test_task_ack_is_required_not_optional() -> None:
     speech = (root / "gsuid_core/ai_core/agent_run/speech_policy.py").read_text(encoding="utf-8")
     prompts = (root / "gsuid_core/ai_core/persona/prompts.py").read_text(encoding="utf-8")
     sub = (root / "gsuid_core/ai_core/buildin_tools/subagent.py").read_text(encoding="utf-8")
+    web = (root / "gsuid_core/ai_core/buildin_tools/web_search.py").read_text(encoding="utf-8")
     assert "重任务接任务必须短应" in speech
     assert "轻查询不先应" in speech
     assert "或直接干活" not in prompts
-    assert "自己组合查询词" in prompts
+    assert "自己组合查询词" in web
     assert "短应走正文或" not in sub
     assert needs_task_ack_turn(
         create_by="Chat",
@@ -469,7 +492,27 @@ def test_task_ack_is_required_not_optional() -> None:
         followup_detected=False,
         is_http=False,
     )
-    assert task_ack_phrase(None) == "收到。"
+    assert task_ack_phrase(None) == ""
+    from gsuid_core.ai_core.agent_run.loop import needs_create_subagent_ack
+
+    assert "早柚" not in task_ack_phrase(None)
+    assert "唔" not in task_ack_phrase(None)
+    assert needs_create_subagent_ack(
+        create_by="Chat",
+        is_subagent=False,
+        is_framework=False,
+        is_status_inquiry=False,
+    )
+    assert not needs_create_subagent_ack(
+        create_by="Chat",
+        is_subagent=False,
+        is_framework=True,
+        is_status_inquiry=False,
+    )
+    loop_src = (root / "gsuid_core/ai_core/agent_run/loop.py").read_text(encoding="utf-8")
+    assert "知道了，稍等" not in loop_src
+    assert "收到。" not in loop_src
+    assert "ModelRetry" in loop_src
     assert looks_like_task_accept_speech("收到。")
     silent = ToolCallPart(tool_name="create_subagent", args="{}")
     spoken = ToolCallPart(tool_name="send_message_by_ai", args='{"text": "好，我去查。"}')
@@ -486,6 +529,10 @@ def test_first_ack_with_tools_keeps_accept_speech() -> None:
     assert not tools_warrant_task_ack(["search_cognition", "find_tools"])
     assert decide_text_outbound_slot(has_fn_tool=True, accept_slot_used=False, heavy_ack=True) == "send_accept"
     assert decide_text_outbound_slot(has_fn_tool=True, accept_slot_used=True, heavy_ack=True) == "unsent"
+    assert (
+        decide_text_outbound_slot(has_fn_tool=True, accept_slot_used=False, heavy_ack=False, light_accept=True)
+        == "send_accept"
+    )
     assert decide_text_outbound_slot(has_fn_tool=True, accept_slot_used=False, heavy_ack=False) == "unsent"
     assert decide_text_outbound_slot(has_fn_tool=False, accept_slot_used=False, heavy_ack=False) == "send_final"
     blk, why = should_block_user_visible_text(
@@ -607,3 +654,130 @@ def test_async_blocks_non_wait_until_image() -> None:
         wait_comfort_sent=True,
     )
     assert blk and why == "silence_only_or_async"
+
+
+def test_capability_absence_and_stale_present() -> None:
+    from datetime import datetime
+
+    from gsuid_core.ai_core.output_firewall import NEVER_RELEASE_CATEGORIES, check_ooc
+
+    assert looks_like_capability_absence("呼工具里没挂实时天气，搜出来都是气候平均")
+    assert looks_like_capability_absence("天气这个我没装那玩意儿，查不了实时")
+    assert looks_like_capability_absence("我这边没接口拿你游戏里的练度数据")
+    assert looks_like_capability_absence("更新面板是群里那个机器人干的活")
+    assert looks_like_capability_absence("你平时用那种指令，是别的家伙管的")
+    assert looks_like_capability_absence("主人你直接发 `gs深渊` 嘛")
+    assert not looks_like_capability_absence("翻不到卷轴…先睡了")
+    assert not looks_like_capability_absence("报错一般是券商没单独开通权限")
+    assert not looks_like_capability_absence("接口文档发我一份")
+    assert not looks_like_capability_absence("工具人没来开会")
+    assert not looks_like_capability_absence("我没接口文档")
+    assert not looks_like_capability_absence("先发「图片」我看看")
+    assert not looks_like_capability_absence("那种指令听着就烦")
+    assert not looks_like_capability_absence("你直接发「晚安」给她")
+    hit = check_ooc("呼工具里没挂实时天气")
+    assert hit is not None
+    assert hit.category == "capability_absence"
+    assert "capability_absence" in NEVER_RELEASE_CATEGORIES
+    assert looks_like_stale_present_tense(
+        "今天广州是2020年5月25日晴，27度",
+        now=datetime(2026, 9, 14),
+    )
+    assert not looks_like_stale_present_tense(
+        "5月25日那天好热",
+        now=datetime(2026, 9, 14),
+    )
+    assert not looks_like_stale_present_tense(
+        "今天突然想起2020年5月25日那天",
+        now=datetime(2026, 9, 14),
+    )
+    assert not looks_like_stale_present_tense(
+        "现在想想2023年1月1日那次",
+        now=datetime(2026, 9, 14),
+    )
+    stale_hit = check_ooc("现在还是2020-05-25的气温")
+    assert stale_hit is not None
+    assert stale_hit.category == "stale_present"
+    assert not looks_like_stale_present_tense(
+        "今天是 2023-04-18，从 2023-02-15 到 2023-04-18 相差约 2 个月。",
+        now=datetime(2026, 9, 24),
+    )
+
+
+def test_framework_deliver_blocks_status_ping_before_image() -> None:
+    """交付回灌未发图时，短进度句也不出站。"""
+    blk, why = should_block_user_visible_text(
+        "framework_deliver",
+        "（揉了揉眼睛）还没…别催…",
+        pending_async=False,
+        image_sent=False,
+        has_status_tool=False,
+        tool_calls_so_far=[],
+    )
+    assert blk and why == "deliver_before_send"
+
+
+def test_master_title_blocked_for_non_master_addressee() -> None:
+    blk, why = should_block_user_visible_text(
+        "framework_deliver",
+        "唔…图给你…剩下的交给主人判断了",
+        pending_async=False,
+        image_sent=True,
+        has_status_tool=False,
+        tool_calls_so_far=["send_message_by_ai"],
+        forbid_title="主人",
+    )
+    assert blk and why == "master_title"
+    ok, _ = should_block_user_visible_text(
+        "free",
+        "图给你了…你自己看",
+        pending_async=False,
+        image_sent=True,
+        has_status_tool=False,
+        tool_calls_so_far=["send_message_by_ai"],
+        forbid_title="主人",
+    )
+    assert not ok
+
+
+def test_entity_routed_blocks_answer_without_tools() -> None:
+    blk, why = should_block_user_visible_text(
+        "free",
+        "这种材料给能稳定满足条件的人。",
+        pending_async=False,
+        image_sent=False,
+        has_status_tool=False,
+        tool_calls_so_far=[],
+        entity_routed=True,
+    )
+    assert blk and why == "entity_without_tool"
+    ok, _ = should_block_user_visible_text(
+        "free",
+        "这种材料给能稳定满足条件的人。",
+        pending_async=False,
+        image_sent=False,
+        has_status_tool=False,
+        tool_calls_so_far=["lookup_record"],
+        entity_routed=True,
+    )
+    assert not ok
+
+
+def test_framework_deliver_allows_short_close_without_image() -> None:
+    blk, _why = should_block_user_visible_text(
+        "framework_deliver",
+        "按卡片上的那条。",
+        pending_async=False,
+        image_sent=False,
+        has_status_tool=False,
+        tool_calls_so_far=[],
+    )
+    assert not blk
+
+
+def test_short_title_is_not_a_master_title_hit() -> None:
+    from gsuid_core.ai_core.agent_run.speech_policy import title_mentioned
+
+    assert not title_mentioned("主", "交给主人判断")
+    assert not title_mentioned("lord", "landlord said hello")
+    assert title_mentioned("主人", "交给主人判断")

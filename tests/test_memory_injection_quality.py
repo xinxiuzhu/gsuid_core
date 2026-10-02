@@ -63,6 +63,66 @@ def test_to_prompt_text_facts_include_statement_and_event_time() -> None:
     assert "发生 2023-05-04" in text
 
 
+def test_classify_edge_write_add_only() -> None:
+    from gsuid_core.ai_core.memory.ingestion.edge import classify_edge_write
+
+    assert classify_edge_write("user lives in A", "user lives in A") == "merge"
+    assert classify_edge_write("user lives in A", "user lives in A ") == "merge"
+    assert classify_edge_write("user uses Milvus 2.2.0", "user uses Milvus 2.3.1") == "add"
+    assert classify_edge_write("user likes coffee", "user does not like coffee") == "conflict"
+
+
+def test_to_prompt_text_order_query_emits_numbered_skeleton() -> None:
+    q = (
+        "Can you list the order in which I brought up different aspects of developing "
+        "my personal budget tracker throughout our conversations, in order? "
+        "Mention ONLY and ONLY three items."
+    )
+    mc = MemoryContext(
+        episodes=[
+            _episode(
+                "User: Finalizing security hashing and deployment checklist.",
+                valid_at="2024-04-25 10:00:00",
+                eid="sec",
+            ),
+            _episode(
+                "User: I started the budget tracker core authentication module.",
+                valid_at="2024-03-14 10:00:00",
+                eid="core",
+            ),
+            _episode(
+                "User: Implementing transaction creation with proper error handling.",
+                valid_at="2024-04-05 10:00:00",
+                eid="err",
+            ),
+        ]
+    )
+    text = mc.to_prompt_text(max_chars=8000, query=q)
+    assert "【事件顺序" in text
+    assert "1. 2024-03-14 ·" in text
+    assert "2. 2024-04-05 ·" in text
+    assert "3. 2024-04-25 ·" in text
+    i1 = text.index("1. 2024-03-14 ·")
+    i2 = text.index("2. 2024-04-05 ·")
+    i3 = text.index("3. 2024-04-25 ·")
+    assert i1 < i2 < i3
+
+
+def test_to_prompt_text_episodes_include_event_at() -> None:
+    mc = MemoryContext(
+        episodes=[
+            _episode(
+                "User: I obtained my OpenWeather API key three months ago.",
+                valid_at="2024-07-01 10:00:00",
+                eid="k",
+            )
+        ]
+    )
+    text = mc.to_prompt_text(max_chars=4000, query="")
+    assert "[2024-07-01 10:00:00]" in text
+    assert "发生 2024-04-02" in text
+
+
 def test_dangling_predicate_facts_rejected() -> None:
     """生产日志里的真实垃圾条目全部命中。"""
     junk = ["用户100000003提到", "用户100000007被提及", "[100000008]提及", "用户100000009提到。", "路人丙提到"]
@@ -95,14 +155,14 @@ def test_injection_drops_dangling_facts() -> None:
 
 def test_third_party_sensitive_fact_dropped() -> None:
     """B 的催婚隐私不得注入 A 的对话。"""
-    mc = MemoryContext(edges=[_edge("100000004", "年纪到了被催婚，待房间躲避")])
+    mc = MemoryContext(edges=[_edge("100000004", "年纪到了被催婚")])
     text = mc.to_prompt_text(max_chars=2000, current_speaker_ids={"100000001"})
     assert "催婚" not in text
 
 
 def test_own_sensitive_fact_kept() -> None:
     """当事人自己在场时，其敏感事实照常可用。"""
-    mc = MemoryContext(edges=[_edge("100000004", "年纪到了被催婚，待房间躲避")])
+    mc = MemoryContext(edges=[_edge("100000004", "年纪到了被催婚")])
     text = mc.to_prompt_text(max_chars=2000, current_speaker_ids={"100000004"})
     assert "催婚" in text
 
@@ -137,7 +197,7 @@ def test_deployer_extra_sensitive_terms(monkeypatch: pytest.MonkeyPatch) -> None
         return original_get(key)
 
     monkeypatch.setattr(cfg_mod.ai_config, "get_config", fake_get)
-    mc = MemoryContext(edges=[_edge("100000004", "高考分数只有 400 多")])
+    mc = MemoryContext(edges=[_edge("100000004", "高考分数还没出来")])
     blocked = mc.to_prompt_text(max_chars=2000, current_speaker_ids={"100000001"})
     assert "高考分数" not in blocked
     allowed = mc.to_prompt_text(max_chars=2000, current_speaker_ids={"100000004"})
@@ -592,18 +652,59 @@ def test_inject_skips_tool_hint_for_memory_eval() -> None:
     assert block.rfind("（系统：") > block.find("[guide]")
 
 
-def test_memory_eval_skips_memory_block_char_budget() -> None:
-    from gsuid_core.ai_core.kits.base import join_named_blocks
+def test_memory_block_cap_comes_from_inject_memory_cap() -> None:
+    """记忆块的帽只有一个出口：``inject_memory_cap``；pack 的 covered 必须传到 join。"""
+    from gsuid_core.ai_core.hooks import AgentHookPoint, AgentHookContext
+    from gsuid_core.ai_core.kits.base import inject_memory_cap, join_named_blocks
+    from gsuid_core.ai_core.kits.compose import join_blocks
 
-    blob = "P" * 3000
-    chat = join_named_blocks({"memory": blob}, create_by="Chat")
-    assert len(chat) <= 800
+    default = inject_memory_cap("今天天气怎么样")
+    order_q = "List the order I brought up hiring aspects, in order. Mention ONLY three items."
+    wide = inject_memory_cap(order_q)
+    assert wide > default
+    assert inject_memory_cap("今天天气怎么样", n_doc_sources=2) == wide
+
+    blob = "P" * (default + 1000)
+    chat = join_named_blocks({"memory": blob})
+    assert len(chat) <= default
     assert chat.endswith("…")
-    still_capped = join_named_blocks({"memory": blob}, create_by="TEST")
-    assert len(still_capped) <= 800
-    skipped = join_named_blocks({"memory": blob}, create_by="Chat", skip_memory_cap=True)
-    assert blob in skipped
-    assert len(skipped) >= 3000
+    # 不传 budget 时仍按问句抬帽，空 query 不会误走宽档。
+    still_capped = join_named_blocks({"memory": blob}, query="今天天气怎么样")
+    assert len(still_capped) <= default
+    assert still_capped.endswith("…")
+    timeline = join_named_blocks({"memory": blob}, query=order_q)
+    assert len(timeline) == len(blob)
+
+    # 块里有 ≥2 份入库文档时不传 budget，join 也按宽档收（不再从尾部切掉后期来源）。
+    doc_block = "【文档】a.md\n" + "x" * (default + 1000) + "\n【文档】b.md\n" + "y" * 200
+    multi = join_named_blocks({"memory": doc_block})
+    assert len(multi) == len(doc_block)
+    explicit = join_named_blocks({"memory": doc_block}, memory_budget=wide)
+    assert len(explicit) == len(doc_block)
+
+    # 覆盖包即使还没写出两份文档头，join 也要跟 pack 同一档。
+    ctx = AgentHookContext(point=AgentHookPoint.COMPOSE_CONTEXT, query="哪些歌好听")
+    ctx.blocks["memory"] = blob
+    assert len(join_blocks(ctx)) <= default
+    ctx.memory_covered = True
+    assert len(join_blocks(ctx)) == len(blob)
+
+
+def test_join_named_blocks_caps_non_memory_blocks() -> None:
+    from gsuid_core.ai_core.kits.base import BLOCK_CHAR_BUDGET, join_named_blocks
+
+    history = "H" * 5000
+    voice = "V" * 300
+    out = join_named_blocks({"history": history, "voice_anchor": voice})
+    hist_cap = BLOCK_CHAR_BUDGET["history"]
+    voice_cap = BLOCK_CHAR_BUDGET["voice_anchor"]
+    assert history not in out
+    assert voice not in out
+    assert out.count("…") >= 2
+    assert len(out) <= hist_cap + voice_cap + 8
+    still = join_named_blocks({"history": history}, memory_budget=96000)
+    assert len(still) <= hist_cap
+    assert still.endswith("…")
 
 
 def test_prioritize_retrieved_puts_query_overlap_first() -> None:
@@ -1247,3 +1348,360 @@ def test_eval_dump_latest_facts_sort_by_statement_time() -> None:
     assert "Seattle" in dumped
     assert "[2023-06-01]" in dumped
     assert "[2023-01-01]" in dumped
+
+
+def test_chat_long_memory_qa_uses_prompt_text_not_catalog() -> None:
+    from gsuid_core.ai_core.hooks import AgentHookPoint, AgentHookContext
+    from gsuid_core.ai_core.kits.memory.kit import format_retrieved_memory, wants_evidence_injection
+
+    long_q = "Have I ever formulated heat equation problems before in our previous sessions?"
+    short_q = "hi"
+    long_ep = "beam_eval_3: I've never formulated any heat equation problems before today."
+    mem = MemoryContext(episodes=[_episode(long_ep, valid_at="2024-11-02 10:00:00", eid="u1")])
+    chat_long = AgentHookContext(
+        point=AgentHookPoint.RETRIEVE_CONTEXT,
+        create_by="Chat",
+        query=long_q,
+        intent="问答",
+    )
+    assert wants_evidence_injection(chat_long)
+    dumped = format_retrieved_memory(chat_long, mem)
+    assert "【相关对话片段】" in dumped
+    assert "never formulated any heat equation problems" in dumped
+    assert "[记忆目录]" not in dumped
+    chat_short = AgentHookContext(
+        point=AgentHookPoint.RETRIEVE_CONTEXT,
+        create_by="Chat",
+        query=short_q,
+        intent="闲聊",
+    )
+    assert not wants_evidence_injection(chat_short)
+    catalog = format_retrieved_memory(chat_short, mem)
+    assert "[记忆目录]" in catalog
+    assert "search_cognition" in catalog
+    short_fact = AgentHookContext(
+        point=AgentHookPoint.RETRIEVE_CONTEXT,
+        create_by="Chat",
+        query="Where do I take yoga classes?",
+        intent="闲聊",
+    )
+    assert wants_evidence_injection(short_fact)
+    dumped_fact = format_retrieved_memory(short_fact, mem)
+    assert "[记忆目录]" not in dumped_fact
+    assert "【相关对话片段】" in dumped_fact
+    where = AgentHookContext(
+        point=AgentHookPoint.RETRIEVE_CONTEXT,
+        create_by="Chat",
+        query="where is it?",
+        intent="闲聊",
+    )
+    assert not wants_evidence_injection(where)
+
+
+def test_to_prompt_text_prefers_user_turns_over_assistant() -> None:
+    mem = MemoryContext(
+        episodes=[
+            _episode(
+                "assistant: Here is a curriculum on Green's functions.",
+                valid_at="2025-03-01 09:00:00",
+                eid="a",
+            ),
+            _episode(
+                "beam_eval_3: I'm starting my deep dive into Green's functions.",
+                valid_at="2025-03-01 10:00:00",
+                eid="u",
+            ),
+        ],
+        temporal_mode=True,
+    )
+    text = mem.to_prompt_text(max_chars=4000, query="list the order from 2025-03-01 to 2025-03-31")
+    assert "deep dive into Green's functions" in text
+    assert "curriculum" not in text
+
+
+def test_to_prompt_text_temporal_drops_out_of_window() -> None:
+    from datetime import datetime
+
+    mem = MemoryContext(
+        episodes=[
+            _episode("beam_eval_3: March topic A", valid_at="2025-03-01 00:00:00", eid="m1"),
+            _episode("beam_eval_3: June grant writing", valid_at="2025-06-17 00:00:00", eid="j1"),
+        ],
+        temporal_mode=True,
+        time_range=(datetime(2025, 3, 1), datetime(2025, 4, 1)),
+    )
+    text = mem.to_prompt_text(max_chars=4000, query="list the order from 2025-03-01 to 2025-03-31")
+    assert "March topic A" in text
+    assert "June grant writing" not in text
+
+
+def test_spread_datetimes_keeps_calendar_day() -> None:
+    from datetime import datetime
+
+    from gsuid_core.ai_core.memory.ingest_time import spread_datetimes
+
+    d0 = datetime(2025, 3, 1, 0, 0, 0)
+    d1 = datetime(2025, 3, 2, 0, 0, 0)
+    out = spread_datetimes([d0, d0, d0, d1, d1])
+    assert out[0] == d0
+    assert out[1] == datetime(2025, 3, 1, 0, 0, 1)
+    assert out[2] == datetime(2025, 3, 1, 0, 0, 2)
+    assert out[3] == d1
+    assert out[4] == datetime(2025, 3, 2, 0, 0, 1)
+
+
+def test_spread_datetimes_monotonic_across_chunk_size() -> None:
+    from datetime import datetime
+
+    from gsuid_core.ai_core.memory.ingest_time import spread_datetimes
+
+    d0 = datetime(2025, 3, 1, 0, 0, 0)
+    out = spread_datetimes([d0] * 250)
+    assert out[0] == d0
+    for i in range(1, 250):
+        prev = out[i - 1]
+        cur = out[i]
+        assert prev is not None and cur is not None
+        assert cur > prev
+        assert cur.date() == d0.date()
+
+
+def test_spread_datetimes_clamps_same_calendar_day() -> None:
+    from datetime import datetime
+
+    from gsuid_core.ai_core.memory.ingest_time import spread_datetimes
+
+    late = datetime(2025, 3, 1, 23, 59, 59)
+    out = spread_datetimes([late, late, late])
+    assert out[0] == late
+    assert out[1] is not None and out[1].date() == late.date()
+    assert out[2] is not None and out[2].date() == late.date()
+    assert out[1] > late
+    assert out[2] is not None and out[1] is not None and out[2] > out[1]
+
+
+def test_looks_like_self_history_query_skips_howto() -> None:
+    from gsuid_core.ai_core.kits.memory.kit import looks_like_self_history_query
+
+    assert looks_like_self_history_query("Have I ever formulated heat equation problems before?")
+    assert looks_like_self_history_query("What is my current address?")
+    assert looks_like_self_history_query(
+        "Can you list the order in which I brought up Green's functions from 2025-03-01 to 2025-03-31, in order?"
+    )
+    assert not looks_like_self_history_query("How do I use the plot function in MATLAB?")
+    assert not looks_like_self_history_query("How do I use Green's functions to solve a PDE?")
+
+
+def test_refine_retrieved_memory_flags_opposite_user_stances() -> None:
+    from gsuid_core.ai_core.kits.memory.kit import refine_retrieved_memory
+
+    mem = MemoryContext(
+        episodes=[
+            _episode(
+                "beam_eval_3: I've never formulated any heat equation problems before today.",
+                valid_at="2024-11-02 10:00:00",
+                eid="neg",
+            ),
+            _episode(
+                "beam_eval_3: I completed 5 heat equation problems this week.",
+                valid_at="2024-12-01 10:00:00",
+                eid="pos",
+            ),
+            _episode(
+                "assistant: Here is a curriculum on heat equations.",
+                valid_at="2024-11-03 10:00:00",
+                eid="asst",
+            ),
+        ]
+    )
+    refine_retrieved_memory(mem, "Have I ever formulated heat equation problems before?")
+    assert mem.conflicts
+    blob = "\n".join(mem.conflicts)
+    assert "never formulated" in blob
+    assert "completed 5" in blob
+
+
+def test_refine_skips_conflicts_on_latest_slot() -> None:
+    from gsuid_core.ai_core.kits.memory.kit import refine_retrieved_memory
+
+    mem = MemoryContext(
+        episodes=[
+            _episode("User: daily quota is 1,000 calls per day.", valid_at="2024-03-14 16:00:46", eid="old"),
+            _episode("User: update the daily quota to 1,200 calls per day.", valid_at="2024-03-14 16:01:06", eid="new"),
+        ]
+    )
+    refine_retrieved_memory(mem, "What is the daily call quota for the API key used in my application?")
+    assert mem.conflicts == []
+
+
+def test_timeline_query_is_not_point_lookup() -> None:
+    from gsuid_core.ai_core.kits.memory.kit import (
+        looks_like_count_query,
+        looks_like_timeline_query,
+        looks_like_self_history_query,
+    )
+
+    order_q = "Can you list the order in which I brought up Green's functions from 2025-03-01 to 2025-03-31, in order?"
+    assert looks_like_timeline_query(order_q)
+    assert looks_like_self_history_query(order_q)
+    assert looks_like_timeline_query(
+        "Can you list the order in which I brought up different aspects of developing my personal "
+        "budget tracker throughout our conversations, in order? Mention ONLY and ONLY three items."
+    )
+    assert looks_like_timeline_query(
+        "Can you provide a comprehensive summary of how my budget tracker project has progressed, "
+        "including the key features implemented"
+    )
+    assert not looks_like_timeline_query("Have I ever formulated heat equation problems before?")
+    assert not looks_like_timeline_query(
+        "How did the user feedback influence the UI/UX improvements I made before the public launch?"
+    )
+    assert looks_like_count_query("How many total problems did I practice across calculus sets?")
+    assert looks_like_count_query("我一共做了多少题")
+    assert looks_like_count_query("How many commits have been merged into the main branch of my Git repository?")
+    assert not looks_like_count_query("How many days passed between when I obtained my API key and the UI wireframe?")
+    assert not looks_like_count_query("How many weeks do I have between finishing the features and the deadline?")
+    from gsuid_core.ai_core.memory.retrieval.event_time import (
+        query_only_item_cap,
+        looks_like_order_query,
+        looks_like_duration_query,
+    )
+
+    assert looks_like_duration_query(
+        "How many days passed between when I obtained my API key and when I completed the UI wireframe?"
+    )
+    assert query_only_item_cap("Mention ONLY and ONLY three items.") == 3
+    assert query_only_item_cap("Mention ONLY and ONLY five items.") == 5
+    assert query_only_item_cap("Please list 3 items") == 3
+    assert query_only_item_cap("列出5条") == 5
+    assert not looks_like_order_query("Mention ONLY and ONLY three items.")
+    assert not looks_like_count_query("What is my current address?")
+    assert not looks_like_count_query("这个多少钱")
+    assert not looks_like_count_query("外面多少度")
+
+
+def test_refine_temporal_keeps_window_ends() -> None:
+    from datetime import datetime, timedelta
+
+    from gsuid_core.ai_core.kits.memory.kit import refine_retrieved_memory
+
+    t0 = datetime(2025, 3, 1, 12, 0, 0)
+    eps = [
+        _episode(
+            f"day {d}",
+            valid_at=(t0 + timedelta(days=d)).strftime("%Y-%m-%d %H:%M:%S"),
+            eid=f"d{d}",
+        )
+        for d in range(30)
+    ]
+    mem = MemoryContext(episodes=eps, temporal_mode=True)
+    refine_retrieved_memory(mem, "list the order from 2025-03-01 to 2025-03-31 in order")
+    ids = [e["id"] for e in mem.episodes]
+    assert "d0" in ids
+    assert "d29" in ids
+    assert len(ids) == 30
+
+
+def test_to_prompt_text_temporal_keeps_dense_user_turns() -> None:
+    from datetime import datetime, timedelta
+
+    t0 = datetime(2025, 3, 1)
+    eps = [
+        _episode(
+            f"beam_eval_3: March topic unique-{i}",
+            valid_at=(t0 + timedelta(days=i)).strftime("%Y-%m-%d 00:00:00"),
+            eid=f"m{i}",
+        )
+        for i in range(25)
+    ]
+    mem = MemoryContext(
+        episodes=eps,
+        temporal_mode=True,
+        time_range=(datetime(2025, 3, 1), datetime(2025, 4, 1)),
+    )
+    text = mem.to_prompt_text(max_chars=12000, query="list the order from 2025-03-01 to 2025-03-31")
+    kept = sum(1 for i in range(25) if f"unique-{i}" in text)
+    assert kept >= 14
+    assert "unique-0" in text
+    assert "unique-24" in text
+
+
+def test_to_prompt_text_temporal_keeps_day_opener_not_homework() -> None:
+    from datetime import datetime, timedelta
+
+    t0 = datetime(2025, 3, 1, 8, 0, 0)
+    eps = []
+    for d in range(8):
+        day = t0 + timedelta(days=d)
+        eps.append(
+            _episode(
+                f"beam_eval_3: I'm starting aspect unique-{d} today.",
+                valid_at=day.strftime("%Y-%m-%d %H:%M:%S"),
+                eid=f"open{d}",
+            )
+        )
+        eps.append(
+            _episode(
+                f"beam_eval_3: I scored 85% on 10 homework problems unique-hw-{d}.",
+                valid_at=(day + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S"),
+                eid=f"hw{d}",
+            )
+        )
+    mem = MemoryContext(
+        episodes=eps,
+        temporal_mode=True,
+        time_range=(datetime(2025, 3, 1), datetime(2025, 4, 1)),
+    )
+    text = mem.to_prompt_text(max_chars=12000, query="list the order from 2025-03-01 to 2025-03-31 in order")
+    assert "unique-0" in text
+    assert "unique-7" in text
+    skel = text.split("【相关对话片段】")[0]
+    assert "unique-0" in skel
+    assert "unique-hw-0" not in skel
+    assert "unique-hw-7" not in skel
+
+
+def test_to_prompt_text_summary_keeps_late_milestones() -> None:
+    pad = " implementation notes and review comments. " * 10
+    eps = []
+    for i in range(12):
+        month = 3 + (i // 2)
+        day = 1 + (i % 2) * 10
+        extra = " Redis lockout and Confluence docs." if i == 11 else f" early auth flask week {i}."
+        eps.append(
+            _episode(
+                f"User: Budget tracker update{extra}{pad} MVP deadline April 15.",
+                valid_at=f"2024-{month:02d}-{day:02d} 10:00:00",
+                eid=f"e{i}",
+            )
+        )
+    mem = MemoryContext(episodes=eps)
+    text = mem.to_prompt_text(
+        max_chars=3500,
+        query=(
+            "Can you provide a comprehensive summary of how my budget tracker project has progressed, "
+            "including the key features implemented, the development timeline, security enhancements, "
+            "and documentation efforts?"
+        ),
+    )
+    assert "Redis lockout" in text
+    assert "Confluence" in text
+
+
+def test_to_prompt_text_count_query_keeps_latest_not_old_tail() -> None:
+    pad = " repository history notes and review comments. " * 12
+    eps = [
+        _episode(
+            f"User: my repository had {150 + i} commits merged into main.{pad}",
+            valid_at=f"2024-04-{i + 1:02d} 10:00:00",
+            eid=f"c{i}",
+        )
+        for i in range(8)
+    ]
+    mem = MemoryContext(episodes=eps)
+    text = mem.to_prompt_text(
+        max_chars=2800,
+        query="How many commits have been merged into the main branch of my Git repository?",
+    )
+    assert "157 commits" in text
+    assert "150 commits" not in text

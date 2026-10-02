@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Union, Literal, Optional, Sequence
 from asyncio import Event as AsyncEvent
+from datetime import datetime
 
 from pydantic_ai.messages import UserContent, ModelMessage
 
@@ -42,6 +43,7 @@ class RunOnceHost:
     dynamic_tools: bool | None
     wall_clock_budget: float | None
     capability_node_id: str
+    turn_clock: datetime | None
     _session_logger: AISessionLogger
     _run_sent_texts: set[str]
     _run_disputes: list[str]
@@ -85,6 +87,20 @@ class RunOnceHost:
         raise NotImplementedError
 
     def _model_declares_video(self) -> bool:
+        raise NotImplementedError
+
+    async def _lightweight_text_rewrite(self, rewrite_message: str, *, max_tokens: int | None = None) -> str:
+        raise NotImplementedError
+
+    def _ooc_hard_hit(self, text: str, ev: Event | None) -> output_firewall.FirewallHit | None:
+        raise NotImplementedError
+
+    async def _ooc_recover_persona_voice(
+        self,
+        hit: output_firewall.FirewallHit,
+        original: str,
+        ev: Event | None,
+    ) -> str:
         raise NotImplementedError
 
     async def _resolve_output_gate_after_run(

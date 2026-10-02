@@ -166,9 +166,7 @@ def test_batch_delete_retries_file_after_sql_success(tmp_path: Path, monkeypatch
                 session.add(_record("a" * 16, "common/a.png"))
                 await session.commit()
             operation, _ = await deletion.create_delete_preview("owner@example.com")
-            operation = await deletion.confirm_delete_operation(
-                operation.operation_id, "owner@example.com", "DELETE 1"
-            )
+            operation = await deletion.confirm_delete_operation(operation.operation_id, "owner@example.com", "DELETE 1")
 
             original_unlink = Path.unlink
             failed_once = False
@@ -365,9 +363,7 @@ def test_frontend_api_contract(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     asyncio.run(run())
 
 
-def test_list_selection_metadata_and_persona_folder_semantics(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_list_selection_metadata_and_persona_folder_semantics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         engine, maker = await _database(tmp_path, monkeypatch)
         try:

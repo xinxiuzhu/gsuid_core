@@ -62,6 +62,10 @@ class CreateNodeRequest(BaseModel):
     tool_names: List[str] = Field(default_factory=list, description="显式工具白名单（按名）")
     tool_query: str = Field("", description="可选：再做一次向量检索补充工具的查询词")
     boundary_override: str = Field("", description="可选：覆写 task-mode 交付边界（空=框架默认）")
+    master_only: Optional[bool] = Field(
+        None,
+        description="仅主人可触发。白名单含高危执行工具时即使用 false 也会被运行时锁成仅主人",
+    )
     base: Optional[str] = Field(None, description="（可选）以哪个已存在节点为模板复制字段，再用本请求覆盖")
 
 
@@ -76,6 +80,7 @@ class PatchNodeRequest(BaseModel):
     tool_names: Optional[List[str]] = None
     tool_query: Optional[str] = None
     boundary_override: Optional[str] = None
+    master_only: Optional[bool] = None
 
 
 # ─────────────────────────────────────────────
@@ -87,6 +92,10 @@ class PatchNodeRequest(BaseModel):
 async def list_capability_agents(
     _: Dict[str, Any] = Depends(require_auth),
     source: Optional[str] = Query(None, description="按来源筛选：builtin / plugin / user / persona"),
+    delegable: bool = Query(
+        False,
+        description="仅可委派节点：排除 persona 投影与 capability_evaluator",
+    ),
 ) -> Dict[str, Any]:
     """列出所有节点（含 ``source`` 与 ``plugin`` 来源插件名）。
 
@@ -94,10 +103,17 @@ async def list_capability_agents(
     """
     from gsuid_core.ai_core.capability_agents.persistence import _node_to_dto
 
-    include_persona = source is None or source == "persona"
+    include_persona = (source is None or source == "persona") and not delegable
     items: List[AgentNodeDTO] = [_node_to_dto(n) for n in list_nodes(include_persona=include_persona)]
     if source:
         items = [x for x in items if "source" in x and x["source"] == source]
+    if delegable:
+        items = [
+            x
+            for x in items
+            if ("source" not in x or x["source"] != "persona")
+            and ("node_id" not in x or x["node_id"] != "capability_evaluator")
+        ]
     return {"status": 0, "msg": "ok", "data": {"items": items, "count": len(items)}}
 
 
@@ -133,6 +149,12 @@ async def create_capability_agent(
         return {"status": 1, "msg": f"节点 {body.node_id} 已存在，请改用 PATCH 编辑", "data": None}
 
     base_node = get_node(body.base) if body.base else None
+    if body.master_only is not None:
+        master_only = body.master_only
+    elif base_node is not None:
+        master_only = base_node.master_only
+    else:
+        master_only = False
     node = AgentNode(
         node_id=body.node_id,
         display_name=body.display_name or (base_node.display_name if base_node is not None else body.node_id),
@@ -152,6 +174,7 @@ async def create_capability_agent(
         ),
         tool_query=body.tool_query or (base_node.tool_query if base_node is not None else ""),
         boundary_override=body.boundary_override or (base_node.boundary_override if base_node is not None else ""),
+        master_only=master_only,
         source="user",
     )
 
@@ -202,6 +225,7 @@ async def patch_capability_agent(
         boundary_override=(
             body.boundary_override if body.boundary_override is not None else existing.boundary_override
         ),
+        master_only=body.master_only if body.master_only is not None else existing.master_only,
         source="user",
     )
     register_agent_node(patched)

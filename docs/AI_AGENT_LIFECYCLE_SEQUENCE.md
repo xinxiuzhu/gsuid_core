@@ -1270,9 +1270,11 @@ fire_hooks(RETRIEVE_CONTEXT, ctx)        # 内核唯一动作
 ```text
 # 私聊：不注入 IM 历史（pydantic_ai session.history 已覆盖，避免破坏缓存前缀）
 # 评测 HTTP 可传入 history_context="" 跳过
-raw = history_manager.get_history(...) if group else []
-history = raw[:-1]                          # 去掉本轮（已在 payload）
-rag_context = "【历史对话】\n" + format_history_for_agent(...)
+raw = history_manager.get_history(...)      # 群 deque 全窗
+records = raw[:-1]                          # 去掉本轮（已在 payload）
+[与你的对话] 当前说话人的 user 句（含未点名）+ 机器人出站，从新到旧凑满 14 条
+  纯 <SILENCE> 不注入；本轮出站句柄写入该格，追问时 read_handle
+[历史对话] 最近 20 条里的他人 user 句，最多 6 条
 ```
 
 ### 9.4 动态上下文唯一顺序（`CONTEXT_BLOCK_ORDER` + 合成器）
@@ -1714,9 +1716,9 @@ session_log entries（磁盘，可稍后刷）：
 
 | 条件 | 行为 | 原因 |
 |------|------|------|
-| `is_subagent` 或 `create_by ∈ {CapabilityAgent, AutoPlanner}` | **跳过** `scrub_or_fallback`（roleplay OOC） | 事实包必含 `res_` / `artifact_put` / `render_agent` 等「框架泄漏」形态词；若 scrub 会整段换成中性兜底句 → 主人格误判失败 |
+| `is_subagent` 或 `create_by ∈ {CapabilityAgent, AutoPlanner}` | **跳过** roleplay OOC scrub | 事实包必含 `res_` / `artifact_put` / `render_agent` 等「框架泄漏」形态词；若 scrub 会整段丢弃 → 主人格误判失败 |
 | 同上 | 仅 `is_tech_dump` → 替换为短错误摘要 | 仍防堆栈回灌 |
-| 其它 Chat 等 return 消费方 | 仍可 scrub | 对用户可见出口保持防火墙 |
+| 其它 Chat 等 return 消费方 | 仍可 scrub（`_ooc_recover_persona_voice` 让人格重说一句，两次不行就原样返回） | 对用户可见出口保持防火墙 |
 
 `create_subagent` 对 capability 回执：
 

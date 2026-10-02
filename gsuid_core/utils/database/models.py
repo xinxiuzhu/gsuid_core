@@ -1,4 +1,5 @@
-from typing import Any, Dict, List, Type, Union, Optional, Sequence
+import asyncio
+from typing import Any, Dict, List, Union, Optional, Sequence
 
 from sqlmodel import Field, Index, col, select, update
 from sqlalchemy import Row, UniqueConstraint, or_, func, delete, distinct
@@ -20,7 +21,24 @@ from .base_models import (
     BaseIDModel,
     BaseBotIDModel,
     with_session,
+    with_read_session,
 )
+
+# 订阅表没有唯一约束。锁要包住提交，第二条才能看见第一条。
+_OWNER_SUBSCRIBE_LOCK: asyncio.Lock | None = None
+_OWNER_SUBSCRIBE_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+def _owner_subscribe_lock() -> asyncio.Lock:
+    """锁绑在当前事件循环上。测试里多次 asyncio.run 不能复用上一轮的锁。"""
+    global _OWNER_SUBSCRIBE_LOCK, _OWNER_SUBSCRIBE_LOOP
+    loop = asyncio.get_running_loop()
+    lock = _OWNER_SUBSCRIBE_LOCK
+    if lock is None or _OWNER_SUBSCRIBE_LOOP is not loop:
+        lock = asyncio.Lock()
+        _OWNER_SUBSCRIBE_LOCK = lock
+        _OWNER_SUBSCRIBE_LOOP = loop
+    return lock
 
 
 class Subscribe(BaseModel, table=True):
@@ -42,6 +60,45 @@ class Subscribe(BaseModel, table=True):
     uid: Optional[str] = Field(title="账户ID", default=None, index=True)
     extra_data: Optional[str] = Field(title="额外消息2", default=None)
     msg_id: Optional[str] = Field(title="消息ID", default=None)
+
+    @classmethod
+    async def ensure_owner(cls, event: Event) -> None:
+        """确认主人订阅。锁包住提交，并发调用只会留下一行。"""
+        async with _owner_subscribe_lock():
+            await cls._ensure_owner_row(event)
+
+    @classmethod
+    @with_session
+    async def _ensure_owner_row(cls, session: AsyncSession, event: Event) -> None:
+        stmt = select(cls).where(
+            col(cls.user_id) == event.user_id,
+            col(cls.task_name) == "主人用户",
+            col(cls.bot_id) == event.bot_id,
+        )
+        result = await session.execute(stmt)
+        blank: Optional["Subscribe"] = None
+        for row in result.scalars().all():
+            if not isinstance(row, cls):
+                continue
+            if row.WS_BOT_ID == event.WS_BOT_ID:
+                return
+            if not row.WS_BOT_ID and blank is None:
+                blank = row
+        if blank is not None:
+            blank.WS_BOT_ID = event.WS_BOT_ID
+            return
+        session.add(
+            cls(
+                user_id=event.user_id,
+                bot_id=event.bot_id,
+                group_id=event.group_id,
+                task_name="主人用户",
+                bot_self_id=event.bot_self_id,
+                user_type=event.user_type,
+                WS_BOT_ID=event.WS_BOT_ID,
+                msg_id=event.msg_id,
+            )
+        )
 
     async def send(
         self,
@@ -258,16 +315,16 @@ class CoreUser(BaseBotIDModel, table=True):
         return len(to_delete_ids)
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_all_user(
         cls,
         session: AsyncSession,
     ):
-        result: Optional[Sequence[Type["CoreUser"]]] = await cls.select_rows(True)
+        result: Sequence["CoreUser"] = await cls.select_rows(True)
         return result
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_all_user_list(
         cls,
         session: AsyncSession,
@@ -280,7 +337,7 @@ class CoreUser(BaseBotIDModel, table=True):
         return data
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_distinct_user_count(
         cls,
         session: AsyncSession,
@@ -290,17 +347,17 @@ class CoreUser(BaseBotIDModel, table=True):
         return int(result.scalar_one() or 0)
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_group_all_user(
         cls,
         session: AsyncSession,
         group_id: str,
     ):
-        result: Optional[Sequence[Type["CoreUser"]]] = await cls.select_rows(group_id=group_id)
+        result: Sequence["CoreUser"] = await cls.select_rows(group_id=group_id)
         return result
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_group_all_user_count(
         cls,
         session: AsyncSession,
@@ -310,8 +367,35 @@ class CoreUser(BaseBotIDModel, table=True):
         return len(result) if result else 0
 
     @classmethod
-    @with_session
     async def insert_user(
+        cls,
+        bot_id: str,
+        user_id: str,
+        group_id: Optional[str],
+        user_name: Optional[str],
+        user_icon: Optional[str],
+    ) -> int:
+        # 每条消息都会进来。画像没变时只读，不占写闸门。
+        matched = await cls.base_select_data(
+            bot_id=bot_id,
+            user_id=user_id,
+            group_id=group_id,
+            user_name=user_name,
+            user_icon=user_icon,
+        )
+        if matched is not None:
+            return 1
+        return await cls._insert_user_if_changed(
+            bot_id,
+            user_id,
+            group_id,
+            user_name,
+            user_icon,
+        )
+
+    @classmethod
+    @with_session
+    async def _insert_user_if_changed(
         cls,
         session: AsyncSession,
         bot_id: str,
@@ -425,16 +509,16 @@ class CoreGroup(BaseBotIDModel, table=True):
         return len(to_delete_ids)
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_all_group(
         cls,
         session: AsyncSession,
-    ) -> Sequence[Type["CoreGroup"]]:
-        result: Optional[Sequence[Type["CoreGroup"]]] = await cls.select_rows(True)
+    ) -> Sequence["CoreGroup"]:
+        result: Sequence["CoreGroup"] = await cls.select_rows(True)
         return result
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_all_group_list(
         cls,
         session: AsyncSession,
@@ -447,7 +531,7 @@ class CoreGroup(BaseBotIDModel, table=True):
         return data
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_distinct_group_count(
         cls,
         session: AsyncSession,

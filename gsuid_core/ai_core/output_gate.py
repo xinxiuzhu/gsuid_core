@@ -207,6 +207,26 @@ def _eval_angle_bracket(
     if not tags:
         return None
 
+    if ab.looks_like_dated_or_ordered_answer(text):
+        cleaned = ab.sanitize_illegal_angle_tags(text)
+        if cleaned and not ab.has_illegal_angle_tags(cleaned):
+            logger.warning(
+                i18n_t(
+                    "log.ai.output_gate_angle_bracket_rewrite",
+                    attempts=0,
+                    max_retries=ab.MAX_RETRIES,
+                    channel=channel,
+                    tags=repr(tags[:4]),
+                    preview=repr(text[:80]),
+                )
+            )
+            return GateResult(
+                decision=GateDecision.FALLBACK,
+                policy="angle_bracket",
+                send_text=cleaned,
+                detail="sanitized_list",
+            )
+
     attempts = _record_block(extra, "angle_bracket", text, count_attempt=count_attempt)
     if attempts >= ab.MAX_RETRIES:
         _set_abort(extra, "angle_bracket")
@@ -246,13 +266,6 @@ def _eval_angle_bracket(
 
 
 # ── 策略：ooc ───────────────────────────────────────────────────────
-
-
-def _persona_from_extra(extra: Dict[str, Any]) -> str | None:
-    if "persona_name" not in extra:
-        return None
-    raw = extra["persona_name"]
-    return raw if isinstance(raw, str) and raw else None
 
 
 def _extra_turn_id(extra: Dict[str, Any]) -> str:
@@ -304,25 +317,22 @@ def _eval_ooc(
         return None
 
     if hit.category == "machine_dump":
+        # 主通道也走重写：技术堆栈不该由框架罐头代答，改由当前人格自己重说一句
+        # （defer_ooc → run 末 _ooc_rewrite_and_send）。工具通道无 run，当场打回。
         if channel == "main":
             logger.warning(
                 i18n_t(
-                    "log.ai.output_gate_ooc_fallback_machine_dump",
+                    "log.ai.output_gate_ooc_rewrite_machine_dump_main",
                     preview=repr(text[:80]),
                 )
             )
-            return GateResult(
-                decision=GateDecision.FALLBACK,
-                policy="ooc",
-                send_text=of.fallback_machine_text(_persona_from_extra(extra)),
-                ooc_hit=hit,
-                detail=hit.category,
-            )
-        logger.warning(i18n_t("log.ai.output_gate_ooc_rewrite_machine_dump_tool"))
+        else:
+            logger.warning(i18n_t("log.ai.output_gate_ooc_rewrite_machine_dump_tool"))
         return GateResult(
             decision=GateDecision.REWRITE,
             policy="ooc",
             feedback=of.build_rewrite_warning(hit),
+            defer_ooc=channel == "main",
             ooc_hit=hit,
             detail=hit.category,
         )
@@ -399,13 +409,21 @@ def _eval_ooc(
 
     if channel == "tool":
         mark_ooc_reminded(extra)
-    logger.warning(
-        i18n_t(
-            "log.ai.output_gate_ooc_defer" if channel == "main" else "log.ai.output_gate_ooc_rewrite_first_warn",
-            category=hit.category,
-            matched=repr(hit.matched[:4]),
+        logger.warning(
+            i18n_t(
+                "log.ai.output_gate_ooc_rewrite_first_warn",
+                category=hit.category,
+                matched=repr(hit.matched[:4]),
+            )
         )
-    )
+    else:
+        logger.warning(
+            i18n_t(
+                "log.ai.output_gate_ooc_defer",
+                category=hit.category,
+                matched=repr(hit.matched[:4]),
+            )
+        )
     return GateResult(
         decision=GateDecision.REWRITE,
         policy="ooc",

@@ -96,11 +96,12 @@ uv run core --dev                          # 只加载目录名以 -dev 结尾�
 uv run core --host 0.0.0.0 --port 9527     # CLI 覆盖不写回文件
 ```
 
+`dev` 组是 uv 的默认组（`pyproject.toml` 的 `default-groups`），所以 `uv sync` 会连
+ruff / basedpyright / pytest 一起装，交付闸才开箱可跑。**生产镜像与部署环境用
+`uv sync --no-dev`**（`Dockerfile` 已如此），别把测试工具打进线上 venv。
+
 ```sh
-# 检查
-uv run ruff check gsuid_core tests eval
-uv run ruff format --check gsuid_core tests eval
-uv run pytest tests/test_interaction_scaffold.py -q
+# 检查命令见下「交付闸」——改完必须全绿，否则不算完成
 ```
 
 实机评测必须打**已启动且加载全部插件**的 core（不要 `--dev`）：
@@ -123,6 +124,22 @@ uv run core --port 8765
 - 行宽 120（ruff）；`#` 注释更严，见 §1.6。
 - 改交互脚手架必须跑 `tests/test_interaction_scaffold.py`（正反双向）。
 - 改工具 docstring / covers：`tests/test_ai_tool_docstrings.py`。
+- 框架 `logger.*` 必须走 `t()` / `i18n_t()`，**第一参必须是静态字符串 key**（`log.<module>.<semantic>`）；禁止三元 / 拼接 / 变量当 key。改日志或 locale 必须跑 `tests/test_logger_i18n.py`（即 `.github/workflows/i18n.yml`）。
+
+## 交付闸（改完必须过，否则不算完成）
+
+**每次改动在向用户宣告完成之前**，必须在仓库根目录把下面全部跑绿。缺一项、失败一项都不许交付：
+
+```sh
+uv run ruff check gsuid_core tests eval
+uv run ruff format --check gsuid_core tests eval
+uv run pytest tests -q
+uv run basedpyright
+```
+
+- **CI**：当前仓库 CI 含 i18n 守门（`tests/test_logger_i18n.py`）。`pytest tests` 已覆盖；若只改了触及面，至少跑触及测试 **加上** `tests/test_logger_i18n.py`。
+- **pyright**：`basedpyright` 与 `pyright` 择一，配置见 `pyrightconfig.json`（`basic`，排除 `plugins` / `data`）。新增标红必须按 §1.5 修掉，禁止 `cast` / `type: ignore` / `Any` 糊弄。
+- 装配 / 闸门 / 每轮注入 / 启动顺序：单测全绿仍不够，还要对照 `eval/agent` 群聊基准（见上）。
 
 ## Security notes
 
@@ -270,21 +287,23 @@ deleted = result.rowcount if isinstance(result, CursorResult) else 0
 
 GsCore 是**通用框架**：部署者自己写人格卡、自己装插件。框架运行时**不得**假定某个具体人格或某个业务垂直存在。
 
-**人格锁定（禁止）**：框架代码、用户可见兜底、闸门、脚手架、分类器、规划提示 **不得**写死某个角色的姓名、口癖、自称、出身或道具梗（如「早柚」「唔…」「呼」「zzz」「卷轴」「本貉」）。口癖配额 / 结尾语气词必须从**当前人格卡**解析（Tone Markers 等）；卡上没有就当无口癖。末端兜底必须人格中性，禁止用默认角色的口头禅冒充中性。
+**人格锁定（禁止）**：框架代码、用户可见兜底、闸门、脚手架、分类器、规划提示 **不得**写死某个角色的姓名、口癖、自称、出身或道具梗（如「早柚」「唔…」「呼」「zzz」「卷轴」「本貉」）。口癖配额 / 结尾语气词必须从**当前人格卡**解析（Tone Markers 等）；卡上没有就当无口癖。**框架不替人格说话**：命中闸门一律让当前人格自己重说一句，**不允许任何预设罐头文案**（§1.9）。两次都不干净时人格/一致性类**原样发送**（出戏闸不该吃掉整轮对话），`fund_claim` / `machine_dump` 与模型主动沉默才发 `<SILENCE>`。
 
 **能力锁定（禁止）**：框架意图分类 / 规划 / 路由 / 提示词 **不得**内置业务垂直词表（游戏练度/圣遗物/命座、股票/研报/模拟盘、把某城市天气写进核心特判等）。插件能力只许插件自己声明：`covers` / 带领域前缀的 `aliases` / `capability_domain` / `ai_entity` / `ai_alias`。框架只做确定性查表 + 向量召回，不在核心维护「这个词属于哪款游戏 / 哪条业务线」。禁止为某个业务域写栏目词表、猜分隔约定、把插件名写进装配路径。
 
 ```python
 # ❌ 框架把默认人格的口癖写进运行时
 if text.endswith(("zzz", "呼", "唔")): ...
-PERSONA_FALLBACK_TEXT = "唔…这个不太想说呢…"
+# ❌ 框架用预设文案冒充人格发言（2026-09 起彻底禁止）
+clean_text = "这个不太想说呢。"
 
 # ❌ 框架意图词表收插件专属域词
 KNOWLEDGE_NOUNS = {"圣遗物", "命座", "元素精通", "模拟盘"}
 
-# ✅ 口癖从当前人格卡解析；兜底中性
+# ✅ 口癖从当前人格卡解析；命中闸门让当前人格自己重说一句
 markers = get_tone_markers(persona_name)
-PERSONA_FALLBACK_TEXT = "这个不太想说呢。"
+rewritten = await self._ooc_recover_persona_voice(hit, original, ev)  # 空串 = 沉默
+
 
 # ✅ 垂直能力由插件自描述，框架不内置词表
 @ai_tools(covers=["…"], aliases=["领域A·能力X"], capability_domain="…")
@@ -298,6 +317,11 @@ PERSONA_FALLBACK_TEXT = "这个不太想说呢。"
 - 插件代码；评测 / 单测用某个已启用人格名做寻址 fixture；历史事故注释点名具体插件。
 - HTML 模板库的通用版式名（metrics / ranking / weather 卡片）是可视化原语，不是路由特判。
 - 遗留的游戏 UID / Cookie / Enka 工具在 `utils/`，服务已装插件，不进 AI 路由词表。
+
+### 1.10 未过交付闸禁止宣告完成
+
+改完必须把「交付闸」跑绿（ruff / format / `pytest tests` / basedpyright，以及 CI 的 i18n）。
+缺项或失败不许说做完。`i18n_t()` / `t()` 的 key 必须是静态字符串，禁止三元表达式。
 
 ---
 
@@ -739,5 +763,6 @@ bot = Bot(_bot, mock_ev)
 5. **代码组织 → 相关方法封装在类中，使用 dataclass/TypedDict 定义数据结构**
 6. **Bot 类型 → 插件/触发器用 `Bot`（高层），框架内部用 `_Bot`（底层），禁止混用**
 7. **注释精简 → `#` 注释最多两行、每行 ≤88 字，只写「为什么/坑/边界」，不复述代码**
+8. **交付闸 → ruff / format / pytest / basedpyright（及 CI 的 i18n）全绿才允许说做完**
 
 专题细节按 Skills 表按需加载，不要把整本 `references/` 一次读完。

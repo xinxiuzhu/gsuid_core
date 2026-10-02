@@ -189,6 +189,7 @@ SESSION_ENTRY_TYPES: frozenset[str] = frozenset(
         # 前缀缓存失配探针（每 run 一条，data.reason 见 PrefixBreakReason）
         "prefix_break",
         "outbound_audit",
+        "task_ack",
     }
 )
 
@@ -679,7 +680,10 @@ class AISessionLogger:
         image_id: str,
         topic: str,
         target_user: str,
+        bubble_index: int = 0,
+        bubble_total: int = 1,
     ) -> None:
+        """记录一条实际下发的消息。``bubble_*`` 标出主通道拆条后的位置。"""
         self._add_entry(
             "outbound_audit",
             {
@@ -688,6 +692,8 @@ class AISessionLogger:
                 "image_id": image_id,
                 "topic": topic,
                 "target_user": target_user,
+                "bubble_index": bubble_index,
+                "bubble_total": bubble_total,
             },
         )
 
@@ -770,6 +776,10 @@ class AISessionLogger:
     def log_text_output(self, content: str) -> None:
         """记录模型直接输出的文本"""
         self._add_entry("text_output", {"content": content})
+
+    def log_task_ack(self, content: str, *, source: str) -> None:
+        """记录框架补发的接任务应（persona.json 配置句）。"""
+        self._add_entry("task_ack", {"content": content, "source": source})
 
     def log_result(self, output: Any, tool_calls: List[str]) -> None:
         """记录单次 run 的最终结果"""

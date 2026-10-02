@@ -395,9 +395,7 @@ async def update_rule(
     final_scope_type = str(updates.get("scope_type", rule.scope_type))
     final_scope_id = str(updates.get("scope_id", rule.scope_id))
     final_member_id = str(updates.get("member_id", rule.member_id))
-    normalized_scope_id, normalized_member_id = _normalize_rule_scope(
-        final_scope_type, final_scope_id, final_member_id
-    )
+    normalized_scope_id, normalized_member_id = _normalize_rule_scope(final_scope_type, final_scope_id, final_member_id)
     updates["scope_id"] = normalized_scope_id
     updates["member_id"] = normalized_member_id
 

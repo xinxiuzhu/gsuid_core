@@ -35,7 +35,7 @@ async def send_meme_record(
     """发送一条已选中的表情记录，并统一记录使用次数与上下文元数据。"""
     file_path = get_memes_base_path() / record.file_path
     if not file_path.exists():
-        logger.warning(t("[Meme] 表情包文件不存在: {file_path}", file_path=file_path))
+        logger.warning(t("log.meme.file_missing", file_path=file_path))
         return False
 
     image_data = await _read_file(file_path)
@@ -57,7 +57,7 @@ async def send_meme_record(
     await AiMemeRecord.record_usage(record.meme_id, ev.group_id or "")
     logger.info(
         t(
-            "[Meme] 发送表情包: {p0} (mood={mood}, scene={scene}, persona={persona_name})",
+            "log.meme.send_with_context",
             p0=record.meme_id,
             mood=mood,
             scene=scene,

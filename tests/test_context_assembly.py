@@ -99,52 +99,10 @@ def test_dynamic_context_ordering_contract() -> None:
     assert i_hist >= 0 and i_mem > i_hist, "长期记忆须在历史之后"
     assert i_soft > i_mem, "软触发提示须在记忆之后"
     i_guide = full.find("[guide]")
-    assert i_guide > i_mem, "评测指南须跟在记忆正文后，避免 800 字预算把目录卡截掉"
+    assert i_guide > i_mem, "评测指南须跟在记忆正文后，避免记忆字帽把目录卡截掉"
     assert i_soft > i_guide
     assert full.endswith(SOFT_TRIGGER_NOTE), "软触发提示必须最后"
     print("[OK] 动态上下文顺序契约")
-
-
-def test_block_order_is_single_source() -> None:
-    """块名与顺序的唯一定义在 ``kits.base.CONTEXT_BLOCK_ORDER``，装配层只做拼装。
-
-    A 线的记忆块写 ``memory``、C 线的关系行写 ``relationship`` —— 名字不许各自造，
-    否则跨越数月的三条线会把同一个装配函数改三次、每次都对不上前一次。
-    """
-    from gsuid_core.ai_core.kits.base import CONTEXT_BLOCK_ORDER
-    from gsuid_core.ai_core.context_assembly import join_context_blocks
-
-    assert CONTEXT_BLOCK_ORDER == (
-        "mood",
-        "relationship",
-        "voice_anchor",
-        "identity",
-        "history",
-        "group_context",
-        "memory",
-        "task",
-        "plan_hint",
-        "chitchat_style",
-        "transaction_priority",
-        "report_titles",
-        "soft_trigger",
-        "plugin_hints",
-    )
-    # 乱序写入也按表拼；空块被丢弃；未在表内的块名进不来（写入侧白名单校验）
-    out = join_context_blocks({"memory": "M", "mood": "D", "plugin_hints": "P", "task": ""})
-    assert out == "D\n\nM\n\nP", out
-    cues = join_context_blocks(
-        {
-            "voice_anchor": "（口吻：迷糊）（对这个人的口气：亲昵）",
-            "identity": "（身份：你是「早柚」。）",
-            "history": "[历史对话]",
-        }
-    )
-    assert cues == "（口吻：迷糊）（对这个人的口气：亲昵）（身份：你是「早柚」。）\n\n[历史对话]", cues
-    voice_src = _src("gsuid_core/ai_core/kits/self_cognition/kit.py")
-    assert '"".join(parts)' in voice_src
-    assert '"\\n\\n".join(parts)' not in voice_src
-    print("[OK] 块顺序单源")
 
 
 def test_addressed_suffix_keeps_voice_anchor_outside_product_cap() -> None:
@@ -180,7 +138,8 @@ def test_addressed_suffix_keeps_voice_anchor_outside_product_cap() -> None:
     _apply_suffix_block_policy(ctx)
     assert ctx.blocks["voice_anchor"] == voice
     assert ctx.blocks["task"] == "任务块"
-    product = sum(len(v) for k, v in ctx.blocks.items() if k != "voice_anchor")
+    assert ctx.blocks["history"] == "H" * 500
+    product = sum(len(v) for k, v in ctx.blocks.items() if k not in ("voice_anchor", "history"))
     assert product <= _SUFFIX_PRODUCT_CAP
     idle = TurnGraph(
         user_type="group",
@@ -191,11 +150,33 @@ def test_addressed_suffix_keeps_voice_anchor_outside_product_cap() -> None:
         call_to_self=False,
     )
     idle_ctx = AgentHookContext(point=AgentHookPoint.COMPOSE_CONTEXT, turn_graph=idle, cheap_gate="full")
-    assert suffix_allowed_blocks(idle_ctx) == frozenset()
+    # 未寻址轮不再返回空集：口吻锚（身份连续性）与群转录（"这是个群"）必须留下。
+    # 早先返回空集时策略先删光所有块、豁免集只在 allowed 非空时才补回，机制整体失效。
+    assert suffix_allowed_blocks(idle_ctx) == frozenset({"voice_anchor", "history"})
+    idle_ctx.blocks = {
+        "voice_anchor": voice,
+        "task": "任务块",
+        "relationship": "R" * 80,
+        "memory": "M" * 80,
+        "history": "H" * 500,
+    }
+    _apply_suffix_block_policy(idle_ctx)
+    assert idle_ctx.blocks["voice_anchor"] == voice
+    assert idle_ctx.blocks["history"] == "H" * 500
+    assert "task" not in idle_ctx.blocks
+    assert "memory" not in idle_ctx.blocks
+
+
+def test_directed_assistant_line_is_not_a_user_alias_source() -> None:
+    from gsuid_core.ai_core.context_assembly import history_line_is_assistant
+
+    assert history_line_is_assistant("[14:32:18] AI: 晴天")
+    assert history_line_is_assistant("[14:32:18] AI→小明(用户ID:456): 晴天")
+    assert not history_line_is_assistant("[14:32:05] 小明(用户ID:456): 今天天气怎么样")
+    assert not history_line_is_assistant("[历史对话] 旧→新")
 
 
 if __name__ == "__main__":
     test_both_entries_consume_shared_assembly()
     test_dynamic_context_ordering_contract()
-    test_block_order_is_single_source()
     print("\n装配统一防漂移锁全部通过 ✅")

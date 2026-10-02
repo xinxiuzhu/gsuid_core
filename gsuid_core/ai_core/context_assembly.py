@@ -21,7 +21,11 @@ from gsuid_core.bot import Bot
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.models import Event
-from gsuid_core.ai_core.kits.base import join_named_blocks
+from gsuid_core.ai_core.kits.base import (
+    inject_memory_cap,
+    join_named_blocks,
+    count_document_sources,
+)
 from gsuid_core.ai_core.relationship import RelationshipView
 
 if TYPE_CHECKING:
@@ -130,11 +134,19 @@ async def build_session_system_prompt(event: Event, persona_name: str, *, clock_
 
 def join_context_blocks(
     blocks: Dict[str, str],
-    create_by: str = "Chat",
-    skip_memory_cap: bool = False,
+    query: str = "",
+    memory_budget: int | None = None,
 ) -> str:
     """按 ``CONTEXT_BLOCK_ORDER`` 拼装命名块（顺序的**唯一**执行点）。"""
-    return join_named_blocks(blocks, create_by=create_by, skip_memory_cap=skip_memory_cap)
+    return join_named_blocks(blocks, query=query, memory_budget=memory_budget)
+
+
+def history_line_is_assistant(line: str) -> bool:
+    """助手历史行。普通回复是 AI:，点名回复是 AI→。"""
+    mark = "] "
+    at = line.find(mark)
+    rest = line[at + len(mark) :] if at >= 0 else line
+    return rest.startswith("AI:") or rest.startswith("AI→")
 
 
 async def assemble_dynamic_context(
@@ -200,8 +212,34 @@ async def assemble_dynamic_context(
     _ensure_kernel_blocks(ctx)
     _apply_suffix_block_policy(ctx)
     _inject_master_title_hint(ctx)
-    skip_mem = ctx.memory_eval
-    return join_context_blocks(ctx.blocks, create_by=ctx.create_by, skip_memory_cap=skip_mem), has_actionable
+    memory_text = ctx.blocks["memory"] if "memory" in ctx.blocks else ""
+    text = join_context_blocks(
+        ctx.blocks,
+        query=ctx.query,
+        memory_budget=inject_memory_cap(
+            ctx.query,
+            covered=ctx.memory_covered,
+            n_doc_sources=count_document_sources(memory_text),
+        ),
+    )
+    from gsuid_core.ai_core.self_cognition import load_speaker_preference_tail
+
+    tail = await load_speaker_preference_tail(bot_id, user_id)
+    if tail:
+        text = f"{text}\n\n{tail}" if text else tail
+    from gsuid_core.ai_core.entity_index import format_alias_bindings
+
+    # 只扫用户原话和用户历史行。助手自己提过的角色名不算本轮归属。
+    alias_lines = [query]
+    for line in history_context.splitlines():
+        if history_line_is_assistant(line):
+            continue
+        alias_lines.append(line)
+    alias_note = format_alias_bindings("\n".join(alias_lines))
+    if alias_note:
+        text = f"{text}\n\n{alias_note}" if text else alias_note
+        logger.debug(t("log.entity_index.alias_binding_injected", note=alias_note))
+    return text, has_actionable
 
 
 def _ensure_kernel_blocks(ctx: "AgentHookContext") -> None:
@@ -238,9 +276,9 @@ _ADDRESSED_FULL_BLOCKS: frozenset[str] = frozenset(
         "plugin_hints",
     }
 )
-# 点名 suffix 产品块合计帽；voice_anchor 在帽外。history 排最后。
+# 点名 suffix 产品块合计帽。voice_anchor 与历史线程在帽外。
 _SUFFIX_PRODUCT_CAP = 400
-_SUFFIX_EXEMPT_BLOCKS: frozenset[str] = frozenset({"voice_anchor"})
+_SUFFIX_EXEMPT_BLOCKS: frozenset[str] = frozenset({"voice_anchor", "history"})
 _SUFFIX_KEEP_ORDER: tuple[str, ...] = (
     "task",
     "plan_hint",
@@ -249,18 +287,24 @@ _SUFFIX_KEEP_ORDER: tuple[str, ...] = (
     "memory",
     "soft_trigger",
     "plugin_hints",
-    "history",
 )
 
 
 def suffix_allowed_blocks(ctx: "AgentHookContext") -> frozenset[str] | None:
-    """群聊 suffix 允许的产品块。None = 不过滤（私聊 / 无 TurnGraph）。"""
+    """群聊 suffix 允许的产品块。None = 不过滤（私聊 / 无 TurnGraph）。
+
+    未寻址轮只保留 :data:`_SUFFIX_EXEMPT_BLOCKS`（口吻锚 + 群转录）——**这两个不是
+    "被点名才给的加分项"**：口吻锚是身份连续性，群转录是"这是个群、别人在跟谁说话"
+    的唯一证据。早先这里返回空集，而 :func:`_apply_suffix_block_policy` 会先删光不在
+    ``allowed`` 里的块、豁免集却只在 ``allowed`` 非空时才补回，于是豁免机制在未寻址
+    路径上整体失效：软触发轮同时丢掉上文与人格锚，模型只剩一条光消息，只能猜指代。
+    """
     tg = ctx.turn_graph
     if tg is None or not tg.is_group:
         return None
     addressed = bool(tg.call_to_self or tg.ellipsis_followup or tg.task_management)
     if not addressed:
-        return frozenset()
+        return _SUFFIX_EXEMPT_BLOCKS
     return _ADDRESSED_FULL_BLOCKS
 
 

@@ -2,8 +2,12 @@
 
 import time
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
+
+if not (Path(__file__).resolve().parents[1] / "gsuid_core/plugins/ProxyManager").is_dir():
+    pytest.skip("ProxyManager 插件未安装，跳过其专项测试", allow_module_level=True)
 
 from gsuid_core.plugins.ProxyManager.ProxyManager.pm_core.models import Proxy, ProxySlot
 from gsuid_core.plugins.ProxyManager.ProxyManager.pm_core.manager import ProxyManager
@@ -262,11 +266,7 @@ async def test_connect_429_switches_proxy_and_releases_on_response_close(manager
         patcher.config,
         "get_config",
         lambda key: SimpleNamespace(
-            data=(
-                ["403", "429", "502"]
-                if key == "FailureHttpCodes"
-                else _DEFAULT_CONFIG[key]
-            )
+            data=(["403", "429", "502"] if key == "FailureHttpCodes" else _DEFAULT_CONFIG[key])
         ),
     )
 

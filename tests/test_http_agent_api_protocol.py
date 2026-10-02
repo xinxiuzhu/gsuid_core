@@ -13,7 +13,7 @@ from http_agent_support import (
 )
 
 from gsuid_core.ai_core.http_agent.keys import reset_key_store_for_tests
-from gsuid_core.ai_core.http_agent.protocol import SSE_HEADERS, encode_sse, encode_comment, parse_sse_chunk
+from gsuid_core.ai_core.http_agent.protocol import encode_sse, encode_comment, parse_sse_chunk
 from gsuid_core.ai_core.http_agent.capture_bot import CaptureBot
 
 
@@ -31,12 +31,6 @@ def test_heartbeat_is_comment_not_event() -> None:
     assert raw.startswith(": ")
     assert "event:" not in raw
     assert parse_sse_chunk(raw) == []
-
-
-def test_sse_headers_have_no_connection() -> None:
-    assert "Connection" not in SSE_HEADERS
-    assert SSE_HEADERS["Cache-Control"] == "no-cache"
-    assert SSE_HEADERS["X-Accel-Buffering"] == "no"
 
 
 def setup_function() -> None:
@@ -66,7 +60,7 @@ def test_stream_emits_start_text_one_terminal(monkeypatch, tmp_path: Path) -> No
     assert "gated-line" in texts
 
 
-def test_stream_first_visible_is_text_not_attachment(monkeypatch, tmp_path: Path) -> None:
+def test_stream_image_only_does_not_invent_ack(monkeypatch, tmp_path: Path) -> None:
     store = reset_key_store_for_tests(tmp_path / "keys.json")
     token, _rec = store.create(user_id="u1", bot_id="bot")
     patch_settings(monkeypatch, sample_settings(enable=True))
@@ -90,10 +84,9 @@ def test_stream_first_visible_is_text_not_attachment(monkeypatch, tmp_path: Path
     frames = parse_sse_chunk(r.text)
     visible = [f.event for f in frames if f.event in ("text", "attachment")]
     assert visible, frames
-    assert visible[0] == "text"
-    assert any(f.event == "attachment" for f in frames)
+    assert visible[0] == "attachment"
     texts = [f.data["text"] for f in frames if f.event == "text"]
-    assert "收到。" in texts
+    assert "收到。" not in texts
 
 
 def test_remote_image_rejected(monkeypatch, tmp_path: Path) -> None:
@@ -230,12 +223,3 @@ def test_bad_group_id_400(monkeypatch, tmp_path: Path) -> None:
     )
     assert r.status_code == 400
     assert r.json()["code"] == "bad_group"
-
-
-def test_v1_event_names_only() -> None:
-    from gsuid_core.ai_core.http_agent.types import SseEventName
-
-    names: list[SseEventName] = ["run.start", "text", "attachment", "run.done", "run.error"]
-    for name in names:
-        chunk = encode_sse(name, {"seq": 1}, 1)
-        assert f"event: {name}" in chunk

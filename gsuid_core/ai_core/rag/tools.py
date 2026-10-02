@@ -1,7 +1,7 @@
 """工具向量存储 - 管理工具的入库和检索"""
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Set, Dict, List, Tuple, Union, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Set, Dict, List, Tuple, Union, Optional, Protocol, Sequence
 
 from qdrant_client.models import (
     Distance,
@@ -16,6 +16,8 @@ from gsuid_core.ai_core.register import get_all_tools, get_registered_tools
 
 if TYPE_CHECKING:
     from pydantic_ai.tools import Tool
+
+    from gsuid_core.ai_core.agent_node.tool_scope import ToolScope
 from .base import (
     TOOLS_COLLECTION_NAME,
     get_point_id,
@@ -325,6 +327,9 @@ _ENTITY_ROUTE_RECALL: int = 20
 _ENTITY_ROUTE_DEEP_RECALL: int = 60
 
 
+_NEUTRAL_PLUGINS = frozenset({"", "core", "unknown", "gsuid_core"})
+
+
 def _tool_plugin(tool_name: str) -> str:
     from gsuid_core.ai_core.register import find_tool_base
 
@@ -361,6 +366,46 @@ async def _plugins_from_scope_ambiguity(route_text: str, scope_key: str) -> List
     return uniq
 
 
+async def align_seeds_to_context_plugin(
+    found: ToolList,
+    plugin: str,
+    query: str,
+    scope: Optional["ToolScope"] = None,
+) -> ToolList:
+    """最近对白已确定插件时，丢掉别的插件工具，并用该插件的深召回补位。
+
+    当前句自己没有实体。提醒类等无插件工具保留。没有跨插件碰撞则原样返回。
+    """
+    if not plugin or not found:
+        return found
+    if scope is not None and not scope.plugin_enabled(plugin):
+        return [tool for tool in found if scope.tool_enabled(tool.name)]
+    foreign_names = {tool.name for tool in found if _tool_plugin(tool.name) not in _NEUTRAL_PLUGINS | {plugin}}
+    if not foreign_names:
+        return found
+    kept = [tool for tool in found if tool.name not in foreign_names]
+    if scope is not None and not scope.is_open:
+        kept = [tool for tool in kept if scope.tool_enabled(tool.name)]
+    have = {tool.name for tool in kept}
+    deep = await search_tools(
+        query=query,
+        limit=_ENTITY_ROUTE_DEEP_RECALL,
+        threshold=0.0,
+        exclude_names=have,
+        scope=scope,
+    )
+    added = 0
+    for tool in deep:
+        if _tool_plugin(tool.name) != plugin or tool.name in have:
+            continue
+        kept.append(tool)
+        have.add(tool.name)
+        added += 1
+        if added >= 4:
+            break
+    return kept
+
+
 async def search_tools_with_entity_routing(
     query: str,
     route_text: str,
@@ -370,6 +415,7 @@ async def search_tools_with_entity_routing(
     scope_key: str = "",
     ignore_surfaces: Sequence[str] = (),
     exclude_names: Optional[Set[str]] = None,
+    scope: Optional["ToolScope"] = None,
 ) -> ToolList:
     """两级召回：实体身份**确定性**定插件，向量检索在插件内做细选（L0）。
 
@@ -396,6 +442,7 @@ async def search_tools_with_entity_routing(
             non_category=non_category,
             threshold=threshold,
             exclude_names=exclude_names,
+            scope=scope,
         )
 
     wide = await search_tools(
@@ -404,6 +451,7 @@ async def search_tools_with_entity_routing(
         non_category=non_category,
         threshold=threshold,
         exclude_names=exclude_names,
+        scope=scope,
     )
     hits = [t for t in wide if _tool_plugin(t.name) in routed]
 
@@ -416,6 +464,7 @@ async def search_tools_with_entity_routing(
             non_category=non_category,
             threshold=0.0,
             exclude_names=exclude_names,
+            scope=scope,
         )
         hits = [t for t in deep if _tool_plugin(t.name) in routed]
 
@@ -512,64 +561,205 @@ def expand_tools_to_families(
     return out
 
 
+_COVER_HIT_MIN = 3
+
+
+class _NamedTool(Protocol):
+    name: str
+
+
+def _longest_cover_in_text(covers: Sequence[str], text: str) -> int:
+    """covers 里整段出现在 text 中的最长一条。短于 3 字不算，避免单字误钉。"""
+    best = 0
+    for raw in covers:
+        cover = raw.strip()
+        if len(cover) < _COVER_HIT_MIN or cover not in text:
+            continue
+        if len(cover) > best:
+            best = len(cover)
+    return best
+
+
+_PIN_CATEGORIES = frozenset({"by_trigger", "common"})
+
+
+def trigger_keyword_hits(text: str, *, limit: int = 4) -> list[ToolBase]:
+    """by_trigger / common 的 covers 整段出现在原话里则钉住。更长的命令词排前面。"""
+    utterance = text.strip()
+    if not utterance or limit < 1:
+        return []
+    registered = get_registered_tools()
+    scored: list[tuple[int, str, ToolBase]] = []
+    for category, bucket in registered.items():
+        if category not in _PIN_CATEGORIES:
+            continue
+        for name, tb in bucket.items():
+            if tb.hide_from_main:
+                continue
+            hit = _longest_cover_in_text(tb.covers, utterance)
+            if hit <= 0:
+                continue
+            scored.append((hit, name, tb))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [tb for _, _, tb in scored[:limit]]
+
+
+_COVER_NOISE = frozenset(" \t\r\n，。！？、,.!?;；:：~～…（）()【】\"“”‘’'吧啊呀呢嘛哦哈")
+
+
+def cover_dominates_utterance(text: str) -> bool:
+    """去掉命中的 cover 和标点后几乎没剩内容，才算本轮就是这条命令。"""
+    utterance = text.strip()
+    if not utterance:
+        return False
+    hits = trigger_keyword_hits(utterance, limit=4)
+    if not hits:
+        return False
+    leftover = utterance
+    for tb in hits:
+        best = ""
+        for raw in tb.covers:
+            cover = raw.strip()
+            if len(cover) < _COVER_HIT_MIN or cover not in leftover:
+                continue
+            if len(cover) > len(best):
+                best = cover
+        if best:
+            leftover = leftover.replace(best, "", 1)
+    compact = "".join(ch for ch in leftover if ch not in _COVER_NOISE)
+    return len(compact) <= 6
+
+
+def pin_trigger_keyword_hits(
+    utterance: str,
+    seeds: ToolList,
+    *,
+    limit: int = 4,
+    scope: Optional["ToolScope"] = None,
+) -> ToolList:
+    """触发词命中插到种子队列最前，已在队列里的不重复。"""
+    out: ToolList = []
+    seen: set[str] = set()
+    for tb in trigger_keyword_hits(utterance, limit=limit):
+        if tb.name in seen:
+            continue
+        # by_trigger 直查注册表、绕过 search_tools，须在此单独收口
+        if scope is not None and not scope.tool_enabled(tb.name):
+            continue
+        seen.add(tb.name)
+        out.append(tb.tool)
+    for seed in seeds:
+        if seed.name in seen:
+            continue
+        seen.add(seed.name)
+        out.append(seed)
+    return out
+
+
+def _ordered_domain_members(domain: str, seed_name: str, query: str) -> list[ToolBase]:
+    """种子排第一，其余按 covers 是否出现在 query 里。不按注册顺序截。"""
+    from gsuid_core.ai_core.register import get_tools_by_capability_domain
+
+    members = get_tools_by_capability_domain(domain)
+
+    def _key(tb: ToolBase) -> tuple[int, int, str]:
+        return (
+            0 if tb.name == seed_name else 1,
+            -_longest_cover_in_text(tb.covers, query),
+            tb.name,
+        )
+
+    return sorted(members, key=_key)
+
+
+def collect_domain_tools(
+    query: str,
+    seeds: Sequence[_NamedTool],
+    *,
+    domain_limit: int = 3,
+    per_domain_limit: int = 6,
+    exclude_names: Optional[Set[str]] = None,
+    scope: Optional["ToolScope"] = None,
+) -> tuple[list[_NamedTool], int]:
+    """触发词钉扎不占名额；无域种子共用 1 个名额；有域族按匹配分排序后截断。"""
+    from gsuid_core.ai_core.register import find_tool_base
+
+    skip = set(exclude_names or set())
+    if scope is not None and not scope.is_open:
+        # by_trigger 直连注册表、绕过 search_tools，须在此单独收口
+        skip |= {name for name, tb in get_all_tools().items() if not scope.tool_enabled(name)}
+    out: list[_NamedTool] = []
+    seen: set[str] = set()
+    for tb in trigger_keyword_hits(query, limit=per_domain_limit):
+        if tb.name in skip or tb.name in seen:
+            continue
+        seen.add(tb.name)
+        out.append(tb.tool)
+
+    selected_domains: set[str] = set()
+    slots_used = 0
+    bucket_open = False
+    domainless_count = 0
+    for seed in seeds:
+        if seed.name in skip:
+            continue
+        tb = find_tool_base(seed.name)
+        dom = tb.capability_domain if tb is not None and tb.capability_domain else ""
+        if dom:
+            if dom in selected_domains:
+                continue
+            if slots_used >= domain_limit:
+                break
+            selected_domains.add(dom)
+            slots_used += 1
+            ordered = _ordered_domain_members(dom, seed.name, query)
+            for member in ordered[:per_domain_limit]:
+                if member.name in seen or member.name in skip:
+                    continue
+                seen.add(member.name)
+                out.append(member.tool)
+            continue
+        if seed.name in seen:
+            continue
+        if not bucket_open:
+            if slots_used >= domain_limit:
+                break
+            bucket_open = True
+            slots_used += 1
+        if domainless_count >= per_domain_limit:
+            continue
+        domainless_count += 1
+        seen.add(seed.name)
+        out.append(seed)
+    return out, slots_used
+
+
 async def search_tools_by_domain(
     query: str,
     domain_limit: int = 3,
     per_domain_limit: int = 6,
     recall: int = 12,
     exclude_names: Optional[Set[str]] = None,
+    scope: Optional["ToolScope"] = None,
 ) -> ToolList:
-    """两段式·domain 粒度工具检索（Phase 3a）。
+    """两段式·domain 粒度工具检索。
 
-    先按语义召回（已含 Reranker 精排）得到若干种子工具，再**聚合到 capability_domain**：
-    取语义上最靠前的至多 ``domain_limit`` 个不同能力族，整族纳入（每族至多
-    ``per_domain_limit`` 个）；未声明 capability_domain 的种子按"单工具族"各占一个名额。
-
-    相比逐工具检索，本函数以"能力族"为最小装配单位，保证装配进来的工具语义连贯、
-    "能创建就能改/删"，同时用 domain 数量（而非工具总数）控制规模，避免半个族被截断。
-    主要供 ``find_tools`` meta-tool 在运行时按需拉取工具时使用。
-
-    Args:
-        query: 需要的能力的自然语言描述。
-        domain_limit: 最多纳入的能力族数量（含 domainless 单工具名额）。
-        per_domain_limit: 每个能力族最多纳入的工具数。
-        recall: 语义召回的种子工具数量（喂给 domain 聚合）。
+    触发词整段命中的 by_trigger 先入结果且不占 ``domain_limit``。
+    语义种子再按域聚合：有域的族把种子和 covers 命中排前面再截断；
+    没声明域的种子共用 1 个名额，避免「刷新」占满 3 格把「查看」挤掉。
     """
-    from gsuid_core.ai_core.register import find_tool_base, get_tools_by_capability_domain
+    from pydantic_ai.tools import Tool
 
-    seeds = await search_tools(query=query, limit=recall, exclude_names=exclude_names)
-    skip = set(exclude_names or set())
-
-    out: ToolList = []
-    seen_names: Set[str] = set()
-    selected_domains: Set[str] = set()
-    slots_used = 0
-
-    for seed in seeds:
-        if slots_used >= domain_limit:
-            break
-        if seed.name in skip:
-            continue
-        tb = find_tool_base(seed.name)
-        dom = tb.capability_domain if tb else None
-        if dom:
-            if dom in selected_domains:
-                continue
-            selected_domains.add(dom)
-            slots_used += 1
-            members = get_tools_by_capability_domain(dom)[:per_domain_limit]
-            for m in members:
-                if m.name in seen_names or m.name in skip:
-                    continue
-                seen_names.add(m.name)
-                out.append(m.tool)
-        else:
-            if seed.name in seen_names:
-                continue
-            seen_names.add(seed.name)
-            out.append(seed)
-            slots_used += 1
-
+    seeds = await search_tools(query=query, limit=recall, exclude_names=exclude_names, scope=scope)
+    collected, slots_used = collect_domain_tools(
+        query,
+        seeds,
+        domain_limit=domain_limit,
+        per_domain_limit=per_domain_limit,
+        exclude_names=exclude_names,
+        scope=scope,
+    )
+    out: ToolList = [item for item in collected if isinstance(item, Tool)]
     logger.info(
         i18n_t(
             "log.rag.tools_two_stage_domain_retrieval",
@@ -663,6 +853,7 @@ async def search_tools(
     debug: bool = False,
     rerank: bool = True,
     exclude_names: Optional[Set[str]] = None,
+    scope: Optional["ToolScope"] = None,
 ) -> ToolList:
     """根据自然语言意图检索关联工具
 
@@ -678,6 +869,7 @@ async def search_tools(
         category: 工具分类名称，可选值："buildin"、"default"、"common"、"all"，默认为"all", 也可传入列表
         non_category: 将不会在这个分类中找工具, 优先级比category高，可选值："self"、"buildin"、"common"，默认为空
         exclude_names: 已暴露给模型的工具名，从候选剔除（核内工具改走检索时用）
+        scope: 人格工具作用域。被排除插件的工具不进候选（``enabled_tools`` 收放）
         threshold: 相似度分数阈值，只有分数高于该值的工具才会被返回，默认为0.38
         debug: 是否启用调试模式，启用后会记录所有返回工具的分数（无论是否超过阈值），默认为False
         rerank: 是否启用 Reranker 二次精排（默认开）。仅当系统已启用 rerank 功能时实际生效。
@@ -809,6 +1001,12 @@ async def search_tools(
     if exclude_names:
         for hidden_name in list(all_tools_dict.keys()):
             if hidden_name in exclude_names:
+                del all_tools_dict[hidden_name]
+
+    # 人格作用域：被 enabled_tools 排除的插件，其工具不进候选池
+    if scope is not None and not scope.is_open:
+        for hidden_name in list(all_tools_dict.keys()):
+            if not scope.tool_enabled(hidden_name):
                 del all_tools_dict[hidden_name]
 
     # 从 all_tools_dict 中筛选出 tool_names 中的候选（保持向量分数降序）。

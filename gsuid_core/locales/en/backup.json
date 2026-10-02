@@ -1,8 +1,10 @@
 {
+  "log.backup.already_running": "A backup is already writing {final_backup_dir}; skipping this one.",
   "log.backup.backup_core_path_ok": "[Backup Core] Successfully cleared path {path}!",
   "log.backup.backup_ok": "[Backup Core] Successfully backed up {backup}",
   "log.backup.backup_path_skip": "Backup directory does not exist: {backup_path}; skipping cleanup.",
   "log.backup.cleaning_log_file_cleanup": "Cleaning log file {p0}",
+  "log.backup.cleaned_error_reports_delete": "Removed {removed} expired error reports (keep {days} days)",
   "log.backup.compress_directory_fail": "Failed to compress backup directory: {e}",
   "log.backup.create_fail": "Failed to create backup directory: {e}",
   "log.backup.days_start": "Starting cleanup of backup files older than {days} days...",

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Tuple, Optional, Sequence
 from pathlib import Path
 from datetime import datetime, timezone
 
+from sqlmodel import col
 from qdrant_client.models import Vector, Condition, SparseVector
 
 from gsuid_core.i18n import t
@@ -247,9 +248,9 @@ class MemeLibrary:
             try:
                 await _remove_from_qdrant(meme_id)
             except Exception as e:
-                logger.warning(t("[Meme] 删除 Qdrant 向量失败: {e}", e=e))
+                logger.warning(t("log.meme.vector_delete_failed", e=e))
             async with async_maker() as session:
-                await session.execute(delete(AiMemeRecord).where(AiMemeRecord.meme_id == meme_id))
+                await session.execute(delete(AiMemeRecord).where(col(AiMemeRecord.meme_id) == meme_id))
                 await session.commit()
         if file_path.exists():
             await _unlink_file(file_path)

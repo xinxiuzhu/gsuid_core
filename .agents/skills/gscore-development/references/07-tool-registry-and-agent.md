@@ -69,18 +69,18 @@ async def my_tool(ctx: RunContext[ToolContext], ...) -> str: ...
 
 ## 7.3 主 Agent 三层工具池（`gs_agent.py::_execute_run`）
 
-主 Agent 每轮工具列表 = **保底池 + 语境池 + 查询池**，再叠加状态驱动与会话驻留：
+主 Agent 每轮工具列表 = **保底池 + 状态驱动 + 查询池快照**，再在快照之后追加**本轮种子**：
 
 | 层 | 机制 | 作用 |
 |---|---|---|
 | L1 通道核 | `get_main_agent_tools()`：`MAIN_AGENT_CORE_TOOLS`（群/私同一份） | 发现/回想/委派/发送 + 一次性/周期提醒入口；列出/改/删走 L2 或检索 |
 | L2 状态驱动 | `get_state_driven_family_tools()`：按用户持久实体补能力族 | 跨轮追问定时任务/Kanban/record |
 | L3 会话驻留 | `_recent_tool_families`（sticky 3 轮） | 刚用过的族继续常驻数轮 |
-| 语境池 | `get_tools_by_context_tags()` | 群画像标签匹配工具（群聊最多 4 个） |
 | L4 族展开 | `expand_tools_to_families()` | 召回任一工具即带出整族（"能建就能改/删"） |
 | L5 本句检索 | 当前句向量召回未暴露工具（含 self/buildin）；省略跟进才拼上文 | 闲聊跳过；工具/问答必搜 |
+| 本轮种子 | 检索命中 + 触发词钉扎（含 `send_*`），`append_turn_seeds` | 当轮可见，**不写入**会话快照 |
 
-保底池全保留；语境 + 查询池合并去重后限制附加数量上限（`tool_extra_pool_max`，默认 8）。
+保底池全保留；查询池族展开后受 `tool_extra_pool_max` 限制。本轮种子另计，最多 4 个。群画像标签不再把工具冻进快照，只在省略跟进时拼进检索 query。`send_*` 仍不进静态附加池，但本轮种子豁免这层剥离。
 
 > **在途短轮瘦池（2026-08-16）**：`has_active_task` 且剥壳后真人句 ≤48 字时置
 > `RunOnceState.in_flight_short`。装配层跳过语境标签池与向量检索，`max_extra_tools≤2`，
@@ -103,10 +103,10 @@ async def my_tool(ctx: RunContext[ToolContext], ...) -> str: ...
 > 不变量与回归用例见 `tests/test_tool_family_expansion.py`（含"新实现 ⊇ 旧实现"超集断言、
 > 跨族提问用例）。
 >
-> **单领域部署不必付检索开销**：persona `config.json` 的 `tool_packs` 可以直接写
-> `capability_domain` 名（`tool_packs.py::resolve_pack_tool_names` 会解析），整族**无条件常驻**
-> 保底池——纯鸣潮 bot 写 `"tool_packs": ["鸣潮面板"]` 即可，零向量检索、零族展开。
-> 群维度则用 `context_tags` + 语境池（L2）。
+> **单领域部署**：人格侧能力族固定 `dynamic`，`config.json` **没有** `tool_packs`。
+> 要某插件工具每轮都在，写进 `tool_names`；只要缩小检索池，用 `enabled_tools`
+> （如 `["*", "!别的插件"]` 或只列该插件名）。能力代理节点仍可用 `tool_packs`
+> 挂 `capability_domain` 整族。群画像标签不预装工具。本轮对口工具走种子名单，不进快照。
 
 > ⚠️ **工具能被召回的前提是完整检索面**。入库 / 精排文本 = **`ToolBase.retrieval_text`**
 > = `name` + docstring（`description`）+ 可选 `covers` + 可选 `aliases`。
@@ -140,8 +140,10 @@ def get_registered_tools() -> Dict[str, Dict[str, ToolBase]]: ...  # 按分类
 
 - **无实体命中 / 命中归属歧义 → 行为与普通 `search_tools` 完全一致**（有测试逐字节锁死，
   这是它敢上生产的前提）；
-- 只按**当前消息**路由，不吃 L5 拼进来的历史原话——否则"上轮问长离、这轮设提醒"会被
+- 只按**当前消息**做工具路由，不把历史原话拼进检索 query——否则"上轮问长离、这轮设提醒"会被
   上轮实体劫持（跨轮延续由 L3 会话驻留负责）；
+- 最近对白里的别名仍要写成 user 侧硬事实（`format_alias_bindings`）。当前句没有实体、
+  最近对白只有一个插件时，丢掉碰撞进来的其它插件工具，并用该插件深召回补位；
 - 至少留 1 个种子名额给通用最佳匹配；
 - 命中插件的工具被语义阈值砍光时才撤阈值重捞（插件归属已确定性确认，不必再让一个
   按模型标定的阈值否决它）。
@@ -179,8 +181,11 @@ def get_registered_tools() -> Dict[str, Dict[str, ToolBase]]: ...  # 按分类
       真正命中的专用工具并入分档回执（提醒直调），短 cover（不足 3 字）不算命中。
       **禁止**同域立刻 return（`n in hay or hay in n` 已删）；中文另用 ≥4 字窗口。
    1. 向量召族 + 节点匹配，代码分层后一组回执。exclusive 工具折叠成所属专用能力，不回灌主人格。
+      折叠所属节点同样过对口检查。
    2. 通用节点（research / memory_curator / internal_reporter / scheduler）不得压过插件专用工具。
-   3. 有专用项时丢掉通用档。系统提示只陈述分档，不写「优先 subagent」。
+   3. **专用节点入档前必须对口**（`need_matches_node_text`：when_to_use / covers / ≥4 字窗口）。
+      短关键词或语义邻居不算命中。对口专用才丢掉通用档；不对口保留通用调研/网页搜索。
+      缺口文案禁止教模型「做不到」。系统提示只陈述分档，不写「优先 subagent」。
 3. **`RetrievableToolset(AbstractToolset)`**（`dynamic_toolset.py`）——`get_tools(ctx)` 每个 step
    读 `dynamic_tool_names`，逐名 `find_tool_base` + `prepare_tool_def` 解析成可调用工具；用
    `exclude_names`（本轮静态已装配工具名）去重避免跨 toolset 重名冲突。
@@ -233,6 +238,11 @@ step2  RetrievableToolset 读集合 → get_weather 本步"出现"并可调用
 > `visible_to_admin` 只判 `user_pm == 0`。`command_exec/tools.py` 的
 > `_cmd_visible_to_master` / `_has_pending_for_master` **刻意不共用**：它们还叠加了命令执行器
 > `enable` 开关与 `operator_user_ids` 操作员白名单（后者无 ev 时偏隐藏），语义不同不要合并。
+>
+> **高危执行工具**（`execute_file` / `execute_shell_command`）不走 `visible_to_admin`。
+> 它们用 `tool_risk.visible_to_master_operator` + `check_high_risk_operator`：只认
+> `core_config["masters"]`，**无 Event 也拒绝**（不认任务行上的 `user_pm`）。
+> 主人格和子代理同一道门。详见 [§8.3](./08-heartbeat-scheduled-planning.md)。
 
 **保底池条件隐藏（2026-06-20）**：`visible_when` 已从附加池下沉到**保底池**里的窄场景常驻
 `@ai_tools` 默认 `timeout=60`；`web_search_tool` / `web_fetch_tool` 显式 `100` 以覆盖多源 failover；
@@ -351,8 +361,8 @@ Persona 与能力代理画像统一为 **AgentNode**（`ai_core/agent_node/`）�
 （`register_agent_node` / `get_node` / `resolve_node`）+ persona 目录只读投影
 （mtime 自动刷新）。工具装配抹平为**能力族（tool packs）**（`agent_node/tool_packs.py`）：
 
-- `dynamic`：五层自动装配（本章 7.x 描述的整套），persona 默认；能力节点声明后
-  `runner` 传 `create_agent(dynamic_tools=True)`，gs_agent 装配并与显式工具合并；
+- `dynamic`：五层自动装配（本章 7.x 描述的整套）。人格投影恒挂此族（不进 `config.json`）；
+  能力节点声明后 `runner` 传 `create_agent(dynamic_tools=True)`，gs_agent 装配并与显式工具合并；
 - `task_basics`：原 `runner._ALWAYS_TOOLS`（artifact/state/record/search/web 族）；
 - 任意 `capability_domain` 名可整族挂载；插件可 `register_tool_pack` 注册静态族。
 
@@ -391,7 +401,8 @@ grant / 自动提交审批），不依赖 LLM 自觉。详见
      **只计 1 次 attempt**；多段 feedback 用 `merge_rewrite_feedbacks` 合并后注入下一轮请求。
    - 检测启发式：形如 `</?Name…>`；`List<str>` 等 PascalCase 泛型 / 含 `@` 邮箱跳过，降假阳性。
 2. **`ooc`**（`output_firewall.check_ooc`）：
-   - 主路径：`machine_dump` → `FALLBACK`「额…出错了，稍后再试」；**`delivery_narration`
+   - 主路径：`machine_dump` → `REWRITE`+`defer_ooc`（与 never-release 同路：run 末让当前
+     人格自己重说一句，**无罐头兜底**）；**`delivery_narration`
      → `FUSE`**（交付已完成，重说无意义，直接静默）；资金红线持续 `REWRITE`。
    - **软出戏**（`model_identity` / `ai_selfref` 等）：主/工具同一套——命中不强制剥模型名、
      不二次发送放行。注入 `（系统校验：…可能出戏）` 让模型自判；提醒送达后只放行**主路径
@@ -399,8 +410,8 @@ grant / 自动提交审批），不依赖 LLM 自觉。详见
    - 工具路径（`tool_gate_feedback`）：软出戏持续打回，要求改用正文；资金 / 机器腔
      **never-release** 持续打回。
    - OOC 类目：`model_identity` / `ai_selfref` / `system_term` / `fund_claim` /
-     `machine_dump` / **`delivery_narration`**（2026-08-10，交付状态汇报系统日志腔，
-     `speech_policy.looks_like_delivery_status_narration` 双信号结构检测）。
+     `machine_dump` / **`delivery_narration`** / **`capability_absence`**（工具/接口+没挂没装，
+     或另一个机器人+管/干，never-release）/ **`stale_present`**（同句把过期年月日说成今天/现在的读数）。
 
 **DELIVERED 交付终局态（2026-08-10，P0 OOC 根治）**：在 `pre_send_gate` **之前**还有一道
 `speech_policy.should_block_user_visible_text` 话术闸（`agent_run/speech_policy.py`）。
@@ -417,10 +428,17 @@ grant / 自动提交审批），不依赖 LLM 自觉。详见
 群聊折叠卡无 `inline_head`，长委派回执同样折成卡。
 **出站槽（2026-08-26）**：按本 run 是否含**函数** ToolCall 分槽。委派/出图等重工具首次至多一条
 TextPart（接任务应，仍过 `pre_send_gate` / `should_block`；**过不了闸不得占槽**）。点名/跟进/
-私聊/HTTP 且本响应含重工具：模型没写合格短应则发人格卡 `task_ack` 或中性「收到。」。
-回想/网页检索等轻查询不先应，干完再开口。零工具/未点名不补。其后切工具静默，无 ToolCall
-终局开口。hosted 搜索不当函数工具。
-HTTP SSE 第一帧可见必须是 `event: text`（`: ping` 不是接任务应）。unsent 从 `new_messages` 尾部剥掉。
+私聊/HTTP 且本响应含重工具：模型没写合格短应则发 `persona.json` 的 `task_ack`（空则不补）。
+轻工具同包若已是合格接任务应可出站。零工具/未点名不补。
+其后切工具静默，无 ToolCall 终局开口。hosted 搜索不当函数工具。
+交互主人格 `create_subagent(..., transient=true)` 会被忽略（lookup 白名单除外），改走看板后台。
+**委派并列（2026-09-25）**：同一次模型回复里的多个 `create_subagent` 由运行时一起开工。
+框架不会把一条任务自动拆成多次调用；模型没在这一次里并列发出的，deferred 回执之后
+同 run 再补会被挡住，等回灌再决定自己答还是 `render_agent`。
+**接任务应**：委派前若模型没写短句，且人格配置了 `task_ack`，发那一句再执行工具。
+空则不代说，把本批工具打回，由模型用当前人格写一句再调。
+HTTP SSE 的 `: ping` 不是接任务应。只有图、模型没写字时直接出 attachment，不补固定台词。
+unsent 从 `new_messages` 尾部剥掉。
 
 **状态**：仅 `ToolContext.extra["output_gate"]` → 类型化 `GateBag`（会话重启即丢，无旧键）。
 

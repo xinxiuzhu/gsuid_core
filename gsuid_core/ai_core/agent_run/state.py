@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Union, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Union, Literal, Sequence
 from dataclasses import field, dataclass
 
 from pydantic_ai.usage import UsageLimits
@@ -13,6 +13,9 @@ from gsuid_core.models import Event
 from gsuid_core.ai_core import output_firewall
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.rag.tools import ToolList
+
+if TYPE_CHECKING:
+    from gsuid_core.ai_core.agent_node.tool_scope import ToolScope
 
 ReturnMode = Literal["always", "return", "by_bot"]
 
@@ -53,6 +56,9 @@ class RunOnceState:
 
     # 环内可变
     tool_call_list: list[str] = field(default_factory=list)
+    #: 本轮**真实**工具回执正文（折叠前截取，总量有上界）。超轮数兜底总结只能拿它当
+    #: 材料：`self.history` 此刻还没 extend 本轮，工具名也证明不了有事实。
+    run_tool_outputs: list[str] = field(default_factory=list)
     effectual_mutate: bool = False
     wall_nudged: bool = False
     ooc_blocked: list[tuple[str, output_firewall.FirewallHit]] = field(default_factory=list)
@@ -106,6 +112,8 @@ class RunOnceState:
     wait_comfort_sent: bool = False
     # 有活跃任务且本轮真人句很短：瘦检索/语境池，保住委派查询工具。
     in_flight_short: bool = False
+    # 点名且本轮检索装上了查询工具：零工具事实回答要拦。
+    entity_routed: bool = False
     # 出图委派已收到异步 ack / 完成回执；失败回执在未 ack 时回滚抢先静默。
     render_ack_seen: bool = False
     # 主通道已成功发送的台词段数（单轮出站配额兜底，见 4.10）
@@ -133,6 +141,8 @@ class RunOnceState:
     # 上下文 / 用户消息
     blocked_exclusive: set[str] = field(default_factory=set)
     allow_outbound: bool = False
+    # persona enabled_tools 作用域快照：装配阶段解析，建 Agent / 检索两处共用
+    tool_scope: ToolScope | None = None
     run_extra: dict[str, Any] = field(default_factory=dict)
     fw_msg: bool = False
     context: ToolContext | None = None

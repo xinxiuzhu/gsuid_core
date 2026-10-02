@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import re
-from typing import List, Tuple, Union, Literal, Optional, Sequence
+from typing import Dict, List, Tuple, Union, Literal, Optional, Sequence
 
 from pydantic_ai.messages import (
     UserContent,
@@ -17,6 +17,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
+from gsuid_core.models import Event
 from gsuid_core.ai_core.utils import _is_framework_prompt_content
 from gsuid_core.ai_core.rag.tools import NON_SEARCHABLE_TOOL_CATEGORIES
 from gsuid_core.ai_core.control.directive import CONTROL_ENVELOPE_TAG
@@ -29,6 +30,7 @@ from gsuid_core.ai_core.agent_run.speech_policy import (  # noqa: F401
     _WALL_CLOCK_PIPELINE,
     _RENDER_DELEGATE_NUDGE,
     _STATUS_ZERO_TOOL_NUDGE,
+    _WALL_CLOCK_CLOSE_NO_RENDER,
     wall_clock_nudge_for as _wall_clock_nudge_for,
     looks_like_report_speech as _looks_like_report_speech,
 )
@@ -215,7 +217,7 @@ _SCHED_MUTATE_TOOLS: frozenset[str] = frozenset(
     }
 )
 _MISSING_OFFERED_TOOL_RE = re.compile(r"没有.{0,16}工具")
-_DEFER_WORK_RE = re.compile(r"明天再|等我.{0,8}再(查|设|弄|翻)")
+_DEFER_WORK_RE = re.compile(r"明天再|等我.{0,8}再(查|设|弄|翻)|等我.{0,16}(翻|查|搜)")
 
 
 def _claims_missing_offered_tool(text: str, offered: Sequence[str]) -> bool:
@@ -438,11 +440,11 @@ def _capability_exclusive_tool_names() -> set[str]:
     return exclusive
 
 
-def _format_capability_roster() -> str:
+def _format_capability_roster(persona_name: str | None = None) -> str:
     """兼容旧调用点；实现已迁到 agent_node.registry.format_capability_roster。"""
     from gsuid_core.ai_core.agent_node.registry import format_capability_roster
 
-    return format_capability_roster()
+    return format_capability_roster(persona_name)
 
 
 # 工具返回后的输出契约：事件驱动（本轮出现过 ToolReturn），不认业务关键词
@@ -477,6 +479,55 @@ def _tool_return_looks_failed(part: ToolReturnPart) -> bool:
     if isinstance(content, bytes) and len(content) == 0:
         return True
     return False
+
+
+def turn_reply_metadata(ev: Optional[Event]) -> Dict[str, str]:
+    """本轮群聊回复的收件人，落进出站历史供群转录渲染成 ``AI→收件人``。
+
+    缺了它，群里读不出"机器人上一条在跟谁说话"，`history_format._make_speaker`
+    永远只出 ``AI:``——模型只能靠语义猜线程归属，繁忙群里必然串线。
+    私聊不需要（天然 1:1），无 Event 的后台入口也不臆造收件人。
+    """
+    if ev is None or not ev.group_id or ev.user_id is None:
+        return {}
+    meta: Dict[str, str] = {"reply_to_user_id": str(ev.user_id)}
+    if "nickname" in ev.sender:
+        nick = ev.sender["nickname"]
+        if isinstance(nick, str) and nick.strip():
+            meta["reply_to_user_name"] = nick.strip()
+    return meta
+
+
+#: 本轮工具回执正文的取材预算（超轮数兜底总结只拿得到这些 + 既有历史）
+RUN_TOOL_OUTPUT_BUDGET = 4000
+_RUN_TOOL_OUTPUT_ITEM_CAP = 1200
+#: 本轮 thinking 的取材预算。走这条路的按定义是最长那批 run（撞的是
+#: ``multi_agent_lenth`` 上限），裸拼会与完整 message_history 一起撑爆兜底 prompt。
+RUN_THINKING_BUDGET = 2000
+
+
+def collect_run_thinking(segments: Sequence[str]) -> str:
+    """本轮推理线索，超预算取**尾段**（结论在推理末尾，开头是重复的盘算）。"""
+    body = "\n".join(s for s in segments if s and s.strip())
+    if len(body) <= RUN_THINKING_BUDGET:
+        return body
+    return "…[前略]" + body[-RUN_THINKING_BUDGET:]
+
+
+def record_run_tool_output(outputs: List[str], tool_name: str, content: Optional[str]) -> None:
+    """累计本轮真实工具回执正文，供超轮数兜底总结当材料。
+
+    折叠会改写 ``part.content``，所以必须传折叠前那份。工具名证明不了有事实
+    （调了不等于查到），故只收非空正文；总量封顶，别把一整轮长回执塞进总结。
+    """
+    if not content:
+        return
+    body = content.strip()
+    if not body:
+        return
+    if sum(len(x) for x in outputs) >= RUN_TOOL_OUTPUT_BUDGET:
+        return
+    outputs.append(f"[{tool_name}] {body}"[:_RUN_TOOL_OUTPUT_ITEM_CAP])
 
 
 def _tool_return_is_async_pending(part: ToolReturnPart) -> bool:

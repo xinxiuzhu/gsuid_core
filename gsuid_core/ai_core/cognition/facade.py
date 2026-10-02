@@ -33,11 +33,12 @@ from gsuid_core.ai_core.cognition.types import (
 )
 from gsuid_core.ai_core.memory.retrieval.types import Episode
 from gsuid_core.ai_core.memory.retrieval.lexical import (
-    SET_RECALL_HINT,
-    LATEST_WINS_HINT,
+    SPEECH_ACT_HINT,
     strip_clock_lines,
     query_overlaps_text,
     expand_lexical_recall,
+    query_required_needles,
+    text_has_query_needles,
 )
 
 # 一路后端返回的 (排名列表, id→命中) 二元组
@@ -61,12 +62,15 @@ def _fileos_hit_title(summary: str, tool_name: str, profile: str = "") -> str:
     return "落盘"
 
 
-# 各路头名相对分永远过线；知识/落盘/媒体融合名次再收口，避免公共库噪声全标高置信。
+# 各路头名相对分永远过线；知识/落盘/媒体按本类名次收口，避免公共库噪声全标高置信。
 # 记忆片段/事实/偏好不过这条帽——否则「命中 12」只展开 4 条，比纯 Episode dump 更差。
+# 帽按 kind 计，不按融合下标：片段占满前排时，排在后面的知识不能整段变成弱相关。
 _HIGH_CONF_FUSED_CAP = 4
+# 专名对得上的知识条预留名额。片段先占满 limit 时，已挂载资料会整路消失。
+_KNOWLEDGE_SLOT_RESERVE = 4
 _FUSED_CAP_KINDS = KNOWLEDGE_KINDS | WORK_KINDS | MEDIA_KINDS
 # 工具回执：高置信片段最多摊开这么多条，其余进「未展开」。
-_EPISODE_EXPAND_CAP = 6
+_EPISODE_EXPAND_CAP = 16
 _EPISODE_SEED_SCORE = 0.8
 _EPISODE_NEIGHBOR_SCORE = 0.4
 
@@ -200,48 +204,109 @@ async def search_cognition(
         backend_top = max((h.score for h in hits.values()), default=0.0)
         backend_floor = backend_top * floor_ratio if backend_top > 0 else 0.0
         for hid, hit in hits.items():
-            merged[hid] = replace(hit, high_confidence=hit.score >= backend_floor)
+            confident = hit.score >= backend_floor
+            body = hit.summary or hit.title
+            if hit.kind is CogKind.EPISODE and not text_has_query_needles(query, body):
+                confident = False
+            merged[hid] = replace(hit, high_confidence=confident)
 
     if not merged:
         logger.debug(t("log.ai.cognition_empty", q=query[:40]))
         return []
 
-    fused_ids = _fuse_ids(ranked_lists, labels, limit=limit)
+    fused_ids = _fuse_ids(ranked_lists, labels, limit=limit, merged=merged, query=query)
     ordered = [merged[i] for i in fused_ids if i in merged]
+    kind_hi: Dict[CogKind, int] = {}
     capped: List[CognitiveHit] = []
-    for i, hit in enumerate(ordered):
-        if i >= _HIGH_CONF_FUSED_CAP and hit.high_confidence and hit.kind in _FUSED_CAP_KINDS:
-            hit = replace(hit, high_confidence=False)
+    for hit in ordered:
+        if hit.high_confidence and hit.kind in _FUSED_CAP_KINDS:
+            n = kind_hi[hit.kind] if hit.kind in kind_hi else 0
+            if n >= _HIGH_CONF_FUSED_CAP:
+                hit = replace(hit, high_confidence=False)
+            else:
+                kind_hi[hit.kind] = n + 1
         capped.append(hit)
     final = await _drop_stale_handles(capped)
+    # 弱相关片段不进结果：相对分在 RRF 名次上几乎拉不开，专名零命中也会报「命中 24」。
+    has_strong_ep = any(h.kind is CogKind.EPISODE and h.high_confidence for h in final)
+    if has_strong_ep:
+        final = [h for h in final if h.kind is not CogKind.EPISODE or h.high_confidence]
+    else:
+        best_ep_id = ""
+        best_ep_score = -1.0
+        for h in final:
+            if h.kind is CogKind.EPISODE and h.score > best_ep_score:
+                best_ep_score = h.score
+                best_ep_id = h.id
+        if best_ep_id:
+            final = [h for h in final if h.kind is not CogKind.EPISODE or h.id == best_ep_id]
+        else:
+            final = [h for h in final if h.kind is not CogKind.EPISODE]
     logger.debug(t("log.ai.cognition_hits", n=len(final), backends=",".join(labels)))
     return final
 
 
-def _fuse_ids(ranked_lists: List[List[str]], labels: List[str], *, limit: int) -> List[str]:
-    """记忆路先占满 limit，知识/落盘只填剩余。RRF 平权会把公共文插进个人片段名额。"""
+def _knowledge_mentions_query(hit: CognitiveHit, query: str) -> bool:
+    """知识条要带上 query 里的专名才占预留名额。汉字不进专名正则，改对可索引词。"""
+    body = f"{hit.title}\n{hit.summary}"
+    if query_required_needles(query):
+        return text_has_query_needles(query, body)
+    from gsuid_core.ai_core.entity_index import _normalize_surface
+    from gsuid_core.ai_core.cognition.hub import title_tokens
+
+    blob = _normalize_surface(body)
+    for tok in title_tokens(query):
+        key = _normalize_surface(tok)
+        if len(key) < 2 or (key.isascii() and len(key) < 3):
+            continue
+        if key in blob:
+            return True
+    return False
+
+
+def _fuse_ids(
+    ranked_lists: List[List[str]],
+    labels: List[str],
+    *,
+    limit: int,
+    merged: Dict[str, CognitiveHit],
+    query: str,
+) -> List[str]:
+    """记忆在前。专名对得上的知识留名额，避免片段占满后知识整路消失。"""
     from gsuid_core.ai_core.planning.tool_output_protocol import rrf_fuse
 
     memory_lists = [lst for lst, lab in zip(ranked_lists, labels) if lab == "memory"]
     other_lists = [lst for lst, lab in zip(ranked_lists, labels) if lab != "memory"]
     mem_ids = rrf_fuse(memory_lists, limit=limit) if memory_lists else []
     other_ids = rrf_fuse(other_lists, limit=limit) if other_lists else []
+    knowledge_ids = [
+        rid
+        for rid in other_ids
+        if rid in merged and merged[rid].kind is CogKind.KNOWLEDGE and _knowledge_mentions_query(merged[rid], query)
+    ]
+    reserve = min(_KNOWLEDGE_SLOT_RESERVE, len(knowledge_ids))
+    mem_cap = limit - reserve
     out: List[str] = []
     seen: Set[str] = set()
-    for rid in mem_ids:
+
+    def _take(rid: str) -> bool:
         if rid in seen:
-            continue
+            return False
         seen.add(rid)
         out.append(rid)
-        if len(out) >= limit:
+        return len(out) >= limit
+
+    for rid in mem_ids:
+        if len(out) >= mem_cap:
+            break
+        if _take(rid):
+            return out
+    for rid in knowledge_ids:
+        if _take(rid):
             return out
     for rid in other_ids:
-        if rid in seen:
-            continue
-        seen.add(rid)
-        out.append(rid)
-        if len(out) >= limit:
-            break
+        if _take(rid):
+            return out
     return out
 
 
@@ -394,6 +459,21 @@ async def _search_memory(
             group_id=scope.group_id,
             clock=scope.clock_at,
         )
+        from gsuid_core.ai_core.memory.retrieval.lexical import (
+            looks_like_set_query,
+            apply_query_episode_pack,
+            collapse_document_episodes,
+        )
+
+        ctx.episodes = apply_query_episode_pack(
+            ctx.episodes,
+            search_q,
+            temporal_mode=ctx.temporal_mode,
+            time_range=ctx.time_range,
+            asker_id=scope.user_id if scope.group_id else "",
+        )
+        if looks_like_set_query(search_q):
+            ctx.episodes = collapse_document_episodes(ctx.episodes)
     ids: List[str] = []
     hits: Dict[str, CognitiveHit] = {}
     speaker_ids = {scope.user_id} if scope.user_id else set()
@@ -434,6 +514,8 @@ async def _search_memory(
                 if raw_id and raw_id in neighbor_ep_ids and raw_id not in seed_ep_ids
                 else _EPISODE_SEED_SCORE
             )
+            if not text_has_query_needles(search_q, content):
+                ep_score = min(ep_score, 0.2)
             _add(
                 CognitiveHit(
                     kind=CogKind.EPISODE,
@@ -870,13 +952,16 @@ async def inject_memory_slice(
 ) -> str:
     """⑧ 每轮自动注入的**记忆+偏好切片**（与工具路径同一入口、同一 scope 纪律）。
 
-    刻意不走 :func:`render_cognition_block`：``to_prompt_text`` 的五个配额位
-    （偏好独立 0.10 / 事实 55%（temporal 降 30%）/ 类目 15% / 冲突 ~12% / 片段吃剩余）
+    刻意不走 :func:`render_cognition_block`：``to_prompt_text`` 的配额位
+    （偏好独立 ``preference_inject_budget_ratio`` / 事实 / 冲突 / 类目，片段吃剩余）
     与第三方隐私门（敏感事实仅当事人在场才注入）必须保留——统一成通用渲染会让偏好
     被事实挤掉，那正是「语义类型保留」不变量要防的事。
 
+    总帽只从 :func:`inject_memory_cap` 取：与 H05 注入同一条函数，工具路径不会另抬一档。
+
     全联邦（知识 / 落盘 / 产物）只在工具调用或问答预取时跑，不进每轮路径。
     """
+    from gsuid_core.ai_core.kits.base import inject_memory_cap
     from gsuid_core.ai_core.memory.config import memory_config
     from gsuid_core.ai_core.memory.retrieval.dual_route import dual_route_retrieve
 
@@ -893,8 +978,9 @@ async def inject_memory_slice(
         bot_self_id=scope.bot_self_id,
         include_self=True,
     )
+    cap = inject_memory_cap(query, covered=ctx.covered)
     memory_text = ctx.to_prompt_text(
-        max_chars=memory_config.memory_inject_max_chars,
+        max_chars=cap,
         priority_speakers=priority_speakers or None,
         current_speaker_ids=current_speaker_ids or None,
         query=query,
@@ -918,16 +1004,16 @@ def render_cognition_block(
     调错库的代价比不调更高——模型于是宁愿用参数知识糊弄过去。
     """
     if not hits:
-        # 空结果必须带下一步，否则模型会原地编或换说法重搜。
+        # 空结果只给「本次没有可用材料」+ 下一步。原文是检索术语 + 工具名，
+        # 模型会照抄这套口径讲给用户（曾直出「无命中 / 未召回 ≠没存过」）。
         return (
-            f"【{header}】query={query[:30]!r} 无命中（本 query 未召回，≠没存过）。"
-            "请换槽位词再 search_cognition；外部用 web_search_tool，专域用 find_tools。"
+            f"【{header}】{query[:30]!r}：本次没有可用材料。"
+            "换一种问法重试；实时事实改用联网来源，专域信息改用对应能力。"
         )
     lines = [f"【{header}】query={(hint_query or query)[:30]!r} 命中 {len(hits)}"]
-    if any(h.as_of for h in hits):
-        lines.append(LATEST_WINS_HINT)
-    if any(h.kind is CogKind.EPISODE for h in hits):
-        lines.append(SET_RECALL_HINT)
+    # 带时点或对话片段时标明：这是谁说过，不是当前事实。知识条目不贴这句。
+    if any(h.as_of for h in hits) or any(h.kind is CogKind.EPISODE for h in hits):
+        lines.append(SPEECH_ACT_HINT)
     weak_n = 0
     shown = 0
     ep_shown = 0

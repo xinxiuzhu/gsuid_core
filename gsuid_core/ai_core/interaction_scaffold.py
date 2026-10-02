@@ -131,10 +131,15 @@ SPEAKER_RECALL_HINT = (
 
 # 问已有记忆 / 按偏好给建议：必须搜，且 query 带本题主题，不要抄目录干扰标题。
 MEMORY_QA_HINT = (
-    "\n\n（系统提示：这是在问或用已有记忆。必须 search_cognition；"
-    "query 写说话人ID + 问题里的专名/主题 + 偏好或已有做法；目录卡不是全文。"
-    "不要把目录里不相干的标题词拼进 query。作答点名命中里的专名原话，不要用上位词；"
-    "不相干主题不要写进建议。本页未齐时用命中专名再搜。）"
+    "\n\n（系统提示：这是在问或用已有记忆。"
+    "已注入【相关对话片段】/【核心事实】只说明谁在何时说过，"
+    "不是句中日期、数量或状态的当前事实。"
+    "问谁说过什么时按片段原文作答并带上说话时点；"
+    "问现在如何而原话会过期时，没有本轮工具结果就只转述说过的话。"
+    "片段不够再 search_cognition，query 写说话人ID + 问题里的专名/主题。"
+    "目录卡不是全文。作答点名命中里的专名原话。"
+    "点查过往记录且片段对不上就说没有，不要用相近事实顶替；"
+    "问方法/步骤/举例则按问句本身作答，不因记忆不全拒答。）"
 )
 
 MULTI_SPEAKER_HINT = (
@@ -326,7 +331,10 @@ QUOTE_TOME_HINT = (
     "是追问/反驳/吩咐你才开口；在跟群里别人说话或故意惹你，输出 <SILENCE>。）"
 )
 # 引用同时带第二人称祈使：按直接找你，不用 quoted_tome。
-_QUOTE_DIRECTED_RE = re.compile(r"^(?:你|您)?\s*(?:帮|给|查|看|设|改|取消|删|列)")
+_QUOTE_DIRECTED_RE = re.compile(
+    r"^(?:你|您)?(?:\s|仔细|好好|重新|快){0,2}"
+    r"(?:帮|给|查|看|搜|翻|算|设|改|取消|删|列|如何|怎么|怎样|评价|觉得|认为)"
+)
 
 ADDRESS_GATE_HINT = (
     "\n\n（系统提示：这条消息 @ 的是群里另一个人、并不是在叫你，本轮已不提供任何工具。"
@@ -634,7 +642,7 @@ def build_turn_graph(
         from gsuid_core.ai_core.memory.group_profile import collect_persona_surfaces
 
         extra = collect_persona_surfaces(persona_name)
-    # 引用 bot 仍是 is_tome（call_to_self）；quoted_tome 只改注入，不拦进环。
+    # 引用 bot 仍是 is_tome；quoted_tome 只换注入，CheapGate 不因此静默。
     textual = is_addressed_to_self(text, persona_name, False, extra_names=extra)
     quoted_tome = bool(is_tome) and has_reply and not textual
     if quoted_tome:

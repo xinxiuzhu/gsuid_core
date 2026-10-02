@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Sequence
+from typing import Any, List, TypeVar, Protocol, Sequence
 
 from pydantic_ai import Agent
 from pydantic_ai.settings import ModelSettings, merge_model_settings
@@ -28,9 +28,11 @@ from gsuid_core.ai_core.rag.tools import (
     get_main_agent_tools,
     get_scope_context_tags,
     expand_tools_to_families,
-    get_tools_by_context_tags,
+    pin_trigger_keyword_hits,
+    align_seeds_to_context_plugin,
     search_tools_with_entity_routing,
 )
+from gsuid_core.ai_core.tool_risk import skill_tool_visible
 from gsuid_core.ai_core.tool_safety import build_tool_safety_capability
 from gsuid_core.ai_core.agent_run.host import RunOnceHost
 from gsuid_core.ai_core.agent_run.state import (
@@ -94,7 +96,13 @@ def group_idle_request_limit(
     idle_cap: int,
     call_to_self: bool = False,
 ) -> int:
-    """旁观收紧 request_limit。点名履约不收。"""
+    """纯旁观群聊轮收窄 request_limit；点名与省略续聊不收。
+
+    收窄只针对「无人寻址 + 无跟进 + 无在途任务」这一类——它们本不该干活，
+    放开到 multi_agent_lenth 就是零工具空转的烧钱口子。省略续聊轮
+    （``followup_detected`` = ellipsis_followup / task_management）要跑得完
+    find_tools → 真正查询的两跳链路，早期的收窄误伤了它们，见 §12.8。
+    """
     if default_limit < 1 or idle_cap < 1:
         return default_limit
     if call_to_self:
@@ -152,8 +160,40 @@ def _snapshot_visibility_flags(st: RunOnceState) -> tuple[bool, bool]:
 
 
 def is_group_send_extra(name: str) -> bool:
-    """对用户发送 extras（不在通道核）。只许本轮 find_tools 动态暴露。"""
+    """对用户发送 extras（不在通道核）。静态快照不收，本轮种子可以收。"""
     return name.startswith("send_") and name not in interaction_scaffold.MAIN_AGENT_CORE_TOOLS
+
+
+_TURN_SEED_CAP = 4
+
+
+class _NamedTool(Protocol):
+    name: str
+
+
+_SeedT = TypeVar("_SeedT", bound=_NamedTool)
+
+
+def append_turn_seeds(
+    tools: list[_SeedT],
+    seeds: Sequence[_SeedT],
+    *,
+    exclusive: set[str],
+    cap: int = _TURN_SEED_CAP,
+) -> list[str]:
+    """把本轮种子接到 schema 末尾。调用方不得把这些名字写入会话快照。"""
+    seen = {tool.name for tool in tools}
+    added: list[str] = []
+    for tool in seeds:
+        if len(added) >= cap:
+            break
+        name = tool.name
+        if not name or name in seen or name in exclusive:
+            continue
+        tools.append(tool)
+        seen.add(name)
+        added.append(name)
+    return added
 
 
 # 回想核内只有 search_cognition；attach_article 走 find_tools，避免每轮写工具进 schema。
@@ -323,6 +363,25 @@ class ToolsPhase(RunOnceHost):
             logger.info(i18n_t("log.agent.tool_assembly_slot_not_kernel"))
             _assemble = False
 
+        # persona 的 enabled_tools 作用域：本轮向量检索 / find_tools / 动态暴露的收放口径。
+        # 只管检索池，不动常驻直装工具与 tool_packs 静态挂载。
+        from gsuid_core.ai_core.agent_node.tool_scope import get_tool_scope as _get_tool_scope
+
+        _scope = _get_tool_scope(self.persona_name)
+        if not _scope.is_open and self.persona_name:
+            logger.info(
+                i18n_t(
+                    "log.agent.tool_scope_restricted_recall",
+                    p0=self.persona_name,
+                    p1="all" if _scope.allow_all else ",".join(sorted(_scope.allow)) or "none",
+                )
+            )
+        if st.context is not None:
+            # find_tools 在 step 内现查，须能读到本轮作用域
+            st.context.tool_scope = _scope
+        # 建 Agent 阶段（RetrievableToolset）跨方法复用同一份快照
+        st.tool_scope = _scope
+
         # persona 会话与其 AgentNode 声明同步：packs 去掉 dynamic 即关闭五层自动装配
         # 改为静态解析 packs + st.tool_names（与 task-mode 的 runner 同语义）。
         if _assemble and self.dynamic_tools is None and self.persona_name:
@@ -421,6 +480,9 @@ class ToolsPhase(RunOnceHost):
                                 exclude_names=core_names | _exclusive_now,
                                 has_active_task=st.has_active_task,
                             )
+                            # 状态族是「有持久实体就整族可用」，但仍受 enabled_tools 收放
+                            if not _scope.is_open:
+                                extra_tools = _scope.filter_tools(extra_tools)
                             st.final_user_message = _append_user_text(
                                 st.final_user_message, STATE_PERSISTED_FAMILY_HINT
                             )
@@ -440,10 +502,10 @@ class ToolsPhase(RunOnceHost):
                     core_names.discard(_PROGRESS_TOOL)
                     extra_tools = _without_progress_tool(extra_tools)
 
-                # 附加工具池 = L2/跟进尾槽 + 语境 + 查询
-                _ctx_pool_names: set[str] = set()
+                # 附加工具池 = L2/跟进尾槽 + 查询。语境标签只参与省略跟进的检索 query。
+                # 本轮种子（含 send_*）在快照之后另挂，不写进 frozen。
+                turn_seeds: ToolList = []
 
-                # 第二层：语境工具池（群聊瘦模式也保留标签池，上限更紧）
                 ctx_tags: list[str] = []
                 ctx_scope_key = ""
                 if st.ev is not None and st.ev.group_id:
@@ -453,19 +515,6 @@ class ToolsPhase(RunOnceHost):
                 if ctx_scope_key and not st.in_flight_short:
                     try:
                         ctx_tags = await get_scope_context_tags(ctx_scope_key)
-                        if ctx_tags:
-                            _ctx_max = 4 if _is_group else 8
-                            ctx_tools = get_tools_by_context_tags(ctx_tags, max_count=_ctx_max)
-                            if ctx_tools:
-                                extra_tools += ctx_tools
-                                _ctx_pool_names = {t.name for t in ctx_tools}
-                                logger.debug(
-                                    i18n_t(
-                                        "log.agent.contextual_pool_context_tags",
-                                        p0=len(ctx_tools),
-                                        ctx_tags=ctx_tags,
-                                    )
-                                )
                     except Exception as e:
                         logger.debug(i18n_t("log.agent.load_contextual_pool", e=e))
 
@@ -506,7 +555,7 @@ class ToolsPhase(RunOnceHost):
                         from gsuid_core.ai_core.memory.group_profile import collect_persona_surfaces
 
                         _ignore = collect_persona_surfaces(self.persona_name)
-                    extra_tools += await search_tools_with_entity_routing(
+                    _found = await search_tools_with_entity_routing(
                         query=search_query,
                         route_text=qy,
                         limit=_recall_limit,
@@ -514,7 +563,47 @@ class ToolsPhase(RunOnceHost):
                         scope_key=ctx_scope_key,
                         ignore_surfaces=_ignore,
                         exclude_names=core_names,
+                        scope=_scope,
                     )
+                    turn_seeds = pin_trigger_keyword_hits(qy, _found, limit=_TURN_SEED_CAP, scope=_scope)
+                    if st.ev is not None:
+                        from gsuid_core.ai_core.entity_index import (
+                            ALIAS_PLUGIN_EXTRA_KEY,
+                            sole_background_plugin,
+                        )
+                        from gsuid_core.ai_core.turn_pipeline import build_group_history_block
+
+                        _ctx_plugin = sole_background_plugin(qy, build_group_history_block(st.ev))
+                        if _ctx_plugin:
+                            st.run_extra[ALIAS_PLUGIN_EXTRA_KEY] = _ctx_plugin
+                            turn_seeds = await align_seeds_to_context_plugin(turn_seeds, _ctx_plugin, qy, _scope)
+                    if _call_self:
+                        from gsuid_core.ai_core.entity_index import strip_surfaces, plugins_in_text
+
+                        _utter = ""
+                        if st.ev is not None and st.ev.raw_text:
+                            _utter = st.ev.raw_text
+                        elif st.ev is not None and st.ev.text:
+                            _utter = st.ev.text
+                        else:
+                            from gsuid_core.ai_core.agent_run.speech_policy import spoken_user_body
+
+                            _utter = spoken_user_body(qy)
+                        _scan = strip_surfaces(_utter, _ignore) if _ignore else _utter
+                        _routed = plugins_in_text(_scan)
+                        # 向量检索命中不算。要实体路由真正装上该插件的工具。
+                        if len(_utter) >= 12 and _routed:
+                            _wanted = {name for name in _routed if name}
+
+                            def _mounted(tool_name: str) -> bool:
+                                base = find_tool_base(tool_name)
+                                return base is not None and bool(base.plugin) and base.plugin in _wanted
+
+                            _hit = any(_mounted(tool.name) for tool in _found)
+                            if not _hit:
+                                _hit = any(_mounted(name) for name in core_names)
+                            if _hit:
+                                st.entity_routed = True
                     if st.intent in ("工具", "问答"):
                         for _tn in ("web_search_tool", "web_fetch_tool"):
                             if _tn in core_names:
@@ -523,7 +612,7 @@ class ToolsPhase(RunOnceHost):
                             if _tb is not None:
                                 extra_tools.append(_tb.tool)
 
-                # 对用户发送 extras 不进静态附加池；只许本轮 find_tools 动态暴露
+                # 静态附加池仍去掉 send_*。本轮种子在快照后追加，不受这层剥离。
                 if st.group_slim or _interactive:
                     extra_tools = [t for t in extra_tools if not is_group_send_extra(t.name)]
 
@@ -546,6 +635,9 @@ class ToolsPhase(RunOnceHost):
                 )
                 if _interactive:
                     deduped_extra = _without_progress_tool(deduped_extra)
+                if not _scope.is_open:
+                    # 族展开会带出同域的跨插件成员，收口到作用域内
+                    deduped_extra = _scope.filter_tools(deduped_extra)
 
                 # L3 只记族 TTL，不把专属工具写进 core（exclusive 会闪烁前缀）
                 for _et in deduped_extra:
@@ -578,6 +670,20 @@ class ToolsPhase(RunOnceHost):
                                     names=sorted(_stripped)[:12],
                                 )
                             )
+
+                _added_seeds = append_turn_seeds(
+                    st.tools,
+                    turn_seeds,
+                    exclusive=_capability_exclusive_tool_names(),
+                )
+                if _added_seeds:
+                    logger.debug(
+                        i18n_t(
+                            "log.agent.turn_seed_exposed",
+                            n=len(_added_seeds),
+                            names=_added_seeds,
+                        )
+                    )
 
                 _need_subagent = _did_strip_exclusive
                 deleg_pid = ""
@@ -739,12 +845,18 @@ class ToolsPhase(RunOnceHost):
         """构建 pydantic-ai Agent 与流式统计元数据；返回 Agent 实例。"""
         # 当 return_model 指定时，使用 st.output_type 让 pydantic_ai 强制结构化输出
         # st.output_type 默认为 str（返回文本），指定 Pydantic 模型时强制返回结构化 JSON
-        _toolsets = [skills_toolset] if self.create_by in _SKILLS_CREATE_BY and not st.addr_gated else []
+        # 非主人在 get_tools 时看不见 run_skill_script；执行期还有 wrap_tool_execute。
+        _guarded_skills = skills_toolset.filtered(skill_tool_visible)
+        _toolsets = [_guarded_skills] if self.create_by in _SKILLS_CREATE_BY and not st.addr_gated else []
         # 启用渐进式暴露时挂 RetrievableToolset：每个 step 读 dynamic_tool_names 即时暴露命中工具。
         # exclude_names：静态池 + 能力代理专属（防 find_tools 把已剥离工具回灌主人格）。
         if st.expose_dynamic:
             _dyn_exclude = set(st.tool_names) | set(_require_context(st).blocked_tool_names)
-            _toolsets = [*_toolsets, RetrievableToolset(exclude_names=_dyn_exclude)]
+            _scope = st.tool_scope
+            _toolsets = [
+                *_toolsets,
+                RetrievableToolset(exclude_names=_dyn_exclude, scope=_scope if _scope is not None else None),
+            ]
         # eval_mode 下固定 temperature=0：记忆评测的答案须可复现，
         from gsuid_core.ai_core.memory.config import memory_config
 

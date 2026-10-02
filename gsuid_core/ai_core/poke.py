@@ -146,7 +146,7 @@ async def _send_persona_meme(
             observe_memory=False,
         )
     except Exception as exc:
-        logger.warning(t("[Poke] 发送人格表情失败: {exc}", exc=exc))
+        logger.warning(t("log.poke.persona_meme_failed", exc=exc))
         return False
 
 
@@ -170,7 +170,7 @@ async def _generate_reaction(ev: Event, persona_name: str) -> Optional[PokeReact
         if not decision.allowed:
             return None
     except Exception as exc:
-        logger.warning(t("[Poke] 预算预检失败，继续尝试低级模型: {exc}", exc=exc))
+        logger.warning(t("log.poke.budget_precheck_failed", exc=exc))
 
     from gsuid_core.message_history import get_history_manager
     from gsuid_core.ai_core.gs_agent import create_agent
@@ -190,10 +190,7 @@ async def _generate_reaction(ev: Event, persona_name: str) -> Optional[PokeReact
         "text 不超过 24 个汉字；mood 只写一个简短情绪词；可以决定是否回戳。"
         "不要解释系统机制，不要声称执行了尚未执行的动作，也不要请求或调用其他工具。"
     )
-    prompt = (
-        f"{history_context}\n\n"
-        "请对刚刚的戳一戳作出一次回应，并返回结构化结果。"
-    )
+    prompt = f"{history_context}\n\n请对刚刚的戳一戳作出一次回应，并返回结构化结果。"
     agent = create_agent(
         system_prompt=system_prompt,
         persona_name=persona_name,
@@ -222,10 +219,10 @@ async def _generate_reaction(ev: Event, persona_name: str) -> Optional[PokeReact
         )
         return result if isinstance(result, PokeReaction) else None
     except asyncio.TimeoutError:
-        logger.info(t("[Poke] 低级模型响应超时，降级为人格表情"))
+        logger.info(t("log.poke.model_timeout"))
         return None
     except Exception as exc:
-        logger.warning(t("[Poke] 低级模型响应失败，降级为人格表情: {exc}", exc=exc))
+        logger.warning(t("log.poke.model_failed", exc=exc))
         return None
     finally:
         agent._session_logger.close()

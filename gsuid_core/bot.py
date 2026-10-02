@@ -1,7 +1,7 @@
 import time
 import asyncio
 import inspect
-from typing import Any, Dict, List, Union, Literal, Optional
+from typing import Any, Dict, List, Union, Literal, Mapping, Optional
 
 from fastapi import WebSocket
 from msgspec import json as msgjson
@@ -68,8 +68,8 @@ def _truncate_for_log(obj: Any, max_str_len: int = 100) -> Any:
     if isinstance(obj, str):
         if obj.startswith("base64://") and len(obj) > 100:
             return f"base64://...({len(obj)} chars)"
-        elif obj.startswith("link://"):
-            return obj  # 链接保持原样
+        elif obj.startswith("link://") or obj.startswith("file://"):
+            return obj
         elif len(obj) > max_str_len:
             return obj[:max_str_len] + f"...({len(obj)} chars)"
         return obj
@@ -662,7 +662,7 @@ class _Bot:
         )
         logger.info(
             t(
-                "[Bot] 请求回戳用户: bot={bot_id}, target_type={target_type}, target_id={target_id}, user_id={user_id}",
+                "log.bot.poke_requested",
                 bot_id=bot_id,
                 target_type=target_type,
                 target_id=target_id,
@@ -725,7 +725,7 @@ class _Bot:
         except asyncio.TimeoutError:
             logger.warning(
                 t(
-                    "[Bot] 获取群成员列表超时: group_id={group_id}, echo={echo}",
+                    "log.bot.member_list_timeout",
                     group_id=group_id,
                     echo=echo,
                 )
@@ -895,7 +895,7 @@ class Bot:
     async def commit_streamed_history(
         self,
         text: str,
-        extra_metadata: Optional[Dict[str, object]] = None,
+        extra_metadata: Optional[Mapping[str, object]] = None,
     ) -> None:
         """增量已出站：只记 history，不再 send。默认无操作。"""
         return
@@ -1200,7 +1200,7 @@ class Bot:
         协议是否执行成功取决于 adapter 的实现与协议端支持。
         """
         if self.ev.task_event is not None:
-            logger.debug(t("[Bot] HTTP 模式不支持戳一戳"))
+            logger.debug(t("log.bot.http_poke_unsupported"))
             return False
         uid = str(user_id or "").strip()
         if not uid or uid == str(self.bot_self_id):
@@ -1237,7 +1237,7 @@ class Bot:
         超时或 adapter 不支持时返回 None。
         """
         if self.ev.task_event is not None:
-            logger.debug(t("[Bot] HTTP 模式不支持获取群成员列表"))
+            logger.debug(t("log.bot.http_member_list_unsupported"))
             return None
         gid = str(group_id or self.ev.group_id or "")
         if not gid:

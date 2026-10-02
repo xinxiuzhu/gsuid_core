@@ -74,15 +74,15 @@ class AISessionRegistry:
 
 | 机制 | 所属 | 配置 | 效果 |
 |------|------|------|------|
-| 滑动窗口 | `HistoryManager` | `deque(maxlen=40)` | 每 Session 最多 40 条消息 |
-| Token 上限 | `HistoryManager` | `MAX_HISTORY_TOKENS=160000` | 单 Session Token 超限淘汰最旧 |
+| 滚动记录 | `HistoryManager` | `RETAIN_SECONDS=12h` | 每 Session 保留最近 12 小时，跨过零点的仍留着 |
+| Token 计数 | `HistoryManager` | 只统计，不按 token 删 | 12 小时窗口里的长文仍占内存 |
 | AI 历史限制 | `AISessionRegistry` | `MAX_AI_HISTORY_LENGTH=30` | AI 对话历史 ≤ 30 条 |
 | Agent 内部截断 | `GsCoreAIAgent` | `agent_max_history` 默认 **30**（可配） | 超水位 **保头裁中段**（`compact_session_history`） |
 | 空闲清理 | `AISessionRegistry` | `IDLE_THRESHOLD=1800`(30min) | 30 分钟不活跃 Session 自动清除 |
 | 定时清理 | `AISessionRegistry` | `CLEANUP_INTERVAL=3600`(1h) | 每小时检查一次 |
 
-> ⚠️ **隐形 Token 爆炸**：`deque(maxlen=40)` 只按**条数**截断。群里 5 个人各发 10 篇 5000 字
-> 长文 = 50 条但 25 万字，瞬间突破 Token 上限。所以 `GsCoreAIAgent.extract_history` 走
+> ⚠️ **隐形 Token 爆炸**：`HistoryManager` 按 12 小时留消息，长文仍占内存。
+> 所以 `GsCoreAIAgent.extract_history` 走
 > **`compact_session_history`（保头裁中段 + 工具配对）**——**永不砍 `history[0]`**，只丢中间段、
 > 留近期尾，保证 provider **前缀缓存**头部字节跨 compact 不变。配对保护见
 > `_truncate_history_keep_prefix` / `_drop_orphan_tool_results`。
@@ -130,10 +130,48 @@ RESOURCE_PATH/persona/{persona_name}/
 | `ai_mode` | List[str] | `["提及应答"]` | AI 行动模式 |
 | `scope` | str | `"disabled"` | 启用范围 |
 | `target_groups` | List[str] | `[]` | 目标群聊 |
-| `inspect_interval` | int | `30` | 巡检间隔（分钟） |
+| `inspect_interval` | int | `60` | 巡检间隔（分钟） |
 | `keywords` | List[str] | `[]` | 唤醒关键词 |
-| `tool_packs` | List[str] | `["dynamic"]` | 工具能力族（dynamic=五层自动装配 / task_basics / capability_domain 族名） |
-| `tool_names` | List[str] | `[]` | 显式工具白名单（并入保底池，不经向量检索） |
+| `speech_len_soft` | int | `60` | 台词软上限（字）。**留默认即跟随 `chat_style` 派生** |
+| `speech_len_hard` | int | `150` | 台词硬上限（字）。同上。注意终局正文**没有长度硬拦**（`speech_policy.py` 显式弃用），只写进 prompt 起偏置作用 |
+| `chat_style` | int | `50` | **说话强度** 0~100：0=惜字如金 / 50=默认 / 100=连珠炮 |
+| `enabled_tools` | List[str] | `["*"]` | 启用工具（按插件），管辖向量检索池。`*`=全部插件；`!插件名`=排除；只列具体名=仅这些。空列表=一个都不启用 |
+| `tool_names` | List[str] | `[]` | 显式工具白名单（常驻直装，不经向量检索） |
+| `capability_agents` | List[str] | `["*"]` | 可委派能力代理 node_id。`*`=全部；`!render_agent` 禁用出图。空列表=不可委派 |
+
+#### `chat_style`：发言**形态**档（`persona/chat_style.py`，2026-09-28）
+
+与 `relationship/zones.py` **正交且不重叠**：zone 管「对这个人什么态度」（冷热 / 主动与否），
+`chat_style` 管「发成什么形状」（几条 / 多长 / 怎么分段）。刻意不合并——`zones` 要求同一语义
+只有一处定义，**欲望不在 persona 配置里开第二把尺**。
+
+| `chat_style` | 气泡数 | soft / hard | 分段契约 |
+|---|---|---|---|
+| 0–24 | 1 | 30 / 80 | 一次只说一件事，说完即止，不分段 |
+| 25–74（默认 50） | 2 | 60 / 150 | 默认一整段；层次确实不同才用空行分两条 |
+| 75–100 | 4 | 90 / 200 | 可连发多条：**每条之间用一个空行分隔**，每条独立完整 |
+
+- 契约句只讲**结构**，不含业务垂直词与角色口癖，框架层人格中性（AGENTS.md §1.9）。
+- 建 session 时经 `processor.build_persona_prompt` 进 **system 稳定前缀**，会话内不改串
+  （§1.7）；改配置需**新会话**才生效。
+- 气泡数与 `ai_config.main_channel_visible_limit` 是**两把相乘的闸**，只调一把没反应。
+- ⚠️ 边界对齐 `options=[0, 25, 50, 75, 100]`，**默认 50 必须落在「默认」档**——
+  改分档时别让默认值掉进 terse，否则升级即静默把「最多 2 条」降成 1 条。
+  锁在 `tests/test_send_chat_result_bubbles.py`。
+
+### 工具三层来源（`enabled_tools` 只管中间一层）
+
+| 层 | 内容 | 受 `enabled_tools` 收放 |
+|----|------|----------------------|
+| 常驻直装 | `MAIN_AGENT_CORE_TOOLS`（`send_message_by_ai` / `find_tools` / `create_subagent` …）+ persona `tool_names` | ❌ 框架能力，恒在场 |
+| 向量检索 | L3 语义召回 + `find_tools` 域检索 + `RetrievableToolset` 动态暴露 | ✅ 唯一受管辖的一层 |
+| 能力族静态挂载 | 仅能力代理节点仍可显式声明静态族（`task_basics` 等）；persona 侧已固定 `dynamic`，不再开放配置 | ❌ |
+
+判定口是 `ai_core/agent_node/tool_scope.py` 的 `ToolScope`（一次装配取一次快照，
+装配链路全程只读同一份）。`core` / 空插件名视为框架自身，永远启用；未注册工具放行。
+人格模板 **没有** `tool_packs`：五层自动装配由 `persona_proj.py` 恒定挂 `[DYNAMIC_PACK]`
+（`agent_run/tools.py` 的 `has_dynamic_pack` 恒真）。静态族只出现在能力代理节点。
+控制台选择器是「显式工具白名单」与「按插件」（`GET /api/persona/tools/catalog`）。
 
 > **AgentNode 同构（2026-07-07）**：每个 persona 目录经 `ai_core/agent_node/persona_proj.py`
 > 投影为 `source="persona"` 的只读 AgentNode（与能力代理同一注册表 / 同一 schema），
@@ -156,7 +194,8 @@ RESOURCE_PATH/persona/{persona_name}/
 ```
 
 `PersonaConfigManager` 提供 `set_scope` / `set_target_groups` / `set_ai_mode` /
-`set_inspect_interval` / `set_keywords` 等方法，全部即时持久化。
+`set_inspect_interval` / `set_keywords` / `set_enabled_tools` / `set_tool_names` 等方法，
+全部即时持久化。
 
 ### `persona.json`（`persona/settings.py`）
 
@@ -173,8 +212,13 @@ RESOURCE_PATH/persona/{persona_name}/
 | `error_generic` | `这条消息我处理失败了，稍后再试一次吧` | 执行失败 / 无结果 |
 | `error_timeout` | `刚才网络太慢处理超时了，稍后再试试吧` | 超时 |
 | `error_content_policy` | `这条消息触发了内容安全策略，我没法处理` | 内容安全 |
-| `fallback_ooc` | `这个不太想说呢。` | 出戏拦截兜底 |
-| `fallback_machine` | `额…出错了，稍后再试` | 技术堆栈熔断 |
+
+> **出戏拦截没有罐头文案**（2026-09 起）：`fallback_ooc` / `fallback_machine` 两个键与
+> `output_firewall.fallback_ooc_text` / `fallback_machine_text` 访问器已删除。命中闸门一律
+> 让当前人格自己重说一句（`gs_agent._ooc_recover_persona_voice`，两次机会），两次都不干净时
+> 人格/一致性类**原样发送**、`fund_claim` / `machine_dump` 与模型主动沉默才丢弃；没有 run 的
+> 出口（主动播报 / `send_chat_result` 末端）直接丢弃正文。
+> 剩下的 `error_*` 全是**供应商侧**失败（超时 / 套餐打满 / 内容审核），那不是「角色在说话」。
 
 ### Persona 配置热重载特殊处理
 
@@ -204,7 +248,8 @@ RESOURCE_PATH/persona/{persona_name}/
    `_maybe_refresh_stable_prompt` 直接 return。需要「系统提醒」时只在 **user 侧
    `UserPromptPart` 追加**，落盘前由 `_relean_user_turn` / `_is_framework_prompt_content` 剥掉。
 2. **`message_history` 保头**：`compact_session_history` 裁中段，禁止砍头、禁止锚点插头。
-3. **动态内容进 user**：mood / 关系 / 记忆 / 精确时间 / 身份锚只进每轮 user 装配。
+   发言文本仍在 `HistoryManager`（最近 12 小时）。`read_chat_history` 用 query 或 at 取片段，不一次倒出；别人的私聊只有主人能读。
+3. **动态内容进 user**：mood / 关系 / 记忆 / 当前说话人偏好 / 精确时间 / 身份锚只进每轮 user 装配。`preferences_learned` 与 `AIMemPreference` 不进 system：群会话前缀整群共享，按人换系统提示会打掉缓存。偏好拼在本轮 user 尾，按说话人取，不靠问句词面命中。
 4. **persona 文件 mtime 变化** 仍会整会话重建（显式热重载，非每轮改 system）。
 
 历史曾用有限 TTL 原地刷新 system（O-3）；现行默认 **inf = 最大化 cache**。若显式改回有限

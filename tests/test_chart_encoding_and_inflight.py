@@ -199,32 +199,6 @@ def test_inflight_and_active_task_block_numeric_dump() -> None:
     assert not blk3
 
 
-def test_delivery_copy_forbids_expanding_long_text() -> None:
-    from typing import Any
-
-    from gsuid_core.ai_core.planning.kanban_executor import _format_delivery_for_main_agent
-
-    class _Task:
-        ordinal = 1
-        display_name = "单元测交付"
-        failure_reason: str | None = None
-
-    class _Art:
-        id = "res_abc123456789"
-        mime = "text/markdown"
-        summary = "摘要一行即可"
-        payload_path = "/tmp/x.md"
-        payload_inline: str | None = None
-
-    task: Any = _Task()
-    arts: Any = [_Art()]
-    text = _format_delivery_for_main_agent(task, "A" * 50_000, arts)
-    assert "禁止展开念台词" in text
-    assert "禁止把对照表念进气泡" in text
-    assert "A" * 100 not in text
-    assert "limit=8000" not in text
-
-
 def test_render_prompt_mentions_series_encoding() -> None:
     from gsuid_core.ai_core.capability_agents.profiles import _RENDER_PROMPT, _RESEARCH_PROMPT
     from gsuid_core.ai_core.capability_agents.delegation_contracts import (
@@ -362,6 +336,34 @@ def test_inflight_quota_allows_short_ack_once() -> None:
         has_status_tool=False,
         tool_calls_so_far=["create_subagent"],
         wait_comfort_sent=True,
+    )
+    assert blk2 and why2 == "silence_only_or_async"
+
+
+def test_inflight_partial_progress_ack_is_sent_once() -> None:
+    """翻完一部分但仍要查，是接任务应，在途只放行一次。"""
+    line = "前面那份翻完了，另一份还缺，先让我查查。"
+    assert looks_like_task_accept_speech(line, max_len=150)
+    blk, why = should_block_user_visible_text(
+        "silence_only",
+        line,
+        pending_async=True,
+        image_sent=False,
+        has_status_tool=False,
+        tool_calls_so_far=["create_subagent"],
+        wait_comfort_sent=False,
+        speech_len_hard=150,
+    )
+    assert not blk, why
+    blk2, why2 = should_block_user_visible_text(
+        "silence_only",
+        line,
+        pending_async=True,
+        image_sent=False,
+        has_status_tool=False,
+        tool_calls_so_far=["create_subagent"],
+        wait_comfort_sent=True,
+        speech_len_hard=150,
     )
     assert blk2 and why2 == "silence_only_or_async"
 

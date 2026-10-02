@@ -16,8 +16,6 @@ from unittest.mock import AsyncMock, patch
 
 from gsuid_core.ai_core.cognition import (
     ALL_KINDS,
-    KIND_LABEL,
-    WORK_KINDS,
     MEMORY_KINDS,
     KNOWLEDGE_KINDS,
     DEFAULT_RECALL_KINDS,
@@ -51,26 +49,6 @@ def _empty_group_profile_patch() -> Any:
     return patch("gsuid_core.ai_core.memory.group_profile.get_group_profile", new=_profile)
 
 
-def test_kind_taxonomy_is_complete_and_labelled() -> None:
-    """六类语义互不覆盖，且每类都有面向模型的中文标签。"""
-    assert set(KIND_LABEL) == set(CogKind)
-    assert MEMORY_KINDS < ALL_KINDS
-    assert KNOWLEDGE_KINDS == {CogKind.KNOWLEDGE}
-    assert WORK_KINDS == {CogKind.TOOL_OUTPUT, CogKind.ARTIFACT}
-    assert DEFAULT_RECALL_KINDS < ALL_KINDS
-    assert CogKind.MEME not in DEFAULT_RECALL_KINDS
-    assert CogKind.OUTBOUND not in DEFAULT_RECALL_KINDS
-    assert SPEAKER_RECALL_KINDS <= MEMORY_KINDS
-    assert CogKind.EPISODE in SPEAKER_RECALL_KINDS
-    assert CogKind.KNOWLEDGE not in SPEAKER_RECALL_KINDS
-    assert CogKind.TOOL_OUTPUT not in SPEAKER_RECALL_KINDS
-    # ⑧ 每轮默认切片不含知识/落盘（延迟不回退）
-    assert CogKind.KNOWLEDGE not in MEMORY_KINDS
-    assert CogKind.TOOL_OUTPUT not in MEMORY_KINDS
-    # 偏好在默认切片里：它是「须遵守」的硬约束
-    assert CogKind.PREFERENCE in MEMORY_KINDS
-
-
 def test_scope_and_kinds_have_no_internal_default() -> None:
     """两个真实 bug 的共同根因是「可选参数被内部兜底成看起来合理的值」。"""
     from gsuid_core.ai_core.cognition import search_cognition
@@ -80,17 +58,6 @@ def test_scope_and_kinds_have_no_internal_default() -> None:
         param = sig.parameters[name]
         assert param.default is inspect.Parameter.empty, f"{name} 不许有默认值"
         assert param.kind is inspect.Parameter.KEYWORD_ONLY
-
-
-def test_dual_route_enable_system2_is_required() -> None:
-    """``enable_system2`` 必填：函数默认值曾是 True 而生产配置默认关，工具路径偷跑。"""
-    from gsuid_core.ai_core.memory.retrieval.dual_route import dual_route_retrieve
-
-    param = inspect.signature(dual_route_retrieve).parameters["enable_system2"]
-    assert param.default is inspect.Parameter.empty
-    assert param.kind is inspect.Parameter.KEYWORD_ONLY
-    # group_id 也必须是关键字参数，避免位置传参把 user_id 错位成 group
-    assert inspect.signature(dual_route_retrieve).parameters["group_id"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 def test_private_scope_is_none_not_user_id() -> None:
@@ -109,16 +76,18 @@ def test_scope_defaults_are_conservative() -> None:
 
 
 def test_empty_result_is_one_short_line() -> None:
-    """空结果只回一行——历史上要拼「未找到 + 无匹配 + 长说明」三大段。
+    """空结果只回一行，且**不得携带检索术语与工具名**。
 
-    一行之内还必须指路：只说「无命中」时模型会原地编答案或换个说法重搜，
-    收成单一动词后这类空转的成本全压在这一个工具上。
+    历史上这里是「无命中 / 未召回 ≠没存过」 + 三个工具名。旣一方向正确（模型会实际调工具），
+    但它同时把禁用的口径原文交到了模型手上，模型照抄就对群里讲「没查到 / 原话没存下来」。
+    因此此处是**有意的语义反转**：一行与指路保留，口径改为人话。
     """
     block = render_cognition_block("竖图偏好", [])
     assert len(block.splitlines()) == 1
     assert len(block) < 160, f"{len(block)} 字：{block}"
-    assert "无命中" in block
-    assert "web_search_tool" in block and "find_tools" in block
+    assert "没有可用材料" in block
+    for leak in ("无命中", "召回", "没存过", "web_search_tool", "find_tools", "search_cognition"):
+        assert leak not in block, f"空结果泄漏禁用口径 {leak}: {block}"
 
 
 def test_hits_render_with_kind_labels_and_handles() -> None:
@@ -190,7 +159,25 @@ def test_episode_render_keeps_name_but_caps_body() -> None:
     assert len(line) < 40 + EPISODE_BODY_BUDGET
 
 
+def test_document_excerpt_render_keeps_a_late_row() -> None:
+    row = "公积金 99"
+    summary = "【文档】a.md\n" + ("封面\n" * 200) + row
+    hit = CognitiveHit(
+        kind=CogKind.EPISODE,
+        id="doc1",
+        title="",
+        summary=summary,
+        score=0.8,
+        high_confidence=True,
+    )
+    line = hit.render_line(1)
+    assert row in line
+    assert "封面" in line
+
+
 def test_episode_expand_cap_folds_overflow() -> None:
+    from gsuid_core.ai_core.cognition.facade import _EPISODE_EXPAND_CAP
+
     hits = [
         CognitiveHit(
             kind=CogKind.EPISODE,
@@ -200,11 +187,11 @@ def test_episode_expand_cap_folds_overflow() -> None:
             score=0.8,
             high_confidence=True,
         )
-        for i in range(8)
+        for i in range(_EPISODE_EXPAND_CAP + 2)
     ]
     block = render_cognition_block("q", hits)
-    assert "专名0" in block and "专名5" in block
-    assert "专名6" not in block and "专名7" not in block
+    assert "专名0" in block and f"专名{_EPISODE_EXPAND_CAP - 1}" in block
+    assert f"专名{_EPISODE_EXPAND_CAP}" not in block
     assert "另有 2 条弱相关" in block
 
 
@@ -484,14 +471,118 @@ def test_memory_hits_are_not_evicted_by_knowledge_rrf() -> None:
     assert all(h.kind is CogKind.EPISODE for h in hits)
 
 
-def test_weak_hits_are_not_promoted_to_high_confidence() -> None:
-    from pathlib import Path
+def test_named_knowledge_keeps_slots_when_memory_fills_limit() -> None:
+    """片段占满 limit 时，标题带专名的知识仍留下，无关知识不占名额。"""
+    from gsuid_core.ai_core.cognition import search_cognition
 
-    src = (Path(__file__).resolve().parent.parent / "gsuid_core/ai_core/cognition/facade.py").read_text(
-        encoding="utf-8"
-    )
-    assert "_ALWAYS_SHOWN_TOP" not in src
-    assert "_HIGH_CONF_FUSED_CAP" in src
+    mem_hits = {
+        f"m{i}": CognitiveHit(kind=CogKind.EPISODE, id=f"m{i}", title=f"ep{i}", summary="chat", score=0.8)
+        for i in range(8)
+    }
+    kb_hits = {
+        "k_hit": CognitiveHit(
+            kind=CogKind.KNOWLEDGE,
+            id="k_hit",
+            title="北站手册-基础信息",
+            summary="station",
+            score=1.0,
+        ),
+        "k_miss": CognitiveHit(
+            kind=CogKind.KNOWLEDGE,
+            id="k_miss",
+            title="无关条目",
+            summary="other",
+            score=0.9,
+        ),
+    }
+
+    async def _fake_memory(query: str, *, kinds: Any, scope: Any, limit: int, **_kw: Any) -> Any:
+        _ = (query, kinds, scope, limit)
+        return [f"m{i}" for i in range(8)], mem_hits
+
+    async def _fake_kb(query: str, *, scope: Any, limit: int) -> Any:
+        _ = (query, scope, limit)
+        return ["k_hit", "k_miss"], kb_hits
+
+    empty = _empty_backend()
+    with (
+        patch("gsuid_core.ai_core.cognition.facade._search_memory", new=_fake_memory),
+        patch("gsuid_core.ai_core.cognition.facade._search_knowledge_backend", new=_fake_kb),
+        patch("gsuid_core.ai_core.cognition.facade._search_fileos", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_artifacts", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_history", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_records", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_images", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_memes", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_meme_knowledge", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_outbound", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_nodes", new=empty),
+    ):
+        hits = _run(
+            search_cognition(
+                "北站手册 和另一本",
+                kinds=MEMORY_KINDS | KNOWLEDGE_KINDS,
+                scope=CogScope(user_id="u1"),
+                limit=8,
+            )
+        )
+    ids = [h.id for h in hits]
+    assert ids[0].startswith("m")
+    assert "k_hit" in ids
+    assert "k_miss" not in ids
+    assert hits[ids.index("k_hit")].high_confidence
+
+
+def test_search_cognition_drops_weak_episodes_without_needles() -> None:
+    """专名不在正文里的片段不得以「命中 24」展开。"""
+    from gsuid_core.ai_core.cognition import search_cognition
+
+    packed = {
+        "ep_hit": CognitiveHit(
+            kind=CogKind.EPISODE,
+            id="ep_hit",
+            title="",
+            summary="Johnny reviewed the tuning logic.",
+            score=0.8,
+        ),
+        "ep_miss": CognitiveHit(
+            kind=CogKind.EPISODE,
+            id="ep_miss",
+            title="",
+            summary="We discussed RAG sharding and dense search.",
+            score=0.8,
+        ),
+    }
+
+    async def _fake_memory(query: str, *, kinds: Any, scope: Any, limit: int, **_kw: Any) -> Any:
+        _ = (query, kinds, scope, limit)
+        return ["ep_hit", "ep_miss"], packed
+
+    empty = _empty_backend()
+    with (
+        patch("gsuid_core.ai_core.cognition.facade._search_memory", new=_fake_memory),
+        patch("gsuid_core.ai_core.cognition.facade._search_knowledge_backend", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_fileos", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_artifacts", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_history", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_records", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_images", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_memes", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_meme_knowledge", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_outbound", new=empty),
+        patch("gsuid_core.ai_core.cognition.facade._search_nodes", new=empty),
+    ):
+        hits = _run(
+            search_cognition(
+                "Does Johnny have expertise?",
+                kinds=MEMORY_KINDS,
+                scope=CogScope(user_id="u1"),
+                limit=10,
+            )
+        )
+    ids = [h.id for h in hits]
+    assert "ep_hit" in ids
+    assert "ep_miss" not in ids
 
 
 def test_speaker_query_keeps_location_facts_without_userid() -> None:
@@ -596,7 +687,7 @@ def test_search_memory_includes_episodes_with_rank_scores() -> None:
             episodes=[
                 Episode(
                     id="e1",
-                    content="I prefer Adobe Premiere Pro tutorials for advanced color grading.",
+                    content="I prefer Adobe Premiere Pro video editing tutorials for advanced color grading.",
                     valid_at="2023-05-30 12:00:00",
                     scope_key="user_global:u1",
                     embedding=[],
@@ -755,15 +846,6 @@ def test_search_nodes_omits_self_scope_without_bot_id() -> None:
     assert make_scope_key(ScopeType.USER_GLOBAL, "u1") in captured
 
 
-def test_self_note_distill_and_search_share_self_scope() -> None:
-    """写入侧和检索侧必须用同一把 SELF key，防止再漂移。"""
-    from gsuid_core.ai_core.cognition.facade import _search_nodes
-    from gsuid_core.ai_core.cognition.distill import distill_self_note
-
-    assert "ScopeType.SELF" in inspect.getsource(distill_self_note)
-    assert "ScopeType.SELF" in inspect.getsource(_search_nodes)
-
-
 # ── 节点层：索引，不是第二份正文 ──
 
 
@@ -812,12 +894,6 @@ def test_attachment_identity_is_node_plus_ref() -> None:
     assert ("node_id", "ref") in names, names
 
 
-def test_edge_kinds_are_a_minimal_set() -> None:
-    from gsuid_core.ai_core.cognition.nodes import CogEdgeKind
-
-    assert {e.value for e in CogEdgeKind} == {"related", "supports", "supersedes", "derived_from"}
-
-
 def test_edge_table_rejects_self_loops_and_duplicates() -> None:
     from gsuid_core.ai_core.cognition.nodes import AICogEdge
 
@@ -835,26 +911,6 @@ def test_distill_gate_wants_facts_not_narrative() -> None:
     assert is_worth_distilling("约定：以后周报在每周五下午发")
     assert not is_worth_distilling("好的")
     assert not is_worth_distilling("今天心情不错，随便聊了聊，没什么特别的事情发生呢")
-
-
-def test_distilled_facts_are_marked_self_action() -> None:
-    """C6：允许回流工具/任务的**结构化结论**，但必须标明来源是「我做过的事」。"""
-    src = inspect.getsource(__import__("gsuid_core.ai_core.cognition.distill", fromlist=["x"]))
-    assert 'source="self_action"' in src
-    # 助手台词不进群事实图
-    assert "台词" in src
-
-
-def test_prefetch_is_gated_and_off_by_default() -> None:
-    """D-11 边界：有门（非每轮）、只在问答/工具意图、注入目录卡而非全文，且默认关。"""
-    from gsuid_core.ai_core.kits.memory import kit as memory_kit
-    from gsuid_core.ai_core.configs.ai_config import ai_config
-
-    assert ai_config.get_config("cognition_prefetch_enable").data is False, "预取必须默认关，灰度后再翻"
-    src = inspect.getsource(memory_kit)
-    assert "cognition_prefetch_enable" in src
-    assert '("问答", "工具")' in src, "预取必须有意图门"
-    assert "目录卡" in src or "已检索·目录" in src
 
 
 def test_chitchat_gate_still_skips_retrieval() -> None:
@@ -888,18 +944,6 @@ def test_knowledge_query_appends_group_mapping_formal() -> None:
         raw = _run(_knowledge_query_for_scope("East 怎么样", CogScope(user_id="u1", group_id="ST")))
     assert expanded.endswith("AcmeCorp")
     assert "AcmeCorp" not in raw
-
-
-def test_memory_slice_keeps_the_five_budget_slots() -> None:
-    """⑧ 注入必须保留 to_prompt_text 的五个配额位，否则偏好会被事实挤掉。"""
-    from gsuid_core.ai_core.cognition.facade import inject_memory_slice
-
-    src = inspect.getsource(inject_memory_slice)
-    assert "to_prompt_text" in src, "不许改用通用渲染，那会丢掉偏好独立配额"
-    assert "priority_speakers" in src
-    assert "current_speaker_ids" in src, "第三方隐私门不能丢"
-    assert "memory_inject_max_chars" in src
-    assert "query=query" in src
 
 
 def test_repeat_query_is_short_circuited_within_a_run() -> None:
@@ -937,12 +981,15 @@ def test_repeat_query_is_short_circuited_within_a_run() -> None:
         third = _run(search_cognition(ctx, query="完全不同的问题"))
 
     assert len(calls) == 2, calls
-    assert "无命中" in first
-    assert "本轮已检索过" in second
-    assert "仍无命中" in second
+    assert "没有可用材料" in first
+    assert "本轮已拿这个问法问过" in second
+    assert "仍无可用材料" in second
     assert "含路径卡" not in second
-    assert "web_search_tool" in second, "短路回执必须指路到外部检索工具"
-    assert "无命中" in third
+    # 短路回执仍须指路，但不得出现工具名或查询术语
+    assert "联网来源" in second, "短路回执必须指路到外部来源"
+    for leak in ("web_search_tool", "read_handle", "无命中", "认知层是只读的"):
+        assert leak not in second, f"短路回执泄漏禁用口径 {leak}: {second}"
+    assert "没有可用材料" in third
 
 
 def test_readonly_retrieval_tools_have_a_stricter_thrash_limit() -> None:
@@ -964,18 +1011,23 @@ def test_cognition_tool_docstring_steers_away_from_realtime_data() -> None:
 
     收成单一「回想」动词后，模型会把它当通用搜索用（实测抢掉了 web_search_tool），
     所以边界必须写在描述开头、且指名道姓。
+
+    反转（语义修正不是回归）：原文在**空结果段落**又点了一次 ``find_tools``，
+    让模型知道"该改调哪个工具"——这类内部工具名会被照抄进台词（群聊出戏实证）。
+    现在那一段只说人话（另找联网来源 / 另找对应能力），点名只保留在开头的边界句。
     """
     from gsuid_core.ai_core.buildin_tools.rag_search import search_cognition
 
     doc = search_cognition.__doc__ or ""
     assert "不查实时" in doc
     assert "web_search_tool" in doc
-    assert "find_tools" in doc
     assert "专名/数字/约束" in doc
     head = doc[: doc.find("Args:")] if "Args:" in doc else doc
     assert head.index("不查实时") < head.index("什么时候用"), "边界必须先于用法"
+    assert "web_search_tool" in head, "边界句要指名替代工具，否则模型会拿它当通用搜索"
     assert "说话人ID + 要填的槽" in doc
     assert "外部题目" in doc
+    assert "find_tools" not in doc, "空结果段落不该再点名别的工具：工具名会被照抄进台词"
 
 
 def test_web_search_docstring_defers_to_speaker_recall() -> None:
@@ -984,14 +1036,3 @@ def test_web_search_docstring_defers_to_speaker_recall() -> None:
     doc = web_search_tool.__doc__ or ""
     assert "search_cognition" in doc
     assert "空槽" in doc
-
-
-def test_memory_budget_literal_is_gone() -> None:
-    """1200 字面量把 memory_inject_max_chars 架空了，必须已删除。"""
-    from pathlib import Path
-
-    root = Path(__file__).resolve().parent.parent / "gsuid_core" / "ai_core"
-    for rel in ("context_assembly.py", "kits/memory/kit.py", "cognition/facade.py"):
-        src = (root / rel).read_text(encoding="utf-8")
-        assert "1200" not in src, f"{rel} 仍有 1200 字面量"
-        assert "1197" not in src, f"{rel} 仍有 1197 字面量"

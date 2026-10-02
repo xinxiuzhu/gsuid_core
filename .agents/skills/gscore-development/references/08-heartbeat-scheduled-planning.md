@@ -42,9 +42,10 @@ class HeartbeatInspector:
       通过 → _inspect_session_with_semaphore（Semaphore(5) 控并发）
         └── run_heartbeat 两阶段：
               阶段一 决策（DECISION_PROMPT）→ {should_speak, mood, context_hook}
-                    └─ 话头门（2026-08-10）：should_speak=True 但 context_hook 为空
-                       （给不出具体可接话头）→ 降级沉默，不进阶段二
-              阶段二 生成发言（PROACTIVE_MESSAGE_PROMPT，仅 should_speak=True 且有话头）
+                    └─ 话头门：空 hook，或 hook 对不上近窗人类原句/C8 合并语境
+                       （`heartbeat_hook_require_human_span`）→ 降级沉默
+                       合并语境 peek，开口成功后才 consume
+              阶段二 生成发言；与近窗主动正文过相似（`heartbeat_repeat_window`）→ 丢弃
             → _send_proactive_message（metadata={"proactive": True}）
 ```
 
@@ -187,6 +188,15 @@ current_task；引用类工具用自然语言句柄（`resolver.resolve_task_ref
 `memory_curator` / `scheduler_assistant` + 内部 `capability_evaluator`。业务画像（如
 `finance_agent`）由插件注册（`source` 三态 builtin/plugin/user，用户画像落
 `data/ai_core/capability_agents/<id>.json` 启动自动挂回）。
+
+> **仅主人节点 + 高危执行工具（2026-09-22）**：`code_agent` / `plugin_developer_agent`
+> 以及白名单含 `execute_file` / `execute_shell_command` / `run_command` 的节点是
+> `master_only`。非主人在 `create_subagent`、`register_kanban_task`、重派、执行器派活前
+> 都会被拒（认主人名单，不认任务上的 `user_pm`）。即便节点门被绕过，`execute_file`、
+> `execute_shell_command`、`run_command`、`run_skill_script` 在**主人格和子代理**里仍由
+> `wrap_tool_execute`（`block_high_risk_execute`）在函数体之前拒绝；非主人的能力代理
+> 装配时还会把这些名字从列表里剥掉，技能工具集对非主人隐藏 `run_skill_script`。
+> 实现在 `ai_core/tool_risk.py`。
 
 > **Windows subprocess 兼容（2026-08-14 更正）**：此处此前写「SelectorEventLoop 不支持子进程，
 > `code_agent` 跑 `execute_shell_command`/`execute_file` 在 Windows 必抛 `NotImplementedError`」

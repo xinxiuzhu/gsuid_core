@@ -18,6 +18,7 @@ from gsuid_core.logger import logger
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.resource import FILE_PATH
+from gsuid_core.ai_core.tool_risk import check_high_risk_operator, visible_to_master_operator
 
 # Windows 分支是历史兜底（宿主已改回 Proactor，asyncio 子进程可用）；
 # 与 command_executor.py 同源——见同名常量的注释与 dev §12.3。
@@ -154,6 +155,21 @@ async def write_file_content(
         return f"错误：写入文件失败: {str(e)}"
 
 
+def _workspace_file_size(path: Path, workspace: Path) -> Optional[int]:
+    """存在 / 是普通文件 / 在 workspace 内时返回字节数，否则 None。
+
+    同步执行（stat 会打盘），调用方须 ``asyncio.to_thread`` 丢线程池。
+    """
+    if not path.exists() or not path.is_file():
+        return None
+    # 确保路径在 workspace 内
+    try:
+        path.resolve().relative_to(workspace.resolve())
+    except ValueError:
+        return None
+    return path.stat().st_size
+
+
 async def _register_single_workspace_file(path: Path) -> None:
     """把单个 workspace 内文件登记为 workspace_file artifact（如未登记）。
 
@@ -168,14 +184,9 @@ async def _register_single_workspace_file(path: Path) -> None:
         plan_ctx = get_plan_context()
         if plan_ctx is None or plan_ctx.artifact_workspace is None or not plan_ctx.task_id:
             return
-        if not path.exists() or not path.is_file():
+        size = await asyncio.to_thread(_workspace_file_size, path, plan_ctx.artifact_workspace)
+        if size is None:
             return
-        # 确保路径在 workspace 内
-        try:
-            path.resolve().relative_to(plan_ctx.artifact_workspace.resolve())
-        except ValueError:
-            return
-        size = path.stat().st_size
         await register_workspace_artifacts(
             root_task_id=plan_ctx.root_task_id,
             task_id=plan_ctx.task_id,
@@ -231,7 +242,11 @@ async def _record_workspace_violation(req_path: str, detail: str) -> None:
         return
 
 
-@ai_tools(capability_domain="文件")
+@ai_tools(
+    capability_domain="文件",
+    check_func=check_high_risk_operator,
+    visible_when=visible_to_master_operator,
+)
 async def execute_file(
     ctx: RunContext[ToolContext],
     file_path: str,
@@ -306,6 +321,9 @@ async def execute_file(
         exec_cwd_path = _resolve_exec_cwd(FILE_PATH)
         exec_cwd = str(exec_cwd_path)
 
+        ev = ctx.deps.ev
+        uid = str(ev.user_id) if ev is not None else ""
+        logger.info(t("log.ai.tool_risk_master_exec_file", user_id=uid, path=file_path[:120]))
         logger.info(t("log.ai.buildintools_file_cwd_exec", p0=" ".join(cmd), exec_cwd=exec_cwd))
 
         # 执行前快照 workspace（仅当 cwd 是任务的 workspace 时——非任务上下文跑
@@ -321,7 +339,8 @@ async def execute_file(
                 # 仅当 exec_cwd 就是当前任务的 workspace 时才扫描——避免把 FILE_PATH
                 # 沙盒的产物错登记到任务 workspace（虽然两者通常一致）
                 if str(exec_cwd_path.resolve()) == str(ws.resolve()):
-                    before_snapshot = snapshot_workspace(ws)
+                    # rglob 全量遍历，扔线程池避免阻塞事件循环
+                    before_snapshot = await asyncio.to_thread(snapshot_workspace, ws)
         except ImportError:
             before_snapshot = None
 
@@ -342,7 +361,9 @@ async def execute_file(
 
                 plan_ctx = get_plan_context()
                 if plan_ctx is not None and plan_ctx.artifact_workspace is not None and plan_ctx.task_id:
-                    changes = scan_workspace_changes(plan_ctx.artifact_workspace, before_snapshot)
+                    changes = await asyncio.to_thread(
+                        scan_workspace_changes, plan_ctx.artifact_workspace, before_snapshot
+                    )
                     if changes:
                         await register_workspace_artifacts(
                             root_task_id=plan_ctx.root_task_id,

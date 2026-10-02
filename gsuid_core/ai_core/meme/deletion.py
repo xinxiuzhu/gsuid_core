@@ -107,9 +107,9 @@ async def create_delete_preview(
         if exclude_ids:
             stmt = stmt.where(col(AiMemeRecord.meme_id).not_in(list(dict.fromkeys(exclude_ids))))
         if folder is not None:
-            stmt = stmt.where(AiMemeRecord.folder == folder)
+            stmt = stmt.where(col(AiMemeRecord.folder) == folder)
         if status is not None:
-            stmt = stmt.where(AiMemeRecord.status == status)
+            stmt = stmt.where(col(AiMemeRecord.status) == status)
         records = list((await session.execute(stmt)).scalars().all())
         targets = [
             AiMemeDeleteTarget(
@@ -139,7 +139,7 @@ async def get_delete_operation(operation_id: str) -> tuple[Optional[AiMemeDelete
             return None, []
         stmt = (
             select(AiMemeDeleteTarget)
-            .where(AiMemeDeleteTarget.operation_id == operation_id)
+            .where(col(AiMemeDeleteTarget.operation_id) == operation_id)
             .order_by(col(AiMemeDeleteTarget.meme_id))
         )
         targets = list((await session.execute(stmt)).scalars().all())
@@ -171,7 +171,7 @@ async def confirm_delete_operation(operation_id: str, owner_email: str, confirma
             active = await session.execute(
                 select(AiMemeDeleteOperation.operation_id).where(
                     col(AiMemeDeleteOperation.state).in_(_ACTIVE_STATES),
-                    AiMemeDeleteOperation.operation_id != operation_id,
+                    col(AiMemeDeleteOperation.operation_id) != operation_id,
                 )
             )
             if active.first() is not None:
@@ -200,7 +200,7 @@ async def retry_delete_operation(operation_id: str, owner_email: str) -> AiMemeD
                 raise PermissionError("只能重试自己创建的删除操作")
             retryable = await session.execute(
                 select(AiMemeDeleteTarget.meme_id).where(
-                    AiMemeDeleteTarget.operation_id == operation_id,
+                    col(AiMemeDeleteTarget.operation_id) == operation_id,
                     col(AiMemeDeleteTarget.state).in_(("pending", "failed")),
                 )
             )
@@ -209,7 +209,7 @@ async def retry_delete_operation(operation_id: str, owner_email: str) -> AiMemeD
             active = await session.execute(
                 select(AiMemeDeleteOperation.operation_id).where(
                     col(AiMemeDeleteOperation.state).in_(_ACTIVE_STATES),
-                    AiMemeDeleteOperation.operation_id != operation_id,
+                    col(AiMemeDeleteOperation.operation_id) != operation_id,
                 )
             )
             if active.first() is not None:
@@ -217,7 +217,7 @@ async def retry_delete_operation(operation_id: str, owner_email: str) -> AiMemeD
             await session.execute(
                 update(AiMemeDeleteTarget)
                 .where(
-                    AiMemeDeleteTarget.operation_id == operation_id,
+                    col(AiMemeDeleteTarget.operation_id) == operation_id,
                     col(AiMemeDeleteTarget.state).in_(("pending", "failed")),
                 )
                 .values(state="pending", error_message="", updated_at=_now())
@@ -292,7 +292,7 @@ async def _delete_worker_loop() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.exception(t("[Meme] 删除操作执行异常: {exc}", exc=exc))
+            logger.exception(t("log.meme.delete_operation_failed", exc=exc))
             await _mark_operation_crashed(operation_id, str(exc))
         finally:
             _delete_queue.task_done()
@@ -329,8 +329,8 @@ async def execute_delete_operation(operation_id: str) -> None:
             stmt = (
                 select(AiMemeDeleteTarget)
                 .where(
-                    AiMemeDeleteTarget.operation_id == operation_id,
-                    AiMemeDeleteTarget.state == "pending",
+                    col(AiMemeDeleteTarget.operation_id) == operation_id,
+                    col(AiMemeDeleteTarget.state) == "pending",
                 )
                 .order_by(col(AiMemeDeleteTarget.meme_id))
                 .limit(DELETE_BATCH_SIZE)
@@ -351,9 +351,7 @@ async def _execute_target_batch(operation_id: str, targets: list[AiMemeDeleteTar
     ids = [target.meme_id for target in targets]
     async with async_maker() as session:
         records = list(
-            (await session.execute(select(AiMemeRecord).where(col(AiMemeRecord.meme_id).in_(ids))))
-            .scalars()
-            .all()
+            (await session.execute(select(AiMemeRecord).where(col(AiMemeRecord.meme_id).in_(ids)))).scalars().all()
         )
     record_map = {record.meme_id: record for record in records}
     candidates: list[AiMemeDeleteTarget] = []
@@ -417,8 +415,8 @@ async def _execute_target_batch(operation_id: str, targets: list[AiMemeDeleteTar
             await session.execute(
                 update(AiMemeDeleteTarget)
                 .where(
-                    AiMemeDeleteTarget.operation_id == operation_id,
-                    AiMemeDeleteTarget.meme_id == target.meme_id,
+                    col(AiMemeDeleteTarget.operation_id) == operation_id,
+                    col(AiMemeDeleteTarget.meme_id) == target.meme_id,
                 )
                 .values(**values)
             )
@@ -432,20 +430,17 @@ async def _refresh_operation_progress(operation_id: str, *, finished: bool) -> N
     from gsuid_core.utils.database.base_models import async_maker
 
     async with async_maker() as session:
-        counts = dict(
-            (
-                await session.execute(
-                    select(AiMemeDeleteTarget.state, func.count())
-                    .where(AiMemeDeleteTarget.operation_id == operation_id)
-                    .group_by(AiMemeDeleteTarget.state)
-                )
-            ).all()
+        result = await session.execute(
+            select(col(AiMemeDeleteTarget.state), func.count())
+            .where(col(AiMemeDeleteTarget.operation_id) == operation_id)
+            .group_by(col(AiMemeDeleteTarget.state))
         )
+        counts: dict[str, int] = {state: count for state, count in result.all()}
         operation = await session.get(AiMemeDeleteOperation, operation_id)
         if operation is None:
             return
-        operation.deleted_count = int(counts.get("deleted", 0))
-        operation.failed_count = int(counts.get("failed", 0))
+        operation.deleted_count = counts["deleted"] if "deleted" in counts else 0
+        operation.failed_count = counts["failed"] if "failed" in counts else 0
         operation.processed_count = operation.deleted_count + operation.failed_count
         if finished:
             if operation.failed_count == 0:

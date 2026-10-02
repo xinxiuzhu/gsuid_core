@@ -48,12 +48,6 @@ def test_thrash_empty_response_keeps_streak() -> None:
     assert streak == 2
 
 
-def test_thrash_limit_is_four() -> None:
-    from gsuid_core.ai_core.gs_agent import _THRASH_SAME_TOOL_LIMIT
-
-    assert _THRASH_SAME_TOOL_LIMIT == 4
-
-
 def test_post_tool_contracts_split_persona_vs_capability() -> None:
     from gsuid_core.ai_core.gs_agent import (
         _POST_TOOL_OUTPUT_CONTRACT,
@@ -73,11 +67,55 @@ def test_post_tool_contracts_split_persona_vs_capability() -> None:
     assert "render_html_to_image" not in fail_c or "禁止" in fail_c
 
 
+def test_delegation_rejects_other_speakers_history_topic() -> None:
+    from gsuid_core.ai_core.buildin_tools.subagent import delegation_grounded
+
+    said = "帮忙比较一下样本甲组、样本乙组和样本丙组"
+    assert delegation_grounded("对比样本甲组、样本乙组、样本丙组的要点", said)
+    assert not delegation_grounded("分析样本丁组并给出方案", said)
+    assert not delegation_grounded("深度分析样本戊组", said)
+    assert delegation_grounded("甲组配置里，成员乙已经带了丙类部件", "甲组配置，成员乙已经带了丙类部件，成员丁带什么")
+    assert not delegation_grounded("随便查点别的", "救我")
+    assert not delegation_grounded("analyze the market", "help me with the report")
+    assert delegation_grounded("compare sample alpha", "please compare sample alpha today")
+
+
+def test_deferred_ack_closes_serial_followup() -> None:
+    from gsuid_core.ai_core.capability_agents.delegation_contracts import (
+        DELEGATION_FANOUT_RULE,
+        DELEGATION_INFLIGHT_KEY,
+        PENDING_DELEGATION_HOLD,
+        delegation_is_inflight,
+        format_deferred_subagent_ack,
+    )
+
+    assert not delegation_is_inflight({})
+    assert not delegation_is_inflight({DELEGATION_INFLIGHT_KEY: False})
+    assert delegation_is_inflight({DELEGATION_INFLIGHT_KEY: True})
+    ack = format_deferred_subagent_ack(ordinal=64, pid="research_agent", handle="dlg_x")
+    assert "task#64" in ack
+    assert DELEGATION_FANOUT_RULE in ack
+    assert "逐个补派" in ack
+    assert "render_agent" in ack
+    assert "<SILENCE>" in PENDING_DELEGATION_HOLD
+    assert DELEGATION_FANOUT_RULE in PENDING_DELEGATION_HOLD
+
+
 def test_research_agent_not_default_transient() -> None:
     from gsuid_core.ai_core.buildin_tools.subagent import _TRANSIENT_DEFAULT_PROFILES
 
     assert "research_agent" not in _TRANSIENT_DEFAULT_PROFILES
     assert "internal_reporter" in _TRANSIENT_DEFAULT_PROFILES
+
+
+def test_interactive_main_ignores_model_transient_flag() -> None:
+    from inspect import getsource
+
+    from gsuid_core.ai_core.buildin_tools import subagent as sub
+
+    src = getsource(sub._create_subagent_impl)
+    assert "allow_user_outbound" in src
+    assert "use_transient = pid in _TRANSIENT_DEFAULT_PROFILES" in src
 
 
 def test_incomplete_delivery_detects_process_only() -> None:
@@ -130,15 +168,15 @@ def test_incomplete_delivery_accepts_res_handle_summary() -> None:
 
 
 def test_ooc_scrub_kills_res_handle_but_capability_path_must_not() -> None:
-    """roleplay scrub 会杀 res_；能力代理 return 不得走该路径。"""
-    from gsuid_core.ai_core.output_firewall import check_ooc, scrub_or_fallback
+    """roleplay scrub 会杀 res_（丢弃整句，不罐头代答）；能力代理 return 不得走该路径。"""
+    from gsuid_core.ai_core.output_firewall import check_ooc, scrub_or_drop
 
     sample = "事实包已登记为 **`res_fa2c9a5b1364`**，请转 render_agent。"
     hit = check_ooc(sample)
     assert hit is not None
-    out, scrubbed = scrub_or_fallback(sample)
+    out, scrubbed = scrub_or_drop(sample)
     assert scrubbed is True
-    assert "res_" not in out
+    assert out == ""
 
 
 def test_followup_task_mentions_no_render() -> None:

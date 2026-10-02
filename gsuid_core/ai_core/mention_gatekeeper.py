@@ -13,6 +13,7 @@ import time
 from typing import Dict, Tuple
 from collections import defaultdict
 
+from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 
 # ============== 配置 ==============
@@ -34,9 +35,7 @@ class MentionGatekeeper:
         """清理过期的响应记录"""
         now = time.time()
         cutoff = now - RATE_LIMIT_WINDOW
-        self._response_times[group_id] = [
-            t for t in self._response_times[group_id] if t > cutoff
-        ]
+        self._response_times[group_id] = [t for t in self._response_times[group_id] if t > cutoff]
 
     def check_rate_limit(self, group_id: str) -> Tuple[bool, int]:
         """
@@ -56,8 +55,12 @@ class MentionGatekeeper:
 
         if current_count >= RATE_LIMIT_MAX_COUNT:
             logger.info(
-                f"🚪 [MentionGate] 群 {group_id} 频率限制: "
-                f"{current_count}/{RATE_LIMIT_MAX_COUNT} 次/10分钟"
+                t(
+                    "log.ai.mention_rate_limited",
+                    group_id=group_id,
+                    current_count=current_count,
+                    limit=RATE_LIMIT_MAX_COUNT,
+                )
             )
             return False, current_count
 

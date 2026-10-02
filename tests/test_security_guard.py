@@ -44,14 +44,46 @@ def test_firewall_passes_normal_and_plain_tier():
     print("[OK] 正常人格话放行；plain 入口豁免")
 
 
-def test_firewall_scrub_fallback():
-    from gsuid_core.ai_core.output_firewall import PERSONA_FALLBACK_TEXT, scrub_or_fallback
+def test_firewall_spares_user_db_table_prose() -> None:
+    from gsuid_core.ai_core.output_firewall import check_ooc
 
-    out, hit = scrub_or_fallback("我是 GPT 开发的")
-    assert hit and out == PERSONA_FALLBACK_TEXT
-    out2, hit2 = scrub_or_fallback("普通的一句话")
+    prose = "You added a UNIQUE constraint on the transactions 数据库表 and kept SQLite locally."
+    assert check_ooc(prose) is None
+
+
+def test_firewall_spares_error_handling_prose_not_traceback() -> None:
+    from gsuid_core.ai_core.output_firewall import check_ooc, is_tech_dump
+
+    prose = (
+        "You resolved a UNIQUE constraint IntegrityError on the transactions table "
+        "and returned HTTP 500 from the Flask route after logging."
+    )
+    hit = check_ooc(prose)
+    assert hit is None or hit.category != "machine_dump"
+    assert not is_tech_dump(prose)
+    fenced = "```python\nraise ValueError('x')\n```\nThen you continued the security work."
+    assert not is_tech_dump(fenced)
+    dump = 'Traceback (most recent call last):\n  File "app.py", line 1, in <module>'
+    assert is_tech_dump(dump)
+
+
+def test_firewall_spares_flask_sqlalchemy_not_api_key() -> None:
+    from gsuid_core.ai_core.output_firewall import check_ooc
+
+    assert check_ooc("Libraries: Flask 2.3.1, Flask-SQLAlchemy, SQLite 3.39.") is None
+    hit = check_ooc("the token is sk-abcdefghijklmnopqrstuv")
+    assert hit is not None
+    assert hit.category == "system_term"
+
+
+def test_firewall_scrub_drops_instead_of_canned_text():
+    from gsuid_core.ai_core.output_firewall import scrub_or_drop
+
+    out, hit = scrub_or_drop("我是 GPT 开发的")
+    assert hit and out == "", "命中必须丢弃，不许罐头代答"
+    out2, hit2 = scrub_or_drop("普通的一句话")
     assert not hit2 and out2 == "普通的一句话"
-    print("[OK] scrub_or_fallback 命中替换 / 未命中透传")
+    print("[OK] scrub_or_drop 命中丢弃 / 未命中透传")
 
 
 def test_ooc_gate_tool_keeps_warning_not_second_release():
@@ -106,7 +138,7 @@ def test_prompt_contains_lewd_phishing_discipline():
     )
     assert "谐音" in src
     assert "钓鱼连锁信" in src
-    assert "绝不为其调用任何工具" in src
+    assert "不调工具" in src
     print("[OK] system prompt 合规层含低俗谐音/钓鱼纪律")
 
 
@@ -184,7 +216,7 @@ if __name__ == "__main__":
     test_firewall_catches_model_identity()
     test_firewall_catches_ai_selfref_and_system_terms()
     test_firewall_passes_normal_and_plain_tier()
-    test_firewall_scrub_fallback()
+    test_firewall_scrub_drops_instead_of_canned_text()
     test_ooc_gate_tool_keeps_warning_not_second_release()
     test_wrap_untrusted()
     test_lewd_phishing_lexicon_removed()

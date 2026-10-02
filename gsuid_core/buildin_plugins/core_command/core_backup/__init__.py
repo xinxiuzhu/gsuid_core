@@ -1,3 +1,5 @@
+import asyncio
+
 from gsuid_core.sv import SV
 from gsuid_core.aps import scheduler
 from gsuid_core.bot import Bot
@@ -12,8 +14,9 @@ from gsuid_core.utils.database.models import (
     CoreGroup,
 )
 from gsuid_core.utils.backup.backup_core import (
+    backup_and_package,
     remove_old_backups,
-    copy_and_rebase_paths,
+    backup_dir_covers_path,
 )
 from gsuid_core.utils.backup.backup_files import clean_log, backup_file
 from gsuid_core.utils.database.base_models import DB_PATH
@@ -37,21 +40,28 @@ backup_hour, backup_minute = backup_time
     hour=int(backup_hour),
     minute=int(backup_minute),
 )
-async def backup_path_files():
+async def backup_path_files() -> int:
     """
     凌晨自动备份`备份管理`中的路径树
     """
     CLEAN_DAY: str = log_config.get_config("ScheduledCleanLogDay").data
-    copy_and_rebase_paths()
-    logger.success(t("log.core.gscore_path"))
-    remove_old_backups(int(CLEAN_DAY))
+    retcode = await backup_and_package()
+    if retcode != 0:
+        logger.warning(t("log.core.gscore_path_fail", retcode=retcode))
+    else:
+        logger.success(t("log.core.gscore_path"))
+    await asyncio.to_thread(remove_old_backups, int(CLEAN_DAY))
     logger.success(t("log.core.clean_day_delete", CLEAN_DAY=CLEAN_DAY))
+    return retcode
 
 
 @sv_core_backup.on_fullmatch("强制执行文件备份")
 async def get_fullmatch_msg(bot: Bot, ev: Event):
     await bot.send(await bot.t("♻️ 正在进行[强制执行文件备份]"))
-    await backup_path_files()
+    retcode = await backup_path_files()
+    if retcode != 0:
+        await bot.send(await bot.t("♻️ [强制执行文件备份] 失败"))
+        return
     await bot.send(await bot.t("♻️ [强制执行文件备份] 成功！"))
 
 
@@ -66,9 +76,12 @@ async def database_backup():
 
     CLEAN_DAY: str = log_config.get_config("ScheduledCleanLogDay").data
 
-    # 正常备份数据库等用户保存内容
-    await backup_file(DB_PATH, DB_BACKUP)
-    clean_log()
+    # 自选 backup_dir 已包含 GsData.db（文件本身或父目录）时不再另拷一份
+    if backup_dir_covers_path(DB_PATH):
+        logger.info(t("log.core.gscore_database_skip_covered"))
+    else:
+        await backup_file(DB_PATH, DB_BACKUP)
+    await asyncio.to_thread(clean_log)
 
     # AI 会话日志也遵循 ScheduledCleanLogDay 清理（与框架日志同一配置；0 = 不清理）
     ai_clean_days = int(CLEAN_DAY) if CLEAN_DAY and CLEAN_DAY.isdigit() else 8

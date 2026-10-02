@@ -4,7 +4,8 @@
 的四处（寒暄门 + 双路检索 + 预算格式化 + 装配层再硬截一刀）。
 实现仍在 ``ai_core/memory/`` 与 ``ai_core/cognition/``。
 
-挂点：H00 入站观察 · H05 检索（唯一允许的长超时 15s）· H06 注入 · H18 工具轨迹。
+挂点：H00 入站观察 · H05 检索（默认 15s；ledger+dedicated 为 120s）
+· H06 注入 · H18 工具轨迹。
 关槽 = 不注册 = 自然跳过；内核里**不写** ``if enable_memory``（闸门应过滤，不该整轮跳过）。
 
 记忆子系统的 bring-up 归 ``startup._INIT_STEPS``（它要排在 RAG 之后拿 Embedding），
@@ -38,6 +39,26 @@ _EMOTION_RETRIEVE_RE = re.compile(r"(难过|崩溃|沉船|破防|开心死|伤�
 _ENTITY_HINT_RE = re.compile(r"([A-Za-z]{3,}|[「『\"“].+|[一-鿿]{6,})")
 # 「短寒暄」的长度上限，与关系温度的 meaningful 判据同源
 _CHITCHAT_SHORT_LEN = 12
+_FIRST_PERSON_RE = re.compile(
+    r"\b(?:I(?:'ve|'d|'m|'ll)?|my|me|mine|we|our|ours)\b|我(?:们)?",
+    re.IGNORECASE,
+)
+_HOWTO_RE = re.compile(
+    r"\bhow\s+(?:do|can|should|would|to)\s+I\b|\bhow\s+to\b|怎么(?:用|做|才能)|如何",
+    re.IGNORECASE,
+)
+_MEMORY_CUE_RE = re.compile(
+    r"\b(?:have|did|was|were)\s+I\b|"
+    r"\b(?:ever|previously|previous|before|remember|recollect|"
+    r"conversation|session|discussed|mentioned|told me|last time)\b|"
+    r"曾经|以前|上次|还记得|说过|讨论过",
+    re.IGNORECASE,
+)
+_MY_SLOT_RE = re.compile(
+    r"\b(?:what(?:'s| is)|where(?:'s| is)|which)\s+my\b|"
+    r"\bmy\s+(?:current|last|previous|first|old|new)\b",
+    re.IGNORECASE,
+)
 
 
 def _format_memory_catalog(mem: "MemoryContext", _query: str = "") -> str:
@@ -76,8 +97,17 @@ def _format_memory_catalog(mem: "MemoryContext", _query: str = "") -> str:
         if not _add(item):
             break
     if shown < cap:
-        for ep in mem.episodes:
-            if not _add(ep["content"]):
+
+        def _asst(raw: str) -> bool:
+            low = raw.lstrip().lower()
+            return low.startswith("assistant:") or raw.lstrip().startswith("[我此前说过]")
+
+        user_eps = [e for e in mem.episodes if not _asst(e["content"] or "")]
+        asst_eps = [e for e in mem.episodes if _asst(e["content"] or "")]
+        for ep in user_eps + asst_eps:
+            ts = (ep["valid_at"] or "").strip()[:10]
+            body = (ep["content"] or "").strip()
+            if not _add(f"{ts} {body}" if ts else body):
                 break
     if shown < cap:
         for item in unmatched_prefs:
@@ -105,13 +135,128 @@ def retrieve_query_for_search(query: str) -> str:
     return body or query.strip()
 
 
-def format_retrieved_memory(ctx: AgentHookContext, mem: "MemoryContext") -> str:
-    """Chat 默认目录卡；``memory_eval`` 用生产 ``to_prompt_text``（同一 dual_route 命中）。"""
-    if not ctx.memory_eval:
-        return _format_memory_catalog(mem, retrieve_query_for_search(ctx.query))
-    from gsuid_core.ai_core.kits.memory.eval_protocol import format_eval_memory
+def looks_like_timeline_query(query: str) -> bool:
+    """排序/全历程/显式日期窗：要整段时间线，不是点查。"""
+    from gsuid_core.ai_core.memory.retrieval.lexical import strip_clock_lines
+    from gsuid_core.ai_core.memory.retrieval.event_time import looks_like_span_query
 
-    return format_eval_memory(mem, retrieve_query_for_search(ctx.query))
+    return looks_like_span_query(strip_clock_lines(query or ""))
+
+
+def looks_like_self_history_query(query: str) -> bool:
+    """第一人称过往/槽位/时间线。方法步骤问句不算。"""
+    from gsuid_core.ai_core.memory.retrieval.lexical import strip_clock_lines
+    from gsuid_core.ai_core.memory.retrieval.event_time import query_explicit_time_range
+
+    q = strip_clock_lines(query or "")
+    if not q:
+        return False
+    if query_explicit_time_range(q) is not None:
+        return True
+    memory = bool(_MEMORY_CUE_RE.search(q) or _MY_SLOT_RE.search(q))
+    if _HOWTO_RE.search(q) and not memory:
+        return False
+    return bool(_FIRST_PERSON_RE.search(q) and memory)
+
+
+def looks_like_count_query(query: str) -> bool:
+    from gsuid_core.ai_core.memory.retrieval.lexical import looks_like_count_query as _count
+
+    return _count(query)
+
+
+def refine_retrieved_memory(mem: "MemoryContext", query: str) -> None:
+    """非时间线才跨会话取样；用户正反说并存时写入 conflicts。"""
+    from gsuid_core.ai_core.memory.retrieval.lexical import (
+        diversify_episodes,
+        looks_like_latest_slot_query,
+        collect_user_stance_conflicts,
+        wants_parallel_document_coverage,
+    )
+    from gsuid_core.ai_core.memory.retrieval.event_time import (
+        looks_like_span_query,
+        looks_like_order_query,
+        looks_like_summary_query,
+        looks_like_duration_query,
+    )
+
+    if mem.temporal_mode or mem.time_range is not None or looks_like_timeline_query(query):
+        pass
+    elif looks_like_count_query(query) or looks_like_duration_query(query):
+        pass
+    elif looks_like_span_query(query) or looks_like_order_query(query) or looks_like_summary_query(query):
+        # 跨会话题型由 pack（里程碑/首次出现）自己收口，48 条裁剪会把周覆盖砍到几天。
+        pass
+    elif mem.covered or wants_parallel_document_coverage(query):
+        # 同一天灌入的平行材料会被收成一簇，再截前 48 条就把后面的来源丢掉。
+        pass
+    elif len(mem.episodes) > 8:
+        mem.episodes = diversify_episodes(mem.episodes, cap=48)
+    if looks_like_latest_slot_query(query) or looks_like_duration_query(query) or looks_like_span_query(query):
+        return
+    # 平行材料覆盖时，不同来源不是同一属性的正反说；stance 会把它们打成【陈述不一致】。
+    if mem.covered or wants_parallel_document_coverage(query):
+        return
+    extra = collect_user_stance_conflicts(mem.episodes, query)
+    if not extra:
+        return
+    seen = set(mem.conflicts)
+    mem.conflicts = extra + [c for c in mem.conflicts if c not in seen]
+
+
+def wants_evidence_injection(ctx: AgentHookContext) -> bool:
+    """长问句/问答注入 dual_route 正文；短闲聊仍目录卡。"""
+    if ctx.memory_eval:
+        return True
+    body = retrieve_query_for_search(ctx.query)
+    from gsuid_core.ai_core.memory.retrieval.lexical import (
+        looks_like_attribute_query,
+        looks_like_assistant_quote_query,
+    )
+
+    # 短闲聊里只有第一人称取值和复述才注入全文。泛泛的「推荐」仍走目录。
+    personal = bool(_FIRST_PERSON_RE.search(body))
+    if (
+        looks_like_self_history_query(body)
+        or looks_like_assistant_quote_query(body)
+        or (looks_like_attribute_query(body) and personal)
+    ):
+        return True
+    intent = ctx.intent or ""
+    if intent == "闲聊" and len(body) < 40:
+        return False
+    return len(body) >= 40 or intent in ("问答", "工具")
+
+
+def format_retrieved_memory(ctx: AgentHookContext, mem: "MemoryContext") -> str:
+    """Chat 短闲聊目录卡；问答/长问句与 ``memory_eval`` 同一套 ``to_prompt_text``。"""
+    ctx.memory_covered = mem.covered
+    q = retrieve_query_for_search(ctx.query)
+    if ctx.memory_eval:
+        from gsuid_core.ai_core.kits.memory.eval_protocol import format_eval_memory
+
+        return format_eval_memory(mem, q)
+    if not wants_evidence_injection(ctx):
+        return _format_memory_catalog(mem, q)
+    from gsuid_core.ai_core.kits.base import inject_memory_cap
+    from gsuid_core.ai_core.memory.config import memory_config
+    from gsuid_core.ai_core.memory.retrieval.event_time import looks_like_order_query
+
+    cap = inject_memory_cap(q, covered=mem.covered)
+    # ledger + dedicated：排序题已由专用选择器渲染过，本块不再重复注入。
+    if memory_config.eo_strategy == "ledger" and memory_config.eo_selector == "dedicated" and looks_like_order_query(q):
+        from gsuid_core.ai_core.agent_run.order_answer import get_order_rendered
+
+        if get_order_rendered().strip():
+            return ""
+    speakers = ctx.priority_speakers if ctx.priority_speakers else None
+    current = {ctx.user_id} if ctx.user_id else None
+    return mem.to_prompt_text(
+        max_chars=cap,
+        query=q,
+        priority_speakers=speakers,
+        current_speaker_ids=current,
+    )
 
 
 def should_prefetch_memory(ctx: AgentHookContext) -> bool:
@@ -217,9 +362,7 @@ class MemoryKit(AgentKit):
     def register(self) -> None:
         on_agent_hook(AgentHookPoint.ON_INBOUND, priority=110, kit_id=self.kit_id, timeout_ms=500)(self.observe)
         on_agent_hook(AgentHookPoint.AFTER_SESSION, priority=150, kit_id=self.kit_id)(self.observe_active_session)
-        on_agent_hook(AgentHookPoint.RETRIEVE_CONTEXT, priority=110, kit_id=self.kit_id, timeout_ms=15_000)(
-            self.retrieve
-        )
+        on_agent_hook(AgentHookPoint.RETRIEVE_CONTEXT, priority=110, kit_id=self.kit_id)(self.retrieve)
         on_agent_hook(AgentHookPoint.COMPOSE_CONTEXT, priority=150, kit_id=self.kit_id)(self.inject)
         on_agent_hook(AgentHookPoint.ON_TOOL_CALL, priority=110, kit_id=self.kit_id)(self.trace_tool)
 
@@ -298,6 +441,8 @@ class MemoryKit(AgentKit):
 
         if not ai_config.get_config("enable_memory").data or not memory_config.enable_retrieval:
             return
+        if ctx.skip_memory:
+            return
         if not should_prefetch_memory(ctx):
             return
         search_q = retrieve_query_for_search(ctx.query)
@@ -325,7 +470,54 @@ class MemoryKit(AgentKit):
             bot_self_id=scope.bot_self_id,
             include_self=True,
         )
-        if ctx.memory_eval:
+        from gsuid_core.ai_core.memory.retrieval.types import Episode
+        from gsuid_core.ai_core.memory.retrieval.lexical import expand_lexical_recall
+        from gsuid_core.ai_core.memory.retrieval.ledger_timeline import LedgerView
+
+        if isinstance(mem.ledger, LedgerView):
+            from gsuid_core.ai_core.memory.config import memory_config as _eo_cfg
+            from gsuid_core.ai_core.agent_run.order_answer import set_turn_ledger
+
+            set_turn_ledger(mem.ledger)
+            if _eo_cfg.eo_selector == "dedicated":
+                from gsuid_core.ai_core.memory.retrieval.event_time import looks_like_order_query
+
+                if looks_like_order_query(search_q):
+                    from gsuid_core.ai_core.agent_run.eo_selector import select_from_ledger
+
+                    await select_from_ledger(search_q)
+        else:
+            reserved_turns: list[Episode] = []
+            if mem.covered:
+                # 逐份材料覆盖已按来源把每份需要的栏目行都算好了；词面补齐只会往里
+                # 灌闲聊/邻条，把覆盖按预算挤掉（25 份曾被挤到 17 份）。
+                mem.reserved_episodes = reserved_turns
+            else:
+                mem.episodes = await expand_lexical_recall(
+                    mem.episodes,
+                    query=search_q,
+                    user_id=ctx.user_id,
+                    group_id=ctx.group_id,
+                    clock=ctx.clock_at,
+                    reserved=reserved_turns,
+                )
+                mem.reserved_episodes = reserved_turns
+        if mem.ledger is None and wants_evidence_injection(ctx):
+            # 时间线邻条会把同日练习题灌满，冲掉主题演进；只给计数题补会话。
+            if looks_like_count_query(search_q) and not mem.temporal_mode:
+                from gsuid_core.ai_core.memory.retrieval.lexical import expand_episode_neighbors
+
+                mem.episodes = await expand_episode_neighbors(mem.episodes)
+            else:
+                from gsuid_core.ai_core.memory.retrieval.lexical import (
+                    expand_topic_session_turns,
+                    looks_like_personal_upkeep_query,
+                )
+
+                if looks_like_personal_upkeep_query(search_q) and not mem.temporal_mode:
+                    mem.episodes = await expand_topic_session_turns(mem.episodes, search_q)
+            refine_retrieved_memory(mem, search_q)
+        if ctx.memory_eval and mem.ledger is None:
             from gsuid_core.ai_core.kits.memory.eval_protocol import (
                 boost_retrieved_memory,
                 _eval_full_scope_enabled,

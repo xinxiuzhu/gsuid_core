@@ -26,19 +26,15 @@ from gsuid_core.ai_core.buildin_tools.find_tools_rank import (
     build_find_tools_plan,
     classify_callable_tool,
     format_find_tools_plan,
+    need_matches_node_text,
     need_matches_tool_text,
 )
 
 FIND_TOOLS_LOADED_KEY = "find_tools_last_loaded"
 FIND_TOOLS_GAP_NOTE = (
-    "（系统：连续检索未暴露新工具。可用 capability_map 查看全目录后再决定；"
-    "用角色短句说明做不到；禁止再 find_tools；禁止念工具名或叙述装载过程。）"
+    "（系统：连续检索未暴露新工具。下一动：改 need 再检索，或委派通用调研。"
+    "禁止对用户讲检索过程、禁止念工具名、禁止说成「你要的东西不存在」。）"
 )
-
-
-def _need_matches_tool_text(need: str, retrieval_text: str, covers: list[str]) -> bool:
-    """兼容旧导入；实现见 find_tools_rank.need_matches_tool_text。"""
-    return need_matches_tool_text(need, retrieval_text, covers)
 
 
 def _record_find_tools_round(extra: dict[str, Any], loaded: list[str]) -> bool:
@@ -70,6 +66,24 @@ def _node_hit(node_id: str, score: float) -> RankedHit | None:
         return None
     when = (node.when_to_use or "").strip() or node.display_name
     return RankedHit(name=node.node_id, label=when, score=score)
+
+
+def _node_on_topic(need: str, node_id: str) -> bool:
+    """专用节点入档前必须对口；语义邻居 / 短关键词不算命中。"""
+    from gsuid_core.ai_core.agent_node import get_node
+    from gsuid_core.ai_core.agent_node.semantic_routing import aggregate_node_covers
+
+    node = get_node(node_id)
+    if node is None:
+        return False
+    covers = aggregate_node_covers(node)
+    return need_matches_node_text(
+        need,
+        when_to_use=node.when_to_use,
+        display_name=node.display_name,
+        keywords=tuple(node.match_keywords),
+        covers=tuple(covers),
+    )
 
 
 def nodes_with_keyword_hit(need: str) -> list[str]:
@@ -106,6 +120,9 @@ async def _matched_capability_node_ids(need: str, *, limit: int = 5) -> list[str
     def _push(node_id: str) -> None:
         if node_id in seen or len(ids) >= limit:
             return
+        # 专用走 keyword/fold；占这里会挤掉通用档，且后面本来就会 skip。
+        if agent_is_dedicated(node_id):
+            return
         if _node_hit(node_id, 0.0) is None:
             return
         seen.add(node_id)
@@ -127,7 +144,6 @@ async def _matched_capability_node_ids(need: str, *, limit: int = 5) -> list[str
             continue
         if node.source == "persona" or node.node_id == "capability_evaluator":
             continue
-        hay = f"{node.node_id} {node.display_name} {node.when_to_use} {' '.join(node.match_keywords)}".lower()
         hit = False
         for kw in node.match_keywords:
             k = (kw or "").strip().lower()
@@ -135,10 +151,16 @@ async def _matched_capability_node_ids(need: str, *, limit: int = 5) -> list[str
                 hit = True
                 break
         if not hit:
-            for token in blob.replace("，", " ").split():
-                if len(token) >= 2 and token in hay:
-                    hit = True
-                    break
+            from gsuid_core.ai_core.agent_node.semantic_routing import aggregate_node_covers
+
+            covers = aggregate_node_covers(node)
+            hit = need_matches_node_text(
+                need_s,
+                when_to_use=node.when_to_use,
+                display_name=node.display_name,
+                keywords=tuple(node.match_keywords),
+                covers=tuple(covers),
+            )
         if hit:
             _push(node.node_id)
     return ids
@@ -247,7 +269,7 @@ async def find_tools(
         need: 所缺能力的一句话描述。
 
     Returns:
-        分档清单；对不上当没找到。
+        分档清单；对不上当此刻没这项能力（≠「资料不存在」）。
     """
     try:
         from gsuid_core.ai_core.register import find_tool_base
@@ -261,13 +283,32 @@ async def find_tools(
 
         # 已加载命中不短路：短 cover 会误把列表里的工具当对口，真正缺的就搜不到。
         offered_hits = _offered_dedicated_hits(names=offered, need=need, exclusive=exclusive)
+        _scope = ctx.deps.tool_scope
+        if _scope is not None and not _scope.is_open:
+            offered_hits = [h for h in offered_hits if _scope.tool_enabled(h.name)]
         visible_offered = await visible_offered_names(ctx, [h.name for h in offered_hits])
         visible_offered_set = set(visible_offered)
         offered_hits = [h for h in offered_hits if h.name in visible_offered_set]
 
         family_tools = await search_tools_by_domain(
-            query=need, domain_limit=3, per_domain_limit=6, exclude_names=offered_set
+            query=need,
+            domain_limit=3,
+            per_domain_limit=6,
+            exclude_names=offered_set,
+            scope=ctx.deps.tool_scope,
         )
+        from gsuid_core.ai_core.rag.tools import align_seeds_to_context_plugin
+        from gsuid_core.ai_core.entity_index import ALIAS_PLUGIN_EXTRA_KEY
+
+        _alias_plugin = ""
+        if ALIAS_PLUGIN_EXTRA_KEY in ctx.deps.extra:
+            _raw_plugin = ctx.deps.extra[ALIAS_PLUGIN_EXTRA_KEY]
+            if isinstance(_raw_plugin, str):
+                _alias_plugin = _raw_plugin
+        if _alias_plugin:
+            family_tools = await align_seeds_to_context_plugin(family_tools, _alias_plugin, need, ctx.deps.tool_scope)
+        if _scope is not None and not _scope.is_open:
+            family_tools = [t for t in family_tools if _scope.tool_enabled(t.name)]
         dedicated_tools: list[RankedHit] = list(offered_hits)
         generic_tools: list[RankedHit] = []
         fold_names: list[str] = []
@@ -340,12 +381,16 @@ async def find_tools(
         for idx, node_id in enumerate(owner_ids):
             if not agent_is_dedicated(node_id):
                 continue
+            if not _node_on_topic(need, node_id):
+                continue
             hit = _node_hit(node_id, float(2000 - idx))
             if hit is not None:
                 dedicated_agents.append(hit)
 
         for idx, node_id in enumerate(nodes_with_keyword_hit(need)):
             if not agent_is_dedicated(node_id):
+                continue
+            if not _node_on_topic(need, node_id):
                 continue
             hit = _node_hit(node_id, float(1500 - idx))
             if hit is not None:
@@ -368,15 +413,7 @@ async def find_tools(
         if plan.is_empty():
             _record_capability_gap(need)
             stale_empty = _record_find_tools_round(ctx.deps.extra, [])
-            from gsuid_core.ai_core.register import format_capability_family_overview
-
-            fam = format_capability_family_overview(max_families=3, max_chars=400)
-            miss = (
-                f"⚠️ 未检索到与「{need}」相关的工具。可换更具体的能力描述重试一次；"
-                "若确实没有该能力，如实说明做不到，禁止编造。"
-            )
-            if fam:
-                miss = f"{miss}\n{fam}"
+            miss = f"⚠️ 本次没有对口的专用能力（{need}）。可换更具体的能力描述重试，或委派通用调研。"
             return f"{miss}\n{FIND_TOOLS_GAP_NOTE}" if stale_empty else miss
 
         loaded_names = plan.loadable_tool_names()
@@ -495,6 +532,7 @@ async def discover_tools(
             query=task,
             limit=limit,
             non_category="self",
+            scope=ctx.deps.tool_scope,
         )
 
         if not discovered_tools:
@@ -563,6 +601,10 @@ async def list_available_tools(
             tools_dict = {}
             for cat_tools in all_tools_cag.values():
                 tools_dict.update(cat_tools)
+
+        _scope = ctx.deps.tool_scope
+        if _scope is not None and not _scope.is_open:
+            tools_dict = {name: tb for name, tb in tools_dict.items() if _scope.tool_enabled(name)}
 
         if not tools_dict:
             return "⚠️ 当前没有可用的工具。"

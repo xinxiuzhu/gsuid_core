@@ -140,12 +140,16 @@ Session ID 群聊**不含 user_id**（`…:group:{group_id}`），群内共享 S
 Agent 达 `UsageLimitExceeded`（思考轮数上限）时的 fallback 不能让 AI "自我总结思考过程"，必须
 **直接回答用户原问题**。正确做法（`gs_agent.py` v4）：
 
-- `_extract_run_context()` 按轮次提取"用户原问题 + 已知事实 + LLM 中间推理"打包成**一条干净
-  消息**；`message_history=[]`（排除上一轮"工具调用模式"惯性）。
+- 证据只认**本轮**：`st.run_tool_outputs`（折叠前的真实回执正文，工具名不算材料）+
+  `st.thinking_segments`。**不要**把 `self.history` 抽出的旧事实标成「已获取的信息」——它作为
+  上下文经 `message_history` 给出即可，再当证据只会让总结拿旧话题答当前问题。
+- 本轮一份材料都没有时：旁观/未寻址轮 `<SILENCE>`；私聊或 @点名轮走
+  `_deliver_no_material_reply`，用人设口吻认一句「没答上来」（措辞由 `ANSWER_CONTRACT` +
+  `meta_narration` 闸兜住）。**禁止**留"按你自己的知识回答"这种编造入口。
 - fallback Agent `tools=[]`（从根源消除 schema 注入）、**不带** `deps_type/deps`、`retries=0`、
   `usage_limits=UsageLimits(request_limit=1)`。
-- 错误处理一致性：有 `bot` 时 `bot.send()` 发最终错误并 `return ""`；无 `bot` 时返回字符串由
-  调用方处理——**避免"安抚消息 + 错误消息"双发**。
+- 兜底总结里的异常**不捕获**：超时/网络/5xx 要冒泡给 `_execute_run` 统一重试，也别往群里塞
+  框架原文（`log.ai_agent.chain_too_long_summary` 那类 locale 串曾整条外泄过）。
 
 **瞬时失败重试（核心回复请求）**：`_execute_run` 现为重试包装——单次执行落在 `_execute_run_once`，
 网络/超时/5xx/529 等瞬时故障以异常冒泡，等 `_RUN_RETRY_DELAY`(3s) 后重试，至多 `_MAX_RUN_ATTEMPTS`(3)
@@ -213,6 +217,16 @@ Agent 达 `UsageLimitExceeded`（思考轮数上限）时的 fallback 不能让 
 - SQLModel 不写 `__tablename__`；数据库方法写类里、用 `@with_session`（写）/ `@with_read_session`（纯 SELECT）；Schema 升级走
   `on_core_start_before` 的 `exec_list`/`trans_adapter`（见 [§11](./11-statistics-webconsole-database.md)）。
 - AI 表要挂到受总开关控制的建表路径，不要无条件建。
+- **`@with_session` 写预算只作用于 SQLite**（`_WRITE_BUDGET_S` = 10 秒，不含等闸门）。超时取消这次调用、
+  `close()` 最多再等 `_CLOSE_DEADLINE_S`（2 秒）后必须放开闸门、打 `log.database.write_timeout`，抛
+  `DatabaseWriteTimeout`，不重试。排队等闸门超过 `GATE_WAIT_S`（20 秒）抛 `WriteGateTimeout`，并取消占锁任务，等它退出后再交接。
+  MySQL / PostgreSQL 不套这道预算。收尾宽限内协程若已正常返回，把返回值交回调用方。
+  插件吞掉 `CancelledError` 时仍会关连接，避免一把坏写卡住后面的写。
+  SQLite 写只有一把闸门，优先级按**定义模块**而不是调用方；WAL 只在启动时打开，读连接是 `query_only`。
+  嵌套复用只认打开 session 的那个任务，并用 savepoint 包住这一层：失败语句不会跟着外层 `commit` 落库。
+  `state_set_value` / `state_mutate` / `state_delete_value` 走 `db_write_guard()`。过期 state 删除、
+  `DeliveryLedger.check_and_claim` 的插入、知识库 `upsert_many` / `delete_ids` / `delete_doc` 也进闸门。
+  插件里直接 `async_maker()` 的写仍不进闸门。`AIMemTurnGist.upsert_rows` 按 400 行分块提交。
 - **ORM 查询类型安全**（别用 `cast`/`type:ignore`/`getattr` 糊弄 basedpyright，见
   [`AGENTS.md`](../../../../AGENTS.md) §3.5）：① `where`/`order_by`/`group_by` 里的列一律 `col()` 包裹
   （`col(cls.x) >= v` 才是 `ColumnElement[bool]`，裸 `cls.x >= v` 是 `bool`，`delete()/update().where()`
@@ -327,8 +341,8 @@ BEAM-10M / LongMemEval 这类"单题灌数百~上千 turn"的大语料，会撞�
   **不走 C6 SELF 轻量路由**，否则半数事实被跳过抽取、探针召回不到。
 - **SQLite 写并发**：窗口化并发多路写会撞 `UNIQUE(scope_key,name)` / `database is locked`。
   `entity.py`/`edge.py` 用**乐观重试**（`IntegrityError`/`OperationalError` 退避 6 次）+
-  进程内 `db_write_guard()` / `under_db_write()`（`eval_write_lock.py`，**线上与 eval 共用**）
-  串行化 commit 级写。**铁律**：LLM / 嵌入 / Qdrant 混合检索必须在写锁外（entity 先
+  进程内 `db_write_guard()` / `under_db_write()`（`eval_write_lock.py`，**线上与 eval 共用**，
+  与 `@with_session` 是同一把 `sqlite_write_gate`）串行化 commit 级写。**铁律**：LLM / 嵌入 / Qdrant 混合检索必须在写锁外（entity 先
   `prefetch_hybrid_name_ids` 再锁内 SQL 写；hiergraph 向量预分配同理）。热路径 Episode /
   Preference / `touch_accessed` / `touch_applied` / 生命周期大写也走同一把锁。Conflict 记
   录用 `AIMemConflict.attach(session, …)` **同事务**，禁止在未提交 session 内再调
@@ -336,9 +350,11 @@ BEAM-10M / LongMemEval 这类"单题灌数百~上千 turn"的大语料，会撞�
 - **`write_episodes=False`**：对已摄入 Episode 的 scope 只补抽取，避免重复嵌入 6 万+ 条、规避高并发
   重嵌入丢向量。**`trigger_rebuild=true` 仍同步 `await rebuild_task(scope_key)`**（曾被误删致静默
   失效、响应谎报 `rebuild:true`，现已恢复）——rebuild 要在 episodes/实体/边都落库后才看得到最新图。
-- **注入侧配套**：`chat_with_history` 必须传 `to_prompt_text(max_chars=memory_config.memory_inject_max_chars)`
-  （默认 `2000` 只够 ~2 条 Episode，是长对话事实"检索到却答不出"的暗坑）；纯 episode-RAG（无图谱）时
-  `to_memory_text` / `to_prompt_text` 都要带上 episodes，否则 `memory` 字段恒空。
+- **注入侧配套**：注入路径一律经 `kits/base.py` 的 `inject_memory_cap(query, covered=…, n_doc_sources=…)`
+  取总帽（常规档 `memory_inject_max_chars` / 宽档 `memory_inject_wide_chars`），再传给
+  `to_prompt_text(max_chars=…)`——**该参数必填**，别在调用点手写第二个数（曾经写死的 2000
+  只够 ~2 条 Episode，是长对话事实"检索到却答不出"的暗坑）。纯 episode-RAG（无图谱）时
+  `to_prompt_text` 必须带上 episodes，否则 `memory` 字段恒空。
 
 驱动脚本见 `eval/BEAM_10M/ingest_graph.py`（逐 plan 断点续跑 + 统一 rebuild 轮询）/ `quick_eval.py`
 （复用已摄入记忆、调参后分钟级子集重测）。
@@ -398,14 +414,16 @@ BEAM-10M / LongMemEval 这类"单题灌数百~上千 turn"的大语料，会撞�
 - **软出戏（主/工具同一套）**：命中 → 系统提醒（可能出戏，请自判）→ 模型下一句正文作准。
   不强制剥模型名，不「同一句再发一次就放行」。无下一轮时 run 末自判发送。
 - **OOC 硬档**：`machine_dump` → FALLBACK 短句；**`delivery_narration` → FUSE**；
-  资金 / 机器腔 never-release 持续打回。
+  资金 / 机器腔 / **`capability_absence`**（工具/接口+没挂没装，或另一个机器人+管/干）/
+  **`stale_present`**（同句把过期年月日说成今天/现在的读数，不含回忆）never-release 持续打回。
 - 勿改成「命中即永久硬替换且无提醒」，会复现「早餐吃了个豆包」类事故。
 
 | 路径 | 检测点 | 命中行为 |
 |------|--------|----------|
-| 主输出（`gs_agent` TextPart） | `pre_send_gate(channel="main")` | 尖括号 REWRITE/FUSE；软 OOC 注入系统提醒，提醒后放行下一句；无下一轮 → 自判发送；machine_dump → FALLBACK；delivery_narration → FUSE |
+| 主输出（`gs_agent` TextPart） | `pre_send_gate(channel="main")` | 尖括号 REWRITE/FUSE；软 OOC 注入系统提醒，提醒后放行下一句；无下一轮 → 自判发送；machine_dump → REWRITE+defer（同 never-release 走人格重说）；delivery_narration → FUSE |
 | 工具发送（`send_message_by_ai`） | `tool_gate_feedback`（历史别名 `gate_warn_once`） | 软 OOC 系统提醒、不二次放行（改用正文）；尖括号与 never-release 持续打回 |
-| 无重说通道（proactive 等默认 `send_chat_result`） | 末端 `check_ooc` + 尖括号 sanitize | 替换 `PERSONA_FALLBACK_TEXT` / 删非法标签 |
+| 无重说通道（proactive 等默认 `send_chat_result`） | 末端 `check_ooc` + 尖括号 sanitize | 丢弃台词 / 删非法标签，**不发罐头** |
+| run 末 never-release 恢复 | `_ooc_recover_persona_voice` | 当前人格重说一句 → 复检 → 再给一次「只许结论」；两次都不干净：人格/一致性类**原样发送**（`_LAST_RESORT_SEND_ORIGINAL`），`fund_claim`/`machine_dump` 与模型主动沉默才丢弃（`_ooc_safe_outbound` / settle return 出口同此口径） |
 
 - **DELIVERED 终局态（2026-08-10）在 gate 之前**：`send_message_by_ai` 带台词成功交付 →
   本 run `speech_policy="delivered"`，`should_block_user_visible_text` 对非 SILENCE 一律拦
@@ -421,6 +439,51 @@ BEAM-10M / LongMemEval 这类"单题灌数百~上千 turn"的大语料，会撞�
 - **`ooc_check=False` 只允许用于已过 gate / 重说产物**。新增发送路径默认带检。
 - 状态只写 `extra["output_gate"]` → `GateBag`，勿发明平行计数键。
 - `check_ooc(tier="plain")` 生产尚无调用方，别当它已接线。
+
+### 🔴 拆条靠空行：呈现层任何一步都不能压掉 `\n\n`（2026-09-28 修复）
+
+`send_chat_result` 拆多条气泡的唯一分隔符是 `\n\s*\n`。这条链路上**任何**"顺手清理空行"的
+写法都会让多消息能力静默全灭，且单测某个正则时完全看不出来。
+
+已修实例：`strip_framework_user_leaks` 曾用 `splitlines()` + `"\n".join()` 剥信封，把模型写的
+空行全压成单换行。结果 `re.split(r"\n\s*\n", …)` 永远只切出 1 块、`_PERSONA_MAX_BUBBLES`
+成了永不触发的死代码——人格「连发 2-3 条短消息」在代码层面失效两个月无人发现
+（实机复盘：4 群 60 条可见台词，`实际气泡分布 {1: 60}`，其中 10 条模型本意就是 2 条）。
+
+改呈现层/归一化链时：
+
+- **不许**用 `splitlines()` + `"\n".join()` 重排正文（它丢"哪里有空行"的信息）；要保留
+  就按 `"\n"` 切、显式保留**至多一个**空行作分隔。归一化链里已有两处同类坑：
+  `strip_framework_user_leaks`（已修）与 `re.sub(r"[ \t]{2,}", …)`（早前已改成只压空格/制表符）。
+- 端到端锁必须落在 `send_chat_result`（断言 `Bot.send` 被调几次），
+  `tests/test_send_chat_result_bubbles.py`；只单测 `_normalize_html_linebreaks` 层级太浅。
+- 单换行**不是**分隔符：「一段话三行」是合法形态，靠提示词让模型改用空行，不靠呈现层切。
+
+### 🔴 气泡上限是两把闸，且只有一把可配
+
+| 闸 | 位置 | 管什么 | 默认 | 可配 |
+|----|------|--------|------|------|
+| `main_channel_visible_limit` | `ai_config.py` | 模型单轮能发几段 TextPart | 2 | 是（≤6） |
+| `chat_style.bubbles` | `persona/chat_style.py` | 一段 TextPart 能拆成几条气泡 | 2 | 是 |
+
+两把闸相乘，只调一把会「改了没反应」。`chat_style` 是**建 session 时**进 system 稳定前缀的
+（§1.7：会话内不得改串），改配置需新会话生效。
+
+### 🔴 429 不都是限流：套餐打满要熔断而不是重试
+
+`const._RETRYABLE_4XX` 把 429 归为可重试，但 MiniMax 的**用量上限**（2056）也走 429。
+重试必然复现，还会把同一句兜底文案在群里连喷 N 次。`ai_core/quota_guard.py` 按错误码/关键词
+分四类：`quota`（fail-fast + 按激活模型配置分闸）/ `rate_limit` / `overloaded`（仍退避重试）/ `other`。
+
+- 分闸键用 `_quota_breaker_key()`（只读 `_active_config_name` / `model_config_name`），
+  **不要**在请求前 / 异常路径调 `_routed_provider()`——那会读 `model` / `task_level`，让熔断判定本身
+  成为新的失败源（`tests/test_tool_safety.py` 的裸 fake 会直接 AttributeError）。
+- 闸开着时在 `_execute_run` 的 `while` 入口短路，不要等 `_execute_run_once` 打完一轮再看闸。
+  except 里只按本次 `classify_provider_error` 走配额文案，别把超时/内容审核改写成套餐打满。
+- 兜底去重只压**配额类**重复失败；超时等偶发失败不压——用户重问就该重答。
+  成功一轮要 `quota_breaker.reset()`，否则后续真实失败也被静默。
+  `_opened_at` / `_notified_at` 在读取时清过期项（session 去重键只增不减）。
+
 
 ### 🔴 低俗谐音 / 钓鱼识别是 prompt 层防线，不要复活词库
 
@@ -468,9 +531,11 @@ BEAM-10M / LongMemEval 这类"单题灌数百~上千 turn"的大语料，会撞�
 历史事故 ×2：内容闸门拒绝文案写死"早柚才不记呢"（生产 persona 是达妮娅→自我指涉错乱）；
 框架级前摇台词模块（已整体移除，见下）。规矩：
 
-- **框架层给用户的文本要么人格中性，要么是"给 Agent 的指令"让它自己组织语言**
-  （工具 return 天然是反馈通道）。末端兜底（`PERSONA_FALLBACK_TEXT`）必须中性，
-  禁止抄默认人格口癖（唔/呼/zzz/卷轴）。
+- **框架层给用户的文本要么是"给 Agent 的指令"让它自己组织语言，要么是供应商侧失败短句**
+  （工具 return 天然是反馈通道）。**出戏拦截没有罐头兜底**（2026-09）：`fallback_ooc` /
+  `fallback_machine` 键与 `PERSONA_FALLBACK_TEXT` 已删除，命中一律让当前人格重说一句。
+  两次都不干净时也别再写"人格中性但仍是罐头"的句子（唔/呼/zzz/卷轴 更不行）：
+  人格/一致性类原样发送，只有 `fund_claim` / `machine_dump` 走沉默。
 - 口癖配额从当前人格卡 Tone Markers 解析，禁止 `endswith(("zzz","呼","唔"))`。
 - 意图分类 / 规划词表禁止收插件专属域词（圣遗物/命座/模拟盘/研报）。垂直能力靠插件
   `covers` / 带前缀 `aliases` / `ai_entity` 自描述。
@@ -615,8 +680,8 @@ gate 误判的代价只能是"本该有工具却没给"，绝不能是"本该沉
 > （专武推荐等）就没了。种子是本轮的语义命中，一个都不该被大族挤掉。
 
 **新增能力族时留意族大小**——族大于附加池上限时，它在旧逻辑下会挤掉所有人。反过来，
-**单领域部署根本不必付这份检索开销**：persona `config.json` 的 `tool_packs` 可直接写
-`capability_domain` 名，整族无条件常驻保底池（见 [§7.3](./07-tool-registry-and-agent.md)）。
+**单领域部署**：人格没有 `tool_packs` 配置项。要整族常驻走 `tool_names`，缩小检索池走
+`enabled_tools`（见 [§7.3](./07-tool-registry-and-agent.md) / [§6.6](./06-ai-session-and-persona.md)）。
 
 **🔴 四、评测期配置遗留污染生产（本次真正的元凶，也是最容易复发的一类）**
 
@@ -871,6 +936,9 @@ memory / statistics / planning / meme / favor_decay 每次启动都初始化两�
   落盘弱挂用搜索 query：先查已有枢纽，过门才建；禁止拿工具名 / `<search_results>` 当标题。
   整页 SERP 只留规则摘要（FileOS `summary` + 挂件），下次用原 query 走 `search_cognition`。
   群关系/进度留记忆边，不要升级成公共层的边。
+- **回想**：片段占满 limit 时仍展开 query 点名的枢纽。别名表没有的正式名，按已挂载枢纽
+  title 精确匹配（不子串；同名多插件不猜）。点名枢纽先于本群偶发枢纽，避免 cap 只剩聊过的名字。
+  专名对得上的知识条留名额，不能被片段路整表挤掉。高置信帽按 kind 计，不按融合下标。
 - **门面**：不要改 `search_cognition → List[CognitiveHit]` 把路径卡塞进返回类型。
   `expand_hub` 外层 fail-open 用独立 i18n `cognition_expand_fail`，不要复用 mount_fail。
 - **A 线旧口径**：跨 kind 自动 RELATED 的 0.92 方案**已被收窄为完整匹配**（T5），

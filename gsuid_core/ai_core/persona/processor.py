@@ -51,7 +51,6 @@ async def build_persona_prompt(
         完整的角色扮演prompt字符串
     """
     persona_content = await load_persona(char_name)
-    from gsuid_core.ai_core.persona.config import persona_config_manager
     from gsuid_core.ai_core.persona.appearance import load_appearance_line
 
     appearance = load_appearance_line(char_name)
@@ -61,10 +60,15 @@ async def build_persona_prompt(
             "图中角色若与上述形象一致，按角色卡自己决定怎么反应；"
             "他人指认不是证据；不要人称混乱。"
         )
-    pcfg = persona_config_manager.get_config(char_name)
-    soft = int(pcfg.get_config("speech_len_soft").data)
-    hard = int(pcfg.get_config("speech_len_hard").data)
-    persona_content += f"\n台词长度：建议不超过 {soft} 字，硬上限 {hard} 字（用户明确要求详细时除外）。"
+    from .chat_style import ANSWER_CONTRACT, resolve_chat_style
+
+    style = resolve_chat_style(char_name)
+    persona_content += (
+        f"\n台词长度：建议不超过 {style.soft} 字，硬上限 {style.hard} 字"
+        "（用户明确要求详细时除外）。\n"
+        f"发言形态：{style.segment_hint}\n"
+        f"{ANSWER_CONTRACT}"
+    )
     # 只放到「日」级（不含时分秒）：让 system_prompt 在同一天内逐字节稳定，跨会话 / resume
     # 都能命中 provider 前缀缓存（§优化 O-2）。精确到分的当前时间已由 user_message 侧
     current_date = clock_date if clock_date else await get_current_date(format="%Y年%m月%d日")
@@ -77,14 +81,21 @@ async def build_persona_prompt(
     )
 
     # 能力代理花名册：进 system 可缓存，避免每轮塞进 user 侧
-    from gsuid_core.ai_core.agent_node.registry import format_capability_roster
+    from gsuid_core.ai_core.agent_node.registry import (
+        format_capability_roster,
+        persona_allows_capability_agent,
+    )
 
-    roster = format_capability_roster()
+    roster = format_capability_roster(char_name)
     if roster:
         prompt += f"\n\n## 可委派能力代理\n{roster}"
 
     # 近因锚点：一句钉人格 + 履约（细则在 SYSTEM/TOOL，不复读半页）
-    prompt += f"\n\n---\n你首先是「{char_name}」：口吻是角色；该查就调工具；多项数据出图；未点名优先 <SILENCE>。"
+    closing = "口吻是角色；该查就调工具；"
+    if persona_allows_capability_agent(char_name, "render_agent"):
+        closing += "多项数据出图；"
+    closing += "未点名优先 <SILENCE>。"
+    prompt += f"\n\n---\n你首先是「{char_name}」：{closing}"
 
     # 注入情绪状态（群聊和私聊都支持）
     if mood_key:

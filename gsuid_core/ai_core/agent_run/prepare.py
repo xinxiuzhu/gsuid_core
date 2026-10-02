@@ -47,6 +47,20 @@ from gsuid_core.ai_core.agent_run.speech_policy import (
 from gsuid_core.ai_core.agent_run.user_turn_ctx import get_user_turn_id, set_user_turn_id
 
 
+def _ephemeral_system_block(text: str) -> str:
+    """入史前按行剥（系统：）。动态清单不能留在持久 user turn 里。"""
+    lines: list[str] = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if s.startswith("（系统："):
+            lines.append(s)
+        else:
+            lines.append(f"（系统：{s}）")
+    return "\n".join(lines)
+
+
 class PreparePhase(RunOnceHost):
     async def _run_once_budget_gate(self, st: RunOnceState) -> object:
         """预算闸门：超额返回早退值；放行返回 ``BUDGET_GATE_PASS``。"""
@@ -140,7 +154,6 @@ class PreparePhase(RunOnceHost):
         st.render_ack_seen = False
 
         # 使用自定义迭代次数限制（如果有），否则使用配置默认值。
-        # 群聊空闲上限在 TurnGraph 建完后再收紧（见下方）。
         if self.max_iterations is not None:
             st.limits = UsageLimits(request_limit=self.max_iterations)
         else:
@@ -224,6 +237,9 @@ class PreparePhase(RunOnceHost):
             has_active_task=st.has_active_task,
             user_text=_probe_for_policy,
         )
+        # 只锁框架回灌。真人消息里出现这四个字不算交付轮。
+        if st.speech_policy == "framework_deliver" or (st.fw_msg and "交付回灌" in _probe_for_policy):
+            st.run_extra["delivery_wake"] = True
         st.in_flight_short = (not st.fw_msg) and st.has_active_task and spoken_user_body_len(_probe_for_policy) <= 48
         st.context = ToolContext(
             bot=st.bot,
@@ -245,6 +261,9 @@ class PreparePhase(RunOnceHost):
         elif isinstance(st.user_message, Sequence):
             # 从 Sequence[UserContent] 中提取纯文本
             st.last_user_question = "\n".join(item for item in st.user_message if isinstance(item, str)).strip()
+        from gsuid_core.ai_core.utils import mention_names_in_text
+
+        st.run_extra["mention_names"] = mention_names_in_text(st.last_user_question)
 
         # 处理用户消息：框架注入不加 [用户发言]；真人句才加外壳
         if isinstance(st.user_message, Sequence) and not isinstance(st.user_message, str):
@@ -268,27 +287,6 @@ class PreparePhase(RunOnceHost):
         if st.rag_context:
             st.final_user_message = _append_user_text(st.final_user_message, f"\n\n{st.rag_context}")
             logger.info(i18n_t("log.agent.added_rag_context"))
-
-        # 连续无工具调用检测：连续两轮只推脱不调工具时注入强制提醒。闲聊类意图豁免（§15）
-        # 豁免口径唯一定义在 _PROGRESSIVE_TOOLS_SKIP_INTENTS（评审修复 E12）。
-        # 框架纠正轮不要再粘这条：settle 在启动纠正前已 +1，会污染 <control> 信封。
-        if (
-            not st.fw_msg
-            and self.create_by in ["Chat", "Agent"]
-            and self._consecutive_no_tool_rounds >= 2
-            and st.intent not in _PROGRESSIVE_TOOLS_SKIP_INTENTS
-        ):
-            no_tool_reminder = (
-                "\n\n【⚠️ 系统检测】你已连续多轮未调用任何工具，"
-                "当前用户问题可能尚未得到有效回答。"
-                "若你上一轮的思考里明确提到要调用某个工具（如 register_kanban_task、"
-                "evaluate_agent_mesh_capability、create_subagent）却没有真正调用——"
-                "口头答应 ≠ 执行，请本轮立即调用对应工具。否则请立即检查工具列表，"
-                "选择最合适的工具调用，或明确说明为何确实无工具可用——禁止以角色"
-                "不懂为由跳过工具。"
-            )
-            st.final_user_message = _append_user_text(st.final_user_message, no_tool_reminder)
-            logger.debug(i18n_t("log.agent.forced_nudge_consecutive_turns"))
 
         # ── 交互脚手架：优先消费入口 TurnGraph；缺省时现场构建 ──
         st.addr_gated = False
@@ -325,6 +323,7 @@ class PreparePhase(RunOnceHost):
                 )
             st.addr_gated = bool(st.tg.address_gated)
             st.followup_detected = bool(st.tg.needs_task_tools)
+            st.run_extra["turn_followup"] = st.followup_detected
             from gsuid_core.ai_core.buildin_tools.visibility import (
                 SCHED_CREATE_OK_KEY,
                 SCHED_MUTATE_OK_KEY,
@@ -357,6 +356,8 @@ class PreparePhase(RunOnceHost):
             )
             if _vh:
                 st.final_user_message = _append_user_text(st.final_user_message, f"\n{_vh}")
+            # 旁观轮仍收窄到 group_idle_max_iterations；省略续聊轮要跑得完
+            # find_tools → 真正查询的两跳链路，早先的收窄条件误伤了它们。
             if self.max_iterations is None and st.limits is not None:
                 from gsuid_core.ai_core.agent_run.tools import group_idle_request_limit
 
@@ -365,7 +366,7 @@ class PreparePhase(RunOnceHost):
                 _capped = group_idle_request_limit(
                     int(st.limits.request_limit or 0),
                     is_group=bool(st.tg.is_group),
-                    followup_detected=st.followup_detected,
+                    followup_detected=bool(st.followup_detected),
                     has_active_task=st.has_active_task,
                     idle_cap=_idle_cap,
                     call_to_self=bool(st.tg.call_to_self),
@@ -392,6 +393,24 @@ class PreparePhase(RunOnceHost):
                 logger.debug(i18n_t("log.agent.scaffold_ellipsis_style_follow_inject"))
             for _h in _hints:
                 st.final_user_message = _append_user_text(st.final_user_message, _h)
+            _skip_nudge = bool(st.tg.is_group) and (not st.tg.call_to_self or st.tg.quoted_tome or st.addr_gated)
+            if (
+                not _skip_nudge
+                and self.create_by in ["Chat", "Agent"]
+                and self._consecutive_no_tool_rounds >= 2
+                and st.intent not in _PROGRESSIVE_TOOLS_SKIP_INTENTS
+            ):
+                no_tool_reminder = (
+                    "\n\n【⚠️ 系统检测】你已连续多轮未调用任何工具，"
+                    "当前用户问题可能尚未得到有效回答。"
+                    "若你上一轮的思考里明确提到要调用某个工具（如 register_kanban_task、"
+                    "evaluate_agent_mesh_capability、create_subagent）却没有真正调用——"
+                    "口头答应 ≠ 执行，请本轮立即调用对应工具。否则请立即检查工具列表，"
+                    "选择最合适的工具调用，或明确说明为何确实无工具可用——禁止以角色"
+                    "不懂为由跳过工具。"
+                )
+                st.final_user_message = _append_user_text(st.final_user_message, no_tool_reminder)
+                logger.debug(i18n_t("log.agent.forced_nudge_consecutive_turns"))
 
         # 用户追问进行中任务：再判一次（用 last_user_question 剥壳后）并注入进度契约
         if not st.fw_msg and not st.status_inquiry:
@@ -410,6 +429,30 @@ class PreparePhase(RunOnceHost):
         if st.status_inquiry and st.has_active_task and self.create_by in ("Chat", "Agent"):
             st.final_user_message = _append_user_text(st.final_user_message, _STATUS_INQUIRY_HINT)
             logger.debug(i18n_t("log.agent.scaffold_ellipsis_style_follow_inject"))
+        from gsuid_core.ai_core.memory.config import memory_config as _eo_mc
+        from gsuid_core.ai_core.memory.retrieval.event_time import looks_like_order_query as _eo_order
+
+        _eo_q = st.user_message if isinstance(st.user_message, str) else ""
+        if not _eo_q and st.ev is not None:
+            _eo_q = st.ev.raw_text or ""
+        if _eo_mc.eo_strategy == "ledger" and _eo_order(_eo_q):
+            if _eo_mc.eo_selector == "dedicated":
+                from gsuid_core.ai_core.agent_run.eo_selector import restatement_hint
+                from gsuid_core.ai_core.agent_run.order_answer import get_order_rendered
+
+                _eo_list = get_order_rendered()
+                if _eo_list:
+                    st.final_user_message = _append_user_text(
+                        st.final_user_message,
+                        "\n" + _ephemeral_system_block(restatement_hint(_eo_list)),
+                    )
+            else:
+                from gsuid_core.ai_core.agent_run.order_answer import order_protocol_hint
+
+                st.final_user_message = _append_user_text(
+                    st.final_user_message,
+                    "\n" + _ephemeral_system_block(order_protocol_hint(_eo_q)),
+                )
         if not st.fw_msg and st.has_active_task:
             st.in_flight_short = spoken_user_body_len(st.last_user_question) <= 48
         st.run_extra["speech_policy"] = st.speech_policy

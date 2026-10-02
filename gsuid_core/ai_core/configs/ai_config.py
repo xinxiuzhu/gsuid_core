@@ -242,16 +242,18 @@ AI_CONFIG: Dict[str, GSC] = {
         options=[12, 16, 20, 24, 32],
     ),
     "group_idle_max_iterations": GsIntConfig(
-        "群聊空闲轮最大思考轮数",
-        "群聊无跟进且无在途任务时的 request_limit 上限, 防止零工具空转。修改后即时生效",
+        "群聊旁观轮最大思考轮数",
+        "群聊无人寻址且无跟进、无在途任务时的 request_limit 上限, 防止零工具空转。"
+        "点名与省略续聊轮不收窄。修改后即时生效",
         2,
         options=[2, 3, 4, 6, 9],
     ),
     "main_channel_visible_limit": GsIntConfig(
         "主通道单轮出站上限",
-        "同 run 主通道可见台词段数上限(接任务应 + 终局各占一格)。修改后即时生效",
+        "本项管模型单轮能发几段 TextPart（接任务应 + 终局各占一格）。"
+        "一段拆几条由人格「说话强度」决定，两闸相乘。修改后即时生效",
         2,
-        options=[1, 2, 3],
+        options=[1, 2, 3, 4, 5, 6],
     ),
     "group_lurk_mode": GsBoolConfig(
         "群聊未点名默认静默",
@@ -269,6 +271,17 @@ AI_CONFIG: Dict[str, GSC] = {
         "同一用户短窗内相同正文达到该次数则本轮 SILENCE。修改后即时生效",
         3,
         options=[2, 3, 5, 8],
+    ),
+    "heartbeat_hook_require_human_span": GsBoolConfig(
+        "巡检话头必须引用人类原句",
+        "开启后 context_hook 对不上近窗人类句或刚完成的事则沉默。修改后即时生效",
+        True,
+    ),
+    "heartbeat_repeat_window": GsIntConfig(
+        "巡检近窗去重条数",
+        "与最近 N 条主动正文过相似则沉默。修改后即时生效",
+        8,
+        options=[4, 6, 8, 12],
     ),
     "thinking_text_max": GsIntConfig(
         "thinking 蒸馏字数上限",
@@ -1009,8 +1022,20 @@ MEMORY_CONFIG: Dict[str, GSC] = {
     "memory_inject_max_chars": GsIntConfig(
         "记忆注入字符预算",
         "单次注入对话上下文的记忆文本最大字符数, 调大可保留更多历史但更费 Token",
-        800,
-        options=[400, 800, 1000, 2000, 4000],
+        8000,
+        options=[800, 2000, 4000, 8000, 16000],
+    ),
+    "memory_inject_wide_chars": GsIntConfig(
+        "记忆注入宽档预算",
+        "逐份材料覆盖 / 排序摘要长时序题的记忆整块上限, 不低于上面的常规预算。GSUID_MEMORY_INJECT_WIDE_CHARS 可覆盖",
+        48000,
+        options=[16000, 28000, 48000, 64000, 96000],
+    ),
+    "session_gap_seconds": GsIntConfig(
+        "Session 切分静默阈值（秒）",
+        "同 scope 相邻 Episode 间隔超过此秒数则开新 session；默认 1800（30 分钟）",
+        1800,
+        options=[600, 1800, 3600, 7200],
     ),
     "enable_system2get": GsBoolConfig(
         "是否启用 System-2",
@@ -1204,6 +1229,24 @@ MEMORY_CONFIG: Dict[str, GSC] = {
         "记忆评测模式",
         "指定是否启用记忆评测模式, 启用后无法使用 System-2 和 Rerank",
         False,
+    ),
+    "eo_strategy": GsStrConfig(
+        "长时序注入策略",
+        "legacy=注入若干首次提及；ledger=注入压缩全量时间线。环境变量 GSUID_EO_STRATEGY 可覆盖",
+        "legacy",
+        options=["legacy", "ledger"],
+    ),
+    "eo_selector": GsStrConfig(
+        "长时序选择器",
+        "仅 ledger 生效。persona=主人格自选；dedicated=另开一次选择模型。GSUID_EO_SELECTOR 可覆盖",
+        "persona",
+        options=["persona", "dedicated"],
+    ),
+    "ledger_max_chars": GsIntConfig(
+        "时间线总预算",
+        "ledger 策略下排序/摘要题时间线最大字符数。GSUID_LEDGER_MAX_CHARS 可覆盖",
+        28000,
+        options=[8000, 16000, 28000, 40000, 48000],
     ),
 }
 

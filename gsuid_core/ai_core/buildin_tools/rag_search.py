@@ -13,7 +13,6 @@ from gsuid_core.ai_core.rag import search_images
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.cognition import (
-    MEMORY_KINDS,
     CogKind,
     CogScope,
     kinds_from_names,
@@ -28,6 +27,8 @@ from gsuid_core.ai_core.buildin_tools.visibility import (
 
 # 本轮已检索过的 query（run 级，存 ToolContext.extra；ToolContext 每轮新建，轮末自然丢弃）
 _SEEN_QUERIES_KEY = "cognition.seen_queries"
+# run 内的空结果标记：旧写法用「无命中」作值，那是检索术语，会被模型照抄讲给群里。
+_NO_MATERIAL = "本轮没有可用材料"
 
 
 def _seen_queries(ctx: RunContext[ToolContext]) -> Dict[str, str]:
@@ -35,6 +36,27 @@ def _seen_queries(ctx: RunContext[ToolContext]) -> Dict[str, str]:
     if _SEEN_QUERIES_KEY not in extra or not isinstance(extra[_SEEN_QUERIES_KEY], dict):
         extra[_SEEN_QUERIES_KEY] = {}
     return extra[_SEEN_QUERIES_KEY]
+
+
+def _append_alias_canonicals(query: str) -> str:
+    """已登记别名展开成正式名再检索，错字才能命中正式名枢纽。"""
+    from gsuid_core.ai_core.entity_index import lookup_surface
+    from gsuid_core.ai_core.cognition.hub import title_tokens
+
+    extras: list[str] = []
+    seen: set[str] = set()
+    for tok in title_tokens(query):
+        ref = lookup_surface(tok)
+        if ref is None or ref.is_ambiguous or not ref.canonicals:
+            continue
+        canon = ref.canonicals[0]
+        if not canon or canon in query or canon in seen:
+            continue
+        seen.add(canon)
+        extras.append(canon)
+    if not extras:
+        return query
+    return f"{query} {' '.join(extras)}"
 
 
 def _query_key(query: str, kinds: FrozenSet[CogKind]) -> str:
@@ -93,7 +115,7 @@ async def search_cognition(
     **不查实时 / 外部数据**：网页与专域实时信息一律用 `web_search_tool` /
     `web_fetch_tool` / 专域数据工具。本工具查不到外面的东西。
 
-    命中公共概念时，回执会带**路径卡**（挂在上面的文章目录 + 本环境事实）。
+    涉及公共概念时，回执会带**路径卡**（挂在上面的文章目录 + 本环境事实）。
     问到某一栏且能唯一选定时，同一次返回该篇全文（≤6000 字，超出用 read_handle）。
     插件/手动文只读；要补充请用 `attach_article` 新建一篇，不要改只读正文。
 
@@ -102,12 +124,14 @@ async def search_cognition(
     - 需要"已有材料"（专业知识、说明文档、稳定资料、以前搜过的长文）时；
     - 想确认"我对某人了解多少 / 有没有答应过什么"时；
     - 问已有记忆：query 带上问题里的专名/数字/约束；
+    - 问已入库的专名时，片段再多也先看路径卡；路径卡在就不改走 web_search。
     - 办眼前的事需要说话人身上的事实、当前消息和上文都没写：query 写「说话人ID + 要填的槽」，
       不要把本次外部题目的词拼进去；填槽后再 web_search / 专域工具。
 
-    同一 query 重搜结果相同；**换槽位词**（专名/日期/清单项）再搜会召回不同片段。
-    无命中只表示本 query 没排上，不等于没存过。外部数据用 `web_search_tool`，专域用 `find_tools`。
-    同一属性多个 as_of 是更新，只答最晚一条。计数/清单跨多段会话，本页未齐时用命中专名再搜。
+    同一 query 重搜结果相同；**换槽位词**（专名/日期/清单项）再搜会取到不同片段。
+    这次没有结果，换个问法也不会有别的：外部实时事实另找联网来源，某个领域的专用
+    能力另找对应工具——两者都不要向用户解释。取到的片段只证明谁在该时点说过；
+    日期、数量、状态不是当前事实。问现在如何而没有本轮其它工具结果时，只转述原话。
 
     Args:
         ctx: 工具执行上下文
@@ -119,7 +143,7 @@ async def search_cognition(
         limit: 返回条数上限，默认 24
 
     Returns:
-        路径卡（若命中枢纽）+ 选定全文 + 统一命中列表。无命中时只回一行。
+        路径卡（若涉及公共枢纽）+ 选定全文 + 片段列表。没有结果时只回一行。
     """
     scope = _scope_from_ctx(ctx)
     if not scope.user_id:
@@ -132,17 +156,18 @@ async def search_cognition(
     key = _query_key(query, selected)
     if key in seen:
         prev = seen[key]
-        same = f"结果同上：{prev}" if prev != "无命中" else "仍无命中"
+        same = f"结果同上：{prev}" if prev != _NO_MATERIAL else "仍无可用材料"
         return (
-            f"（本轮已检索过「{query[:30]}」，{same}。"
-            "认知层是只读的，换说法重搜不会有新结果——"
-            "要外部数据请用 web_search_tool，要全文请用 read_handle，或直接据已有信息作答。）"
+            f"（本轮已拿这个问法问过，{same}。"
+            "换个问法不会变；要外部实时事实走联网来源，要专域信息走对应能力，"
+            "或者直接据已有信息作答。）"
         )
 
     search_q = strip_speaker_from_query(query, scope.user_id)
     from gsuid_core.ai_core.memory.retrieval.lexical import strip_clock_lines
 
     search_q = strip_clock_lines(search_q) or search_q
+    search_q = _append_alias_canonicals(search_q)
 
     lim = max(1, min(limit, 48))
     hits = await federated_search(
@@ -153,10 +178,9 @@ async def search_cognition(
     )
     from gsuid_core.ai_core.cognition.hub import expand_hub, render_expand_result
 
-    # 说话人面不含知识库：query 词面去挂公共枢纽会把「morning coffee」打成角色卡。
-    mem_n = sum(1 for h in hits if h.kind in MEMORY_KINDS)
-    if CogKind.KNOWLEDGE in selected and mem_n < 8:
-        expansion = await expand_hub(query, hits, scope=scope)
+    # 说话人面不含知识。片段很多也展开：否则聊过的专名会盖住已挂载枢纽。
+    if CogKind.KNOWLEDGE in selected:
+        expansion = await expand_hub(search_q, hits, scope=scope)
     else:
         expansion = None
     from gsuid_core.ai_core.content_guard import wrap_untrusted
@@ -167,13 +191,13 @@ async def search_cognition(
     hits_block = render_cognition_block(query, others, hint_query=search_q)
     card = render_expand_result(query, expansion) if expansion is not None else ""
     if not hits and not card:
-        seen[key] = "无命中"
+        seen[key] = _NO_MATERIAL
     elif card and hits:
-        seen[key] = f"命中 {len(hits)} 条，含路径卡"
+        seen[key] = f"找到 {len(hits)} 条，含路径卡"
     elif card:
         seen[key] = "路径卡"
     else:
-        seen[key] = f"命中 {len(hits)} 条"
+        seen[key] = f"找到 {len(hits)} 条"
     parts: list[str] = []
     if card:
         parts.append(card)

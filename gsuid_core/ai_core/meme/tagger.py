@@ -336,7 +336,7 @@ async def _tag_single(meme_id: str) -> None:
     # VLM 调用期间记录可能被管理员删除。任何移动/标签更新前重新确认。
     record = await AiMemeRecord.get_by_meme_id(meme_id)
     if record is None:
-        logger.info(t("[Meme] 打标时找不到记录: {meme_id}", meme_id=meme_id))
+        logger.info(t("log.meme.tag_record_missing", meme_id=meme_id))
         return
 
     # NSFW 检查：rejected 前也写入标签，方便后期人工审核

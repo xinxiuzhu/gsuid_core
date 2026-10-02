@@ -30,7 +30,7 @@ MAX_CONCURRENT_LLM_CALLS = 5
 # 冷场阈值：超过 1 小时不活跃的群不再巡检
 INACTIVE_THRESHOLD_HOURS = 1
 # 被动→主动冷却：最近一条 AI 消息（无论主动/被动）距今 < 此值（分钟）则不主动插话
-RECENT_AI_COOLDOWN_MINUTES = 12
+RECENT_AI_COOLDOWN_MINUTES = 45
 
 
 class HeartbeatInspector:
@@ -326,7 +326,9 @@ class HeartbeatInspector:
         # 让 AI 自然提及任务进展而非生硬另起一条播报。
         from gsuid_core.ai_core.heartbeat.dispatcher import get_dispatcher
 
-        merge_ctx = get_dispatcher().consume_merge_context(self._target_key(event, history))
+        dispatcher = get_dispatcher()
+        target_key = self._target_key(event, history)
+        merge_ctx = dispatcher.peek_merge_context(target_key)
         meta = await run_heartbeat(
             event,
             history,
@@ -342,13 +344,15 @@ class HeartbeatInspector:
         #    / 主 session 历史同步 / proactive_emission entry / C8 网关登记。
         from gsuid_core.ai_core.proactive import emit_proactive_message
 
-        await emit_proactive_message(
+        sent = await emit_proactive_message(
             event=event,
             message=message,
             source="heartbeat",
             trigger_reason=mood,
             generator_log_files=generator_log_files,
         )
+        if sent:
+            dispatcher.consume_merge_context(target_key)
 
     def _get_history(self, event: Event) -> List[Any]:
         """获取会话的全部历史记录"""

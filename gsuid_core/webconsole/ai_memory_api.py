@@ -20,6 +20,7 @@ from gsuid_core.logger import logger
 from gsuid_core.ai_core.memory import (
     parse_iso_or_unix_timestamp,
 )
+from gsuid_core.ai_core.text_chunk import chunk_text as _chunk_text
 from gsuid_core.webconsole.app_app import app
 from gsuid_core.webconsole.web_api import require_auth
 from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
@@ -237,6 +238,7 @@ async def search_memory(
         data: 包含 episodes、entities、edges、retrieval_meta 的检索结果
     """
     try:
+        from gsuid_core.ai_core.kits.base import inject_memory_cap
         from gsuid_core.ai_core.memory.retrieval.dual_route import dual_route_retrieve
 
         if not memory_config.enable_retrieval:
@@ -265,7 +267,9 @@ async def search_memory(
                 # 本次会命中并注入的偏好/纠错硬约束，便于控制台排查"为什么 Agent 还调错"
                 "preferences": mem_ctx.preferences,
                 "retrieval_meta": mem_ctx.retrieval_meta,
-                "prompt_text": mem_ctx.to_prompt_text(),
+                "prompt_text": mem_ctx.to_prompt_text(
+                    inject_memory_cap(req.query, covered=mem_ctx.covered), query=req.query
+                ),
             },
         }
     except _RUNTIME_ERRORS as e:
@@ -277,45 +281,6 @@ async def search_memory(
 
 
 # 1.5 批量摄入 API（评测 / 回灌专用，无需 web 控制台鉴权，但受 local-test 守卫保护）
-
-# 回灌切块上限（字符）：本地 bge-small 嵌入截断在 512 token(~2000 字符)、
-# 按句子边界打包到约 900 字符一块，保证每块完整入嵌入
-_INGEST_CHUNK_CHARS = 900
-
-_SENT_SPLIT_RE = __import__("re").compile(r"(?<=[。.!?！？\n])\s+")
-
-
-def _chunk_text(text: str, target: int = _INGEST_CHUNK_CHARS) -> List[str]:
-    """把一条长 turn 按句子边界打包成 ≤target 字符的块；过长的单句硬切。
-
-    不做重叠（重叠会引入重复块、稀释 reranker 候选）；短 turn 原样返回单块。
-    """
-    text = text.strip()
-    if len(text) <= target:
-        return [text] if text else []
-
-    chunks: List[str] = []
-    cur = ""
-    for piece in _SENT_SPLIT_RE.split(text):
-        piece = piece.strip()
-        if not piece:
-            continue
-        if len(piece) > target:
-            # 超长单句（如代码块/无标点长串）：先收掉当前块，再硬切
-            if cur:
-                chunks.append(cur)
-                cur = ""
-            for i in range(0, len(piece), target):
-                chunks.append(piece[i : i + target])
-            continue
-        if cur and len(cur) + 1 + len(piece) > target:
-            chunks.append(cur)
-            cur = piece
-        else:
-            cur = f"{cur} {piece}" if cur else piece
-    if cur:
-        chunks.append(cur)
-    return chunks
 
 
 # §14.1 窗口化实体/边抽取（评测/回灌专用） Episode 粒度（granular，由 create_episodes_bulk 写入）与抽取批次粒度在此解耦
@@ -529,10 +494,16 @@ async def batch_observe(
         # 解析每条 turn 的可选 timestamp，失败时累计 ts_failures（不静默吞）
         parsed_turns: List[Tuple[BatchObserveTurn, Optional[datetime]]] = []
         ts_failures = 0
+        raw_ts: List[Optional[datetime]] = []
         for turn in req.turns:
             ts_obj = parse_iso_or_unix_timestamp(turn.timestamp)
             if turn.timestamp is not None and ts_obj is None:
                 ts_failures += 1
+            raw_ts.append(ts_obj)
+        from gsuid_core.ai_core.memory.ingest_time import spread_datetimes
+
+        spread_ts = spread_datetimes(raw_ts)
+        for turn, ts_obj in zip(req.turns, spread_ts):
             parsed_turns.append((turn, ts_obj))
 
         # 评测回放：user / assistant 两侧都是对话内容，统一落到目标 scope。提前算好

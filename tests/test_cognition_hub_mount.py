@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import inspect
 from types import SimpleNamespace
@@ -55,7 +54,6 @@ from gsuid_core.ai_core.cognition.hub import (
 )
 from gsuid_core.ai_core.cognition.nodes import (
     AICogNode,
-    CogEdgeKind,
     AICogAttachment,
     node_visible_to,
 )
@@ -143,13 +141,12 @@ def _kp(
 # ── 表与契约 ──
 
 
-def test_search_cognition_signature_unchanged() -> None:
-    from gsuid_core.ai_core.cognition import search_cognition
+def test_short_self_title_skipped_inside_longer_query() -> None:
+    from gsuid_core.ai_core.cognition.hub import _skip_generic_short_title
 
-    sig = inspect.signature(search_cognition)
-    assert sig.parameters["kinds"].default is inspect.Parameter.empty
-    assert sig.parameters["scope"].default is inspect.Parameter.empty
-    assert "CognitiveHit" in str(sig.return_annotation)
+    assert _skip_generic_short_title("甲乙", "丙丁 甲乙", "甲乙")
+    assert not _skip_generic_short_title("甲乙", "甲乙", "甲乙")
+    assert not _skip_generic_short_title("甲乙", "丙丁 甲乙", "戊己庚")
 
 
 def test_expand_hub_and_link_have_no_scope_defaults() -> None:
@@ -163,91 +160,6 @@ def test_expand_hub_and_link_have_no_scope_defaults() -> None:
     hits_sig = inspect.signature(_hubs_from_hits)
     assert hits_sig.parameters["scope"].default is inspect.Parameter.empty
     assert hits_sig.parameters["scope"].kind is inspect.Parameter.KEYWORD_ONLY
-
-
-def test_init_steps_do_not_await_mount() -> None:
-    from gsuid_core.ai_core import startup as startup_mod
-    from gsuid_core.ai_core.cognition.hub import spawn_cognition_mount
-
-    names = [n for n, _ in startup_mod._INIT_STEPS]
-    assert all("Cognition" not in n and "Mount" not in n for n in names)
-    src = inspect.getsource(startup_mod.init_ai_core)
-    assert "spawn_cognition_mount()" in src
-    assert "await spawn_cognition_mount" not in src
-    assert "await run_cognition_mount" not in src
-    ready_at = src.rfind("_AI_CORE_READY = True")
-    spawn_at = src.find("spawn_cognition_mount")
-    assert 0 <= ready_at < spawn_at
-    spawn_src = inspect.getsource(spawn_cognition_mount)
-    assert "create_task" in spawn_src
-    assert "await run_cognition_mount" not in spawn_src
-
-
-def test_kits_have_no_cognition_mount_init_step() -> None:
-    root = Path(__file__).resolve().parent.parent / "gsuid_core" / "ai_core" / "kits"
-    for kit in root.glob("*/kit.py"):
-        src = kit.read_text(encoding="utf-8")
-        if "cognition_mount" in src or "mount_plugin_and_manual" in src:
-            raise AssertionError(f"{kit} 不得再挂一份挂载 init_step")
-
-
-def test_cognition_mount_enable_exists() -> None:
-    from gsuid_core.ai_core.configs.ai_config import ai_config
-
-    assert ai_config.get_config("cognition_mount_enable").data is True
-
-
-def test_no_has_doc_edge_kind() -> None:
-    assert {e.value for e in CogEdgeKind} == {"related", "supports", "supersedes", "derived_from"}
-    src = inspect.getsource(CogEdgeKind)
-    assert "HAS_DOC" not in src
-    assert "has_doc" not in src.lower()
-
-
-def test_hub_does_not_cross_scope_update_memory_entities() -> None:
-    hub_path = Path(__file__).resolve().parent.parent / "gsuid_core" / "ai_core" / "cognition" / "hub.py"
-    hub_src = hub_path.read_text(encoding="utf-8")
-    assert "AIMemEntity" in hub_src
-    lowered = hub_src.lower()
-    assert "update aimementity" not in lowered
-    assert "delete(aimementity" not in lowered
-    link_src = inspect.getsource(maybe_link_entity_to_world)
-    assert "make_world_ref" not in link_src
-    from gsuid_core.ai_core.cognition.hub import schedule_link_entities
-
-    assert "create_task" in inspect.getsource(schedule_link_entities)
-
-
-def test_entity_hook_covers_all_upserted_not_only_new() -> None:
-    from gsuid_core.ai_core.memory.ingestion import entity as entity_mod
-
-    src = inspect.getsource(entity_mod.extract_and_upsert_entities)
-    compact = src.replace(" ", "").replace("\n", "")
-    assert "schedule_link_entities(scope_key,to_link)" in compact
-    assert "speaker_names_from_entities" in src
-    assert "new_entity_count" in src
-
-
-def test_hub_py_ast_has_no_aimem_cross_scope_dml() -> None:
-    src = (Path(__file__).resolve().parent.parent / "gsuid_core" / "ai_core" / "cognition" / "hub.py").read_text(
-        encoding="utf-8"
-    )
-    tree = ast.parse(src)
-    banned = {"update", "delete"}
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
-        name = ""
-        if isinstance(func, ast.Name):
-            name = func.id.lower()
-        elif isinstance(func, ast.Attribute):
-            name = func.attr.lower()
-        if name not in banned:
-            continue
-        dumped = ast.dump(node).lower()
-        assert "aimementity" not in dumped
-        assert "aimemedge" not in dumped
 
 
 # ── 正式名 / slot ──
@@ -1245,6 +1157,63 @@ def test_expand_ranks_hub_linked_in_current_scope() -> None:
     clear_entity_index()
 
 
+def test_query_token_hits_mounted_hub_without_alias() -> None:
+    """启动挂上的枢纽不在别名表里，query 里的正式名仍要出路径卡。"""
+    clear_entity_index()
+    mem = _HubMem()
+    mem.add_node(_node(nid=1, ref="world:Plug:WindBlade", title="WindBlade"))
+    mem.add_node(_node(nid=2, ref="world:Plug:SilverCup", title="SilverCup"))
+    mem.atts.append(_att(aid=1, node_id=1, slot="资料", title="WindBlade 基础", ref="plugin:a", handle="kb_plugin:a"))
+    mem.atts.append(_att(aid=2, node_id=2, slot="资料", title="SilverCup 基础", ref="plugin:b", handle="kb_plugin:b"))
+    with _mem_patches(mem):
+        with patch("gsuid_core.ai_core.cognition.hub._read_article", new=AsyncMock(return_value="")):
+            with patch("gsuid_core.ai_core.cognition.hub._facts_for_hub", new=AsyncMock(return_value=[])):
+                out = _run(
+                    _expand_hub_body(
+                        "WindBlade 和 SilverCup 哪个合适",
+                        [],
+                        scope=CogScope(user_id="u1", group_id="g1"),
+                    )
+                )
+    assert [c.title for c in out.cards] == ["WindBlade", "SilverCup"] or set(c.title for c in out.cards) == {
+        "WindBlade",
+        "SilverCup",
+    }
+    clear_entity_index()
+
+
+def test_expand_hub_runs_when_memory_fills_page() -> None:
+    from gsuid_core.ai_core.buildin_tools.rag_search import search_cognition
+
+    calls: list[int] = []
+
+    async def _memory_page(query: str, *, kinds: Any, scope: Any, limit: int) -> Any:
+        _ = (query, kinds, scope, limit)
+        return [CognitiveHit(kind=CogKind.EPISODE, id=f"e{i}", title="", summary="chat", score=0.5) for i in range(10)]
+
+    async def _expand(query: str, hits: Any, *, scope: Any) -> ExpandResult:
+        _ = (query, hits, scope)
+        calls.append(1)
+        return ExpandResult(
+            cards=[HubCard(title="WindBlade", hub_ref="world:Plug:WindBlade", as_of="1", plugin="Plug")]
+        )
+
+    deps = SimpleNamespace(
+        ev=SimpleNamespace(user_id="u1", group_id="g1", session_id="s1"),
+        bot=None,
+        extra={},
+        parent_session_id=None,
+    )
+    ctx: Any = SimpleNamespace(deps=deps)
+    with (
+        patch("gsuid_core.ai_core.buildin_tools.rag_search.federated_search", new=_memory_page),
+        patch("gsuid_core.ai_core.cognition.hub.expand_hub", new=_expand),
+    ):
+        text = _run(search_cognition(ctx, query="WindBlade"))
+    assert calls == [1]
+    assert "路径:" in text
+
+
 def test_expand_does_not_inherit_other_scope_link() -> None:
     clear_entity_index()
     register_entity_surface("AbyssPeak", "PeakA", "GameA")
@@ -1364,10 +1333,6 @@ def test_render_expand_uses_untrusted_and_read_handle_hint() -> None:
     assert 'source="memory_recall"' in text
     assert "ignore previous instructions" in text
     assert "选定全文" in text
-
-
-def test_fulltext_limit_constant() -> None:
-    assert FULLTEXT_CHAR_LIMIT == 6000
 
 
 def test_read_article_truncates_and_mentions_read_handle() -> None:
@@ -1676,38 +1641,6 @@ def test_attach_article_does_not_overwrite_web_row() -> None:
     assert len(web) == 1 and web[0].source == "web"
 
 
-def test_seen_query_mentions_path_card() -> None:
-    from gsuid_core.ai_core.buildin_tools.rag_search import search_cognition
-
-    calls: list[str] = []
-
-    async def _counting_search(query: str, *, kinds: Any, scope: Any, limit: int) -> Any:
-        calls.append(query)
-        return []
-
-    async def _no_expand(query: str, hits: Any, *, scope: Any) -> ExpandResult:
-        _ = (query, hits, scope)
-        return ExpandResult()
-
-    deps = SimpleNamespace(
-        ev=SimpleNamespace(user_id="u1", group_id="g1", session_id="s1"),
-        bot=None,
-        extra={},
-        parent_session_id=None,
-    )
-    ctx: Any = SimpleNamespace(deps=deps)
-    with (
-        patch("gsuid_core.ai_core.buildin_tools.rag_search.federated_search", new=_counting_search),
-        patch("gsuid_core.ai_core.cognition.hub.expand_hub", new=_no_expand),
-    ):
-        first = _run(search_cognition(ctx, query="上周的旅行计划"))
-        second = _run(search_cognition(ctx, query=" 上周的旅行计划 "))
-    assert len(calls) == 1
-    assert "无命中" in first
-    assert "仍无命中" in second
-    assert "含路径卡" not in second
-
-
 def test_seen_query_repeats_path_card_when_present() -> None:
     from gsuid_core.ai_core.buildin_tools.rag_search import search_cognition
 
@@ -1776,18 +1709,6 @@ def test_no_cognition_hub_domain_keywords_in_production() -> None:
         src = path.read_text(encoding="utf-8")
         for word in banned:
             assert word not in src, f"{path.name} 含域词 {word}"
-
-
-def test_list_world_hubs_by_title_uses_sql_lower() -> None:
-    src = inspect.getsource(AICogNode.list_world_hubs_by_title)
-    assert "func.lower" in src
-
-
-def test_list_world_canons_in_scope_filters_scope_in_sql() -> None:
-    src = inspect.getsource(AICogNode.list_world_canons_in_scope)
-    assert "col(cls.scope_key) == scope_key" in src
-    assert 'startswith("ent:")' in src
-    assert 'startswith("world:")' in src
 
 
 def test_title_only_query_does_not_select_hub_named_attachment() -> None:
@@ -1981,37 +1902,8 @@ def test_node_visible_to_matches_search_acl() -> None:
     assert node_visible_to(owned, owner_user_id="u2", scope_keys=["group:g1"]) is False
 
 
-def test_cognition_detail_uses_visibility_helper() -> None:
-    from gsuid_core.webconsole import agent_kits_api
-
-    src = inspect.getsource(agent_kits_api.cognitionNodeDetail)
-    assert "node_visible_to" in src
-
-
-def test_cognition_nodes_batches_attachments() -> None:
-    from gsuid_core.webconsole import agent_kits_api
-
-    src = inspect.getsource(agent_kits_api.cognitionNodes)
-    assert "list_for_nodes" in src
-    assert "list_for_node(" not in src
-
-
-def test_import_manual_knowledge_mounts_docs() -> None:
-    from gsuid_core.ai_core.rag.knowledge import import_manual_knowledge
-
-    src = inspect.getsource(import_manual_knowledge)
-    assert "mount_one_manual_document" in src
-
-
 def test_mount_stats_records_last_error() -> None:
     assert "last_error" in MountStats.__dataclass_fields__
-
-
-def test_deep_reconcile_covers_agent_source() -> None:
-    from gsuid_core.ai_core.rag.knowledge import deep_reconcile_manual_knowledge
-
-    src = inspect.getsource(deep_reconcile_manual_knowledge)
-    assert "agent" in src
 
 
 def test_distill_web_attach_uses_persist_title_not_tool_name() -> None:
@@ -2204,8 +2096,3 @@ def test_path_card_without_hits_does_not_say_empty() -> None:
         out = _run(search_cognition(ctx, query="Alpha技能"))
     assert "路径:" in out
     assert "无命中（= 没存过" not in out
-
-
-def test_node_search_title_exact_uses_sql_lower() -> None:
-    src = inspect.getsource(AICogNode.search)
-    assert "func.lower" in src

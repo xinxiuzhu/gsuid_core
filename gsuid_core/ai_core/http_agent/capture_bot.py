@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Dict, List, Union, Literal, Optional
+from typing import Dict, List, Union, Literal, Mapping, Optional
 
 from gsuid_core.bot import Bot, _Bot, message_list_to_str
 from gsuid_core.i18n import t
@@ -48,7 +48,9 @@ class CaptureItem:
 
 
 def _is_image_string(s: str) -> bool:
-    return s.startswith("base64://") or s.startswith("data:image/") or s.startswith("link://")
+    return (
+        s.startswith("base64://") or s.startswith("data:image/") or s.startswith("link://") or s.startswith("file://")
+    )
 
 
 def _b64_payload(s: str) -> tuple[str, str, int]:
@@ -65,6 +67,8 @@ def _b64_payload(s: str) -> tuple[str, str, int]:
         return mime, body, (len(body) * 3) // 4
     if s.startswith("link://"):
         return "image/png", s[7:], len(s)
+    if s.startswith("file://"):
+        return "image/png", s, len(s)
     return "image/png", s, len(s)
 
 
@@ -188,7 +192,7 @@ class CaptureBot(Bot):
     async def commit_streamed_history(
         self,
         text: str,
-        extra_metadata: Optional[Dict[str, object]] = None,
+        extra_metadata: Optional[Mapping[str, object]] = None,
     ) -> None:
         """delta 已出站：只记 history / observe，不再入 SSE。"""
         if not text:
@@ -273,7 +277,7 @@ class CaptureBot(Bot):
             if isinstance(part, str):
                 if _is_image_string(part):
                     mime, payload, nbytes = _b64_payload(part)
-                    encoding: AttachmentEncoding = "url" if part.startswith("link://") else "base64"
+                    encoding: AttachmentEncoding = "url" if part.startswith(("link://", "file://")) else "base64"
                     await self._put_attachment_encoded(mime, payload, nbytes, encoding, "image")
                 elif not is_silence_marker(part):
                     if part:
@@ -286,7 +290,7 @@ class CaptureBot(Bot):
                         await self._put_attachment("image/png", data, "image")
                     elif isinstance(data, str):
                         mime, payload, nbytes = _b64_payload(data)
-                        encoding = "url" if data.startswith("link://") else "base64"
+                        encoding = "url" if data.startswith(("link://", "file://")) else "base64"
                         await self._put_attachment_encoded(mime, payload, nbytes, encoding, "image")
                 elif part.type == "text" and part.data is not None:
                     text = str(part.data)
@@ -339,7 +343,7 @@ class CaptureBot(Bot):
     async def _record_history(
         self,
         message: Union[Message, List[Message], str, bytes, List[str]],
-        extra_metadata: Optional[Dict[str, object]],
+        extra_metadata: Optional[Mapping[str, object]],
     ) -> None:
         from gsuid_core.ai_core.utils import is_silence_marker
         from gsuid_core.message_history import get_history_manager

@@ -14,8 +14,8 @@
 2.  黑名单 / 屏蔽列表 / 相同用户事件冷却（black_list / shield_list / same_user_cd）
 3.  msg_process() 解析消息 → Event 对象
 4.  用户消息记录到历史（history_manager.add_message）
-5.  主人识别：user_pm == 0 且未订阅 → 自动订阅"主人用户"
-6.  用户/群组入库（CoreUser.insert_user / CoreGroup.insert_group）
+5.  主人识别：user_pm == 0 → 后台确保订阅"主人用户"（不挡命令）
+6.  用户/群组记账（后台 insert_user / insert_group，不挡命令）
 7.  生成 session_id（Event.session_id 属性，见 §06）
 8.  重复消息检查（instances 单实例 / mutiply_instances 多实例）
 9.  相同消息冷却（cooldown_tracker.is_on_cooldown）
@@ -27,6 +27,7 @@
 
 > **顺序即语义**：黑名单/冷却在最前（省成本）；历史记录在触发判断**之前**（AI 关了也照样
 > 记历史、攒记忆）；触发器匹配在 AI 之前（**命令优先于 AI**）。加全局拦截要想清楚插在哪一步。
+> 第 5、6 步只把写库放进后台：命令入队时，主人订阅和 `CoreUser` 可能还没提交。
 
 > **入历史门控（2026-07-12）**：第 4 步的条件是 `_has_text or event.at_list`——**纯 @ 消息
 > （at 段无文字）也必须入历史**，否则 @ 目标从历史里凭空消失，AI/Heartbeat 会把紧随其后的
@@ -58,6 +59,14 @@ for sv in SL.lst:
 > **权限不足 = 不匹配 → 落 AI**：若某 SV `pm=2`，而用户 `user_pm=3`（权限更低），该命令
 > "不匹配"，消息落入 AI 流程。如果该触发器声明了 `to_ai`，AI 可能尝试调它对应的工具——
 > 此时**桥接层会再做一次同样的权限检查**并把"权限不足"文本返回给 AI（见 [§07](./07-tool-registry-and-agent.md)）。
+
+> **输入法空格**：`Trigger` 匹配时去掉整句首尾空格（含全角空格、NBSP），并允许插件前缀和命令之间有空格。
+> 命令词内部只在「中文 ↔ 英文/数字」交界允许多余空格（`绑定uid` 对得上 `绑定 uid`）；中文内部、英文内部的空格是参数分隔，保留。
+> 命中后 `ev.text` 去掉命令词紧外侧的那层空格，参数内部空格不动。`raw_text` 不改写。
+> `on_regex` 只去掉前缀后面的那层空格再套正则，正则里的 `\s` 仍由插件自己写。`on_keyword` 仍是字面包含，不跨交界拼词。
+> 群聊热路径仍是注册时拼好的 `prefix+keyword` 做一次 `startswith`：首字对不上前缀就返回。只有首字是空格或前缀首字时才走慢匹配。
+> `on_prefix` 的命令词后可以跟空格（`市盈率对比 光大银行` 与 `市盈率对比光大银行` 等价），但后面必须还有内容，裸命令不命中。
+> 这条判定统一由 `Trigger._check_prefix` 承担：`check_command` 里 `prefix` 分支不落到首字探针，否则空前缀触发器（`_probe` 为空）会被误杀。
 
 ## 4.3 AI 触发条件（`handler.py`）
 

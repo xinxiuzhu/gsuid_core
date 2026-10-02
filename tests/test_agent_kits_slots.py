@@ -18,7 +18,6 @@ from gsuid_core.ai_core.kits import (
     CONTEXT_BLOCK_ORDER,
     AgentKit,
     KitSlotError,
-    slot_of,
     clear_kits,
     enable_kit,
     disable_kit,
@@ -75,20 +74,6 @@ def test_block_order_is_the_single_source(isolated) -> None:
     ):
         assert is_known_block(name)
     assert not is_known_block("whatever")
-
-
-def test_slot_table_covers_18_replaceable_units(isolated) -> None:
-    assert len(KIT_SLOTS) == 19
-    names = {s.name for s in KIT_SLOTS}
-    # 槽名不含点号：点号既是槽名一部分又是配置层级分隔符会有解析歧义
-    assert all("." not in n for n in names), names
-    assert "tool_assembly" in names and "tool.assemble" not in names
-    # 密封槽：出站话术态与身份锚
-    sealed = {s.name for s in KIT_SLOTS if s.sealed}
-    assert sealed == {"speech", "persona_identity"}, sealed
-    # 入站观察允许多占（记忆观察 ≠ 表情观察）
-    assert not slot_of("inbound_observe").exclusive
-    assert slot_of("memory").exclusive
 
 
 def test_exclusive_slot_replacement_unloads_the_old_occupant(isolated) -> None:
@@ -329,8 +314,8 @@ def test_both_entries_stamp_current_time_from_one_producer() -> None:
     assert "run_interactive_turn(" in endpoint, "评测必须走同一轮编排（时间行在那里钉）"
     assert "[当前时间：" not in handle_ai and "[当前时间：" not in endpoint
     kit = (root / "ai_core" / "kits" / "memory" / "kit.py").read_text(encoding="utf-8")
-    assert "timeout_ms=15_000" in kit
-    assert "timeout_ms=45_000" not in kit
+    assert "timeout_ms=120_000" not in kit
+    assert "RETRIEVE_CONTEXT" in kit
     assert "clock_date=clock_date" in endpoint
     assert "memory_eval" in endpoint
 

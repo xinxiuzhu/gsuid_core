@@ -118,9 +118,10 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 
 - ``read_file_content`` / ``write_file_content`` / ``diff_file_content`` /
   ``list_directory`` / ``execute_file``（``file_manager.py``）：
-  Artifact Workspace 沙盒文件操作
-- ``execute_shell_command``（``command_executor.py``）：沙盒 shell
-  （``check_pm`` 权限校验）
+  Artifact Workspace 沙盒文件操作。``execute_file`` 仅主人可执行
+  （``check_high_risk_operator``，无 Event 也拒绝）
+- ``execute_shell_command``（``command_executor.py``）：沙盒 shell，
+  同样只认主人名单，不认任务行上的 ``user_pm``
 - ``_get_current_date``（``get_time.py``）：当前日期时间（注册名带下划线前缀）
 - ``move_file`` / ``copy_file`` / ``pack_to_zip``（``file_operations.py``）：
   artifacts 路径内文件移动（不可覆盖）/ 复制 / 打包 zip
@@ -251,6 +252,7 @@ from gsuid_core.ai_core.buildin_tools.web_search import web_search_tool
 
 # 用户头像工具 - 按用户ID取头像并注册到RM，返回图片ID
 from gsuid_core.ai_core.buildin_tools.avatar_tools import get_user_avatar
+from gsuid_core.ai_core.buildin_tools.chat_history import read_chat_history
 
 # 文件管理工具 - 读写执行文件和diff对比
 from gsuid_core.ai_core.buildin_tools.file_manager import (
@@ -299,6 +301,14 @@ from gsuid_core.ai_core.buildin_tools.file_operations import (
     copy_file,
     move_file,
     pack_to_zip,
+)
+from gsuid_core.ai_core.buildin_tools.memory_timeline import (
+    timeline,
+    read_session,
+    search_turns,
+    mark_evidence,
+    recall_session,
+    recall_timeline,
 )
 
 # 技能安装工具 - 从 git/zip/SKILL.md 直链安装技能到 SKILLS_PATH 并热重载（限主人）
@@ -349,6 +359,13 @@ __all__ = [
     # 认知检索（主人格唯一「回想」动词）+ RAG 图片检索
     "search_cognition",
     "search_image",
+    "recall_timeline",
+    "recall_session",
+    "search_turns",
+    "read_session",
+    "timeline",
+    "mark_evidence",
+    "read_chat_history",
     "attach_article",
     # 图片读取工具（按ID取图转述，保底）
     "read_image",

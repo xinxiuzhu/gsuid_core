@@ -12,6 +12,7 @@ from typing import Final, Union, Callable, Sequence, Awaitable
 from pathlib import Path
 
 import httpx
+
 try:
     from fastembed import SparseTextEmbedding
 except ImportError:
@@ -688,7 +689,7 @@ def _get_sparse_model():
         return
 
     if SparseTextEmbedding is None:
-        logger.warning(t("🧠 [Memory] fastembed 不可用（当前平台缺少 onnxruntime），BM25 稀疏嵌入将跳过"))
+        logger.warning(t("log.memory.fastembed_unavailable"))
         return None
 
     if _sparse_model is None:

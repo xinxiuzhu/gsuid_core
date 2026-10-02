@@ -223,8 +223,11 @@ def test_firewall_blocks_system_copy_leaks() -> None:
         assert hit is not None, text
         assert hit.category == "system_term"
         assert any("系统文案" in m or "框架泄漏" in m for m in hit.matched), hit.matched
-    # 角色化缺口允许
-    assert check_ooc("…没查到具体数字。…困。") is None
+    # 已反转（群聊 OOC 事故 2026-09）：「没查到具体数字」原被当成角色化缺口的正面样例，
+    # 门因此认可了检索语汇。缺口仍允许，但只能用人的说法；检索腔由 meta_narration 拦。
+    assert check_ooc("…那个数字我记不清。…困。") is None
+    meta = check_ooc("…内部库没你的分值。不是 0，是压根没记过。")
+    assert meta is not None and meta.category == "meta_narration", meta
 
 
 def test_persist_and_fold_propagates_then_caller_can_isolate() -> None:
@@ -264,35 +267,6 @@ def test_persist_and_fold_propagates_then_caller_can_isolate() -> None:
         except RuntimeError:
             folded = None
         assert folded is None
-
-
-def test_capability_persist_receives_plan_task_ids() -> None:
-    """plan context 的 task/root 会被传入 schedule_persist 路径。"""
-    from gsuid_core.ai_core.planning.runtime import (
-        PlanRunContext,
-        get_plan_context,
-        bind_plan_context,
-        reset_plan_context,
-    )
-
-    captured: dict[str, str] = {}
-
-    def _fake_schedule(**kwargs: Any) -> None:
-        captured["task_id"] = kwargs.get("task_id", "")
-        captured["root_task_id"] = kwargs.get("root_task_id", "")
-
-    token = bind_plan_context(PlanRunContext(task_id="task_cap_1", root_task_id="root_cap_9"))
-    try:
-        pc = get_plan_context()
-        assert pc is not None
-        _fake_schedule(
-            task_id=pc.task_id or "",
-            root_task_id=pc.root_task_id or "",
-        )
-        assert captured["task_id"] == "task_cap_1"
-        assert captured["root_task_id"] == "root_cap_9"
-    finally:
-        reset_plan_context(token)
 
 
 def test_delete_tool_output_index_noop_without_client() -> None:

@@ -3,7 +3,20 @@ import re
 import json
 import base64
 import asyncio
-from typing import TYPE_CHECKING, Any, Set, Dict, List, Tuple, Union, Literal, Optional, Protocol, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Set,
+    Dict,
+    List,
+    Tuple,
+    Union,
+    Literal,
+    Callable,
+    Optional,
+    Protocol,
+    Sequence,
+)
 
 import httpx
 from PIL import Image
@@ -33,6 +46,7 @@ from gsuid_core.ai_core.const import (
     _RETRYABLE_4XX,
     _CONTENT_REJECT_CODES,
     _CONTENT_REJECT_HINTS,
+    ERROR_QUOTA_EXHAUSTED,
 )
 from gsuid_core.utils.image.convert import convert_img
 from gsuid_core.utils.resource_manager import RM
@@ -187,7 +201,11 @@ _INTERNAL_CHANNEL_RE = re.compile(
 
 
 def strip_framework_user_leaks(text: str) -> str:
-    """剥进用户可见正文的控制信封 / 超轮数 / 内部通道。空则调用方当沉默。"""
+    """剥进用户可见正文的控制信封 / 超轮数 / 内部通道。空则调用方当沉默。
+
+    保留（至多一个）空行：``send_chat_result`` 靠 ``\\n\\s*\\n`` 拆多条气泡，
+    早期版本这里 splitlines+join 把空行全压成单换行，等于让拆条永久失效。
+    """
     if not text:
         return text
     out = _CONTROL_BLOCK_RE.sub("", text)
@@ -195,8 +213,15 @@ def strip_framework_user_leaks(text: str) -> str:
     out = _INTERNAL_CHANNEL_RE.sub("", out)
     if NO_RESULT_TEXT in out:
         out = out.replace(NO_RESULT_TEXT, "")
-    lines = [ln for ln in out.splitlines() if ln.strip()]
-    return "\n".join(lines).strip()
+    kept: list[str] = []
+    for ln in out.split("\n"):
+        if ln.strip():
+            kept.append(ln)
+        elif kept and kept[-1] != "":
+            kept.append("")
+    while kept and not kept[-1]:
+        kept.pop()
+    return "\n".join(kept).strip()
 
 
 def has_model_visible_content(ev: Event) -> bool:
@@ -326,6 +351,23 @@ def _strip_resource_handles(text: str) -> str:
     return cleaned
 
 
+# 同步读落盘图片：async 侧只能经 asyncio.to_thread 调它，文件不存在返回 None
+def _read_image_artifact_bytes(payload_path: str) -> Optional[bytes]:
+    from pathlib import Path
+
+    p = Path(payload_path)
+    if not p.exists():
+        return None
+    return p.read_bytes()
+
+
+# markdown_dark.css 路径含 __file__ resolve（阻塞 IO），async 侧经 to_thread 取
+def _markdown_dark_css_path() -> str:
+    from pathlib import Path
+
+    return str(Path(__file__).resolve().parent.parent / "utils" / "html_render" / "markdown_dark.css")
+
+
 async def _resolve_and_deliver_leaked_handles(
     text: str,
     bot: Bot,
@@ -373,11 +415,9 @@ async def _resolve_and_deliver_leaked_handles(
                 if art is None:
                     continue
                 if art.payload_path and (art.mime or "").startswith("image/"):
-                    from pathlib import Path
-
-                    p = Path(art.payload_path)
-                    if p.exists():
-                        await bot.send(MessageSegment.image(p.read_bytes()), extra_metadata=extra_metadata)
+                    image_data = await asyncio.to_thread(_read_image_artifact_bytes, art.payload_path)
+                    if image_data is not None:
+                        await bot.send(MessageSegment.image(image_data), extra_metadata=extra_metadata)
                         logger.info(i18n_t("log.ai.send_leaked_handle_was_resolved", h=h))
                 elif art.payload_inline and art.payload_inline.strip():
                     inline_texts.append(art.payload_inline.strip())
@@ -1270,13 +1310,11 @@ async def _send_report_images(
 
     主路径应已由 ``render_agent`` 出图；此处是呈现层兜底。
     """
-    from pathlib import Path
-
     from gsuid_core.utils.html_render import render_md_to_bytes
     from gsuid_core.ai_core.configs.ai_config import ai_config
 
     max_width: int = ai_config.get_config("markdown_image_max_width").data
-    css_path = str(Path(__file__).resolve().parent.parent / "utils" / "html_render" / "markdown_dark.css")
+    css_path = await asyncio.to_thread(_markdown_dark_css_path)
     for title, body in reports:
         md = f"# {title}\n\n{body}" if title else body
         md = f"{md}{_report_footer()}"
@@ -1311,9 +1349,7 @@ async def _try_render_markdown_image(
 
     max_width: int = ai_config.get_config("markdown_image_max_width").data
     try:
-        from pathlib import Path
-
-        css_path = str(Path(__file__).resolve().parent.parent / "utils" / "html_render" / "markdown_dark.css")
+        css_path = await asyncio.to_thread(_markdown_dark_css_path)
         image_bytes = await render_md_to_bytes(
             md=f"{md}{_report_footer()}",
             css_path=css_path,
@@ -1330,6 +1366,93 @@ async def _try_render_markdown_image(
     return True
 
 
+_NICK_AT_RE = re.compile(r"@(?!\d)([^\s@，。！？、,.!?]{1,16})")
+_MENTION_LABEL_RE = re.compile(r"([^\s()（）\n]{1,16})\(用户ID:([^)]+)\)")
+
+
+def mention_names_in_text(text: str) -> Dict[str, str]:
+    """从「名(用户ID:id)」抽出可解析的提及。"""
+    names: Dict[str, str] = {}
+    for match in _MENTION_LABEL_RE.finditer(text or ""):
+        name = match.group(1).strip()
+        uid = match.group(2).strip()
+        if name and uid and name != uid:
+            names[name] = uid
+    return names
+
+
+def mention_names_from_event(ev: Event | None) -> Dict[str, str]:
+    if ev is None:
+        return {}
+    sender = ev.sender
+    nick = ""
+    if isinstance(sender, dict) and "nickname" in sender and isinstance(sender["nickname"], str):
+        nick = sender["nickname"].strip()
+    uid = str(ev.user_id).strip() if ev.user_id else ""
+    if nick and uid and nick != uid:
+        return {nick: uid}
+    return {}
+
+
+def rewrite_nickname_mentions(
+    text: str,
+    names: Dict[str, str],
+    *,
+    already_at: str | None = None,
+) -> str:
+    """@昵称 收成 @用户ID。已经在 @ 的人去掉重复；对不上的 @昵称 删掉。"""
+
+    def _repl(match: re.Match[str]) -> str:
+        name = match.group(1)
+        uid = names[name] if name in names else ""
+        if not uid:
+            return ""
+        if already_at and uid == already_at:
+            return ""
+        return f"@{uid} "
+
+    return _NICK_AT_RE.sub(_repl, text)
+
+
+def _persona_max_bubbles(ev: Event | None) -> int:
+    """单轮主通道气泡上限。按当前人格的 ``chat_style`` 派生，缺人格回落默认档。"""
+    from gsuid_core.ai_core.persona.settings import persona_name_from_event
+    from gsuid_core.ai_core.persona.chat_style import resolve_chat_style
+
+    return resolve_chat_style(persona_name_from_event(ev)).bubbles
+
+
+def _outbound_auditor(ev: Event | None) -> Optional[Callable[[str, int, int], None]]:
+    """主通道出站审计回调。拿不到 session 时返回 None（评估 / 子代理等无归属场景）。
+
+    session 在发送前解析一次，不在气泡循环里反复查注册表。
+    """
+    if ev is None or not ev.session_id:
+        return None
+    from gsuid_core.ai_core.session_registry import get_ai_session_registry
+
+    sess = get_ai_session_registry().get_ai_session(ev.session_id)
+    if sess is None or sess._session_logger is None:
+        return None
+
+    group_id = str(ev.group_id) if ev.group_id else ""
+    target_user = str(ev.user_id) if ev.user_id else ""
+    session_logger = sess._session_logger
+
+    def _log(text: str, index: int, total: int) -> None:
+        session_logger.log_outbound_audit(
+            group_id=group_id,
+            text=text,
+            image_id="",
+            topic="",
+            target_user=target_user,
+            bubble_index=index,
+            bubble_total=total,
+        )
+
+    return _log
+
+
 async def send_chat_result(
     bot: Bot,
     text: str,
@@ -1337,6 +1460,7 @@ async def send_chat_result(
     extra_metadata: Optional[Dict[str, Any]] = None,
     ooc_check: bool = True,
     at_user_id: str | None = None,
+    mention_names: Optional[Dict[str, str]] = None,
 ) -> None:
     """
     解析并发送聊天结果，支持：
@@ -1400,6 +1524,10 @@ async def send_chat_result(
 
     # <br> 漏网已在 sanitize 落成换行；再统一其它 HTML 换行写法
     text = _normalize_html_linebreaks(text)
+    _names = mention_names_from_event(ev)
+    if mention_names:
+        _names.update(mention_names)
+    text = rewrite_nickname_mentions(text, _names, already_at=at_user_id)
 
     # Trace 日志：记录原始输出
     logger.trace(i18n_t("log.ai.meme_text_raw_output", text=repr(text)))
@@ -1418,11 +1546,11 @@ async def send_chat_result(
     clean_text = re.sub(r"[ \t]{2,}", " ", clean_text)
     clean_text = re.sub(r"^[，。！？\s]+|[，。！？\s]+$", "", clean_text)
 
-    # 无提醒通道（proactive 等）命中即替换；主循环自判产物走 ooc_check=False。
+    # 无提醒通道（proactive 等）没有 run 可让人格重说：命中即丢弃台词。
+    # 框架不替人格说话，也不发罐头（§1.9）；制品图/表情包仍照发。
     _ooc_replaced = False
     if (clean_text or report_blocks) and ooc_check:
-        from gsuid_core.ai_core.output_firewall import check_ooc, is_enabled, fallback_ooc_text
-        from gsuid_core.ai_core.persona.settings import persona_name_from_event
+        from gsuid_core.ai_core.output_firewall import check_ooc, is_enabled
 
         if is_enabled():
             # 短答门需要来话上下文：身份追问下的超短直答才算泄露（见 check_ooc docstring）
@@ -1436,7 +1564,7 @@ async def send_chat_result(
                         p1=_hit.matched,
                     )
                 )
-                clean_text = fallback_ooc_text(persona_name_from_event(ev))
+                clean_text = ""
                 _ooc_replaced = True
             # report 块与台词同权过末端防火墙：制品通道不能成为资金红线/出戏红线的 旁路（评审修复 F3），
             if report_blocks:
@@ -1477,9 +1605,9 @@ async def send_chat_result(
             await _send_trailing_artifacts()
             return
 
-    # 按空行分割为多条消息；人格连发上限 2 条（真人不会刷 5～7 段）
+    # 按空行分割为多条消息；条数上限由人格「说话强度」决定（chat_style 派生）。
     # 超出部分并入最后一条，避免 IM 刷屏。
-    _PERSONA_MAX_BUBBLES = 2
+    _PERSONA_MAX_BUBBLES = _persona_max_bubbles(ev)
     blocks = [b for b in re.split(r"\n\s*\n", clean_text) if b.strip()]
     if len(blocks) > _PERSONA_MAX_BUBBLES:
         head = blocks[: _PERSONA_MAX_BUBBLES - 1]
@@ -1488,8 +1616,10 @@ async def send_chat_result(
         logger.debug(i18n_t("log.ai.persona_bubbles_clamped", p0=_PERSONA_MAX_BUBBLES))
     _force_at = (at_user_id or "").strip()
     _at_done = False
+    _audit = _outbound_auditor(ev)
+    _total = len(blocks)
 
-    for block in blocks:
+    for _idx, block in enumerate(blocks, 1):
         if not block.strip():
             continue
 
@@ -1514,6 +1644,8 @@ async def send_chat_result(
         await asyncio.sleep(delay)
 
         await bot.send(segments, extra_metadata=extra_metadata)
+        if _audit is not None:
+            _audit(plain_text.strip(), _idx, _total)
 
     # 台词发完补发资料图（制品通道兜底），再发表情包
     await _send_trailing_artifacts()
@@ -1563,8 +1695,8 @@ def _parse_at_segments(text: str) -> list[Message]:
     规则：
     - @后跟纯数字（QQ号格式）才会被解析为 at segment
     - 其余文本保持为 text segment
-    - 示例输入："好哦 @444835641 你来看"
-    - 示例输出：[Text("好哦 "), At(444835641), Text(" 你来看")]
+    - 示例输入："好哦 @100000001 你来看"
+    - 示例输出：[Text("好哦 "), At(100000001), Text(" 你来看")]
     """
     # 匹配 @数字，前后允许空格（空格属于分隔符，不计入文本内容）
     pattern = re.compile(r"\s*@(\d+)\s*")
@@ -1610,48 +1742,6 @@ def _is_content_rejected(e: ModelHTTPError) -> bool:
     if any(hint in blob for hint in _CONTENT_REJECT_HINTS):
         return True
     return any(re.search(rf"\b{code}\b", blob) for code in _CONTENT_REJECT_CODES)
-
-
-def _extract_run_context(history: List[ModelMessage], max_fact_len: int = 2000) -> str:
-    """从历史消息中提取"已知事实"和"模型推理片段"，按轮次组织。
-
-    相比只提取 ToolReturnPart，还保留 TextPart（LLM 中间推理），
-    因为这些推理有时本身就是有价值的结论。
-    """
-    sections: list[str] = []
-    round_num = 0
-
-    for msg in history:
-        if isinstance(msg, ModelResponse):
-            round_num += 1
-            texts: list[str] = []
-            calls: list[str] = []
-            for part in msg.parts:
-                if isinstance(part, TextPart) and part.content.strip():
-                    t = part.content.strip()
-                    if len(t) > 500:
-                        t = t[:500] + "...[截断]"
-                    texts.append(t)
-                elif isinstance(part, ToolCallPart):
-                    calls.append(part.tool_name)
-
-            if texts or calls:
-                header = f"【第{round_num}轮】"
-                if calls:
-                    header += f" 调用工具: {', '.join(calls)}"
-                if texts:
-                    header += "\n" + "\n".join(texts)
-                sections.append(header)
-
-        elif isinstance(msg, ModelRequest):
-            for part in msg.parts:
-                if isinstance(part, ToolReturnPart):
-                    content = str(part.content).strip()
-                    if len(content) > max_fact_len:
-                        content = content[:max_fact_len] + f"\n...[截断, 共{len(content)}字符]"
-                    sections.append(f"  → [{part.tool_name}] 返回: {content}")
-
-    return "\n".join(sections) if sections else ""
 
 
 def _truncate_message_for_log(msg: Any, max_base64_len: int = 100) -> Any:
@@ -2457,6 +2547,8 @@ def sanitize_error_for_user(result_text: str, persona_name: str | None = None) -
     # 用角色短句，不用整行（…）当失败文案（人设可能把括号当可见心声）
     if ERROR_CONTENT_REJECTED in result_text:
         return get_persona_setting(persona_name, "error_content_policy")
+    if ERROR_QUOTA_EXHAUSTED in result_text:
+        return get_persona_setting(persona_name, "error_quota")
     if ERROR_TIMEOUT_TEXT in result_text:
         return get_persona_setting(persona_name, "error_timeout")
     return get_persona_setting(persona_name, "error_generic")
@@ -2467,6 +2559,7 @@ def sanitize_error_for_user(result_text: str, persona_name: str | None = None) -
 _ERROR_TYPE_LABEL_NO_RESULT = "无有效结果"
 _ERROR_TYPE_LABEL_CONTENT = "内容安全"
 _ERROR_TYPE_LABEL_TIMEOUT = "超时"
+_ERROR_TYPE_LABEL_QUOTA = "套餐用量打满"
 _ERROR_TYPE_LABEL_OTHER = "其他错误"
 _ERROR_TYPE_LABEL_UNKNOWN = "未知"
 
@@ -2514,6 +2607,8 @@ def classify_error_type(result_text: str) -> str:
         return _ERROR_TYPE_LABEL_UNKNOWN
     if ERROR_CONTENT_REJECTED in result_text:
         return _ERROR_TYPE_LABEL_CONTENT
+    if ERROR_QUOTA_EXHAUSTED in result_text:
+        return _ERROR_TYPE_LABEL_QUOTA
     if ERROR_TIMEOUT_TEXT in result_text:
         return _ERROR_TYPE_LABEL_TIMEOUT
     return _ERROR_TYPE_LABEL_OTHER
