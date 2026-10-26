@@ -11,8 +11,6 @@ from typing import Any, Dict, List, Tuple, Optional, Sequence
 from pathlib import Path
 from datetime import datetime, timezone
 
-from sqlmodel import col
-
 from gsuid_core.i18n import t
 from gsuid_core.pool import to_thread
 from gsuid_core.logger import logger
@@ -229,10 +227,7 @@ class MemeLibrary:
         Returns:
             是否成功
         """
-        from sqlmodel import delete
-
         from gsuid_core.ai_core.meme.deletion import safe_meme_path, meme_index_lock
-        from gsuid_core.utils.database.base_models import async_maker
 
         record = await AiMemeRecord.get_by_meme_id(meme_id)
         if record is None:
@@ -249,15 +244,7 @@ class MemeLibrary:
                 await _remove_from_qdrant(meme_id)
             except Exception as e:
                 logger.warning(t("log.meme.vector_delete_failed", e=e))
-            from gsuid_core.ai_core.meme.pack_model import AiMemePackItem
-
-            async with async_maker() as session:
-                # 同事务清理挂载成员（等价 PackStore.delete_members_of_meme）与记录
-                await session.execute(
-                    delete(AiMemePackItem).where(col(AiMemePackItem.meme_id) == meme_id)
-                )
-                await session.execute(delete(AiMemeRecord).where(col(AiMemeRecord.meme_id) == meme_id))
-                await session.commit()
+            await AiMemeRecord.delete_by_meme_id(meme_id)
         if file_path.exists():
             await _unlink_file(file_path)
         logger.info(t("log.meme.meme_id_delete_2", meme_id=meme_id))

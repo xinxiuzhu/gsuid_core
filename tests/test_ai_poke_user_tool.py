@@ -1,11 +1,15 @@
 import asyncio
-from types import SimpleNamespace
+from typing import Literal
 from pathlib import Path
 from unittest.mock import AsyncMock
 from importlib.util import module_from_spec, spec_from_file_location
 
 import pytest
+from pydantic_ai import RunContext
+from pydantic_ai.usage import RunUsage
+from pydantic_ai.models.test import TestModel
 
+from gsuid_core.bot import Bot, _Bot
 from gsuid_core.models import Event
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import find_tool_base
@@ -20,7 +24,7 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def _event(*, user_type: str = "group", user_id: str = "speaker") -> Event:
+def _event(*, user_type: Literal["group", "direct"] = "group", user_id: str = "speaker") -> Event:
     return Event(
         bot_id="onebot",
         real_bot_id="onebot",
@@ -32,13 +36,11 @@ def _event(*, user_type: str = "group", user_id: str = "speaker") -> Event:
     )
 
 
-def _ctx(bot, ev: Event, run_id: str = "run-1") -> SimpleNamespace:
-    return SimpleNamespace(
-        deps=ToolContext(
-            bot=bot,
-            ev=ev,
-            extra={"agent_run_id": run_id},
-        )
+def _ctx(bot: Bot, ev: Event, run_id: str = "run-1") -> RunContext[ToolContext]:
+    return RunContext(
+        deps=ToolContext(bot=bot, ev=ev, extra={"agent_run_id": run_id}),
+        model=TestModel(),
+        usage=RunUsage(),
     )
 
 
@@ -73,26 +75,28 @@ def test_poke_user_is_a_structured_slim_group_tool(monkeypatch: pytest.MonkeyPat
     }
 
 
-def test_poke_user_submits_valid_current_group_member() -> None:
+def test_poke_user_submits_valid_current_group_member(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_poke_user_throttle()
-    bot = SimpleNamespace(
-        get_group_member_list=AsyncMock(return_value=[{"user_id": "target"}]),
-        poke_user=AsyncMock(return_value=True),
-    )
+    bot = Bot(_Bot("yunzai"), _event())
+    members = AsyncMock(return_value=[{"user_id": "target"}])
+    submit = AsyncMock(return_value=True)
+    monkeypatch.setattr(bot, "get_group_member_list", members)
+    monkeypatch.setattr(bot, "poke_user", submit)
 
     result = _run(poke_user(_ctx(bot, _event()), "target"))
 
     assert result == "戳一戳请求已提交"
-    bot.get_group_member_list.assert_awaited_once_with(timeout=5.0)
-    bot.poke_user.assert_awaited_once_with("target")
+    members.assert_awaited_once_with(timeout=5.0)
+    submit.assert_awaited_once_with("target")
 
 
-def test_poke_user_rejects_unknown_member_and_self() -> None:
+def test_poke_user_rejects_unknown_member_and_self(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_poke_user_throttle()
-    bot = SimpleNamespace(
-        get_group_member_list=AsyncMock(return_value=[{"user_id": "known"}]),
-        poke_user=AsyncMock(return_value=True),
-    )
+    bot = Bot(_Bot("yunzai"), _event())
+    members = AsyncMock(return_value=[{"user_id": "known"}])
+    submit = AsyncMock(return_value=True)
+    monkeypatch.setattr(bot, "get_group_member_list", members)
+    monkeypatch.setattr(bot, "poke_user", submit)
     ev = _event()
 
     unknown = _run(poke_user(_ctx(bot, ev), "unknown"))
@@ -100,15 +104,16 @@ def test_poke_user_rejects_unknown_member_and_self() -> None:
 
     assert "不在当前群聊" in unknown
     assert "不能戳自己" in self_result
-    bot.poke_user.assert_not_awaited()
+    submit.assert_not_awaited()
 
 
-def test_poke_user_limits_one_submission_per_agent_run() -> None:
+def test_poke_user_limits_one_submission_per_agent_run(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_poke_user_throttle()
-    bot = SimpleNamespace(
-        get_group_member_list=AsyncMock(return_value=[{"user_id": "first"}, {"user_id": "second"}]),
-        poke_user=AsyncMock(return_value=True),
-    )
+    bot = Bot(_Bot("yunzai"), _event())
+    members = AsyncMock(return_value=[{"user_id": "first"}, {"user_id": "second"}])
+    submit = AsyncMock(return_value=True)
+    monkeypatch.setattr(bot, "get_group_member_list", members)
+    monkeypatch.setattr(bot, "poke_user", submit)
     ctx = _ctx(bot, _event())
 
     first = _run(poke_user(ctx, "first"))
@@ -116,17 +121,19 @@ def test_poke_user_limits_one_submission_per_agent_run() -> None:
 
     assert first == "戳一戳请求已提交"
     assert "本轮已经戳过" in second
-    bot.poke_user.assert_awaited_once_with("first")
+    submit.assert_awaited_once_with("first")
 
 
-def test_poke_user_private_scope_only_allows_current_contact() -> None:
+def test_poke_user_private_scope_only_allows_current_contact(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_poke_user_throttle()
-    bot = SimpleNamespace(poke_user=AsyncMock(return_value=True))
     ev = _event(user_type="direct", user_id="friend")
+    bot = Bot(_Bot("yunzai"), ev)
+    submit = AsyncMock(return_value=True)
+    monkeypatch.setattr(bot, "poke_user", submit)
 
     rejected = _run(poke_user(_ctx(bot, ev), "someone-else"))
     accepted = _run(poke_user(_ctx(bot, ev, "run-2"), "friend"))
 
     assert "只能戳当前联系人" in rejected
     assert accepted == "戳一戳请求已提交"
-    bot.poke_user.assert_awaited_once_with("friend")
+    submit.assert_awaited_once_with("friend")

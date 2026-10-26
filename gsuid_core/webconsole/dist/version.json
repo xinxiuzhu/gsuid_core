@@ -1,4 +1,5 @@
 {
-  "version": "0.4.0",
-  "mode": "production"
+  "version": "0.4.2",
+  "mode": "production",
+  "custom_build": true
 }

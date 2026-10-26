@@ -27,7 +27,7 @@ async def send_meme_record(
     *,
     mood: str,
     scene: str,
-    persona_name: str,
+    persona_name: str | None,
     interaction: str = "meme",
     observe_memory: bool = True,
 ) -> bool:

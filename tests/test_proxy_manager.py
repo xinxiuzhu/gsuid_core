@@ -2,15 +2,80 @@
 
 import time
 from types import SimpleNamespace
+from typing import Protocol, runtime_checkable
 from pathlib import Path
+from importlib import import_module
 
 import pytest
+import aiohttp
+
+from gsuid_core.utils.plugins_config.gs_config import StringConfig
 
 if not (Path(__file__).resolve().parents[1] / "gsuid_core/plugins/ProxyManager").is_dir():
     pytest.skip("ProxyManager 插件未安装，跳过其专项测试", allow_module_level=True)
 
-from gsuid_core.plugins.ProxyManager.ProxyManager.pm_core.models import Proxy, ProxySlot
-from gsuid_core.plugins.ProxyManager.ProxyManager.pm_core.manager import ProxyManager
+
+@runtime_checkable
+class Proxy(Protocol):
+    url: str
+
+
+@runtime_checkable
+class _ProxyFactory(Protocol):
+    def __call__(
+        self,
+        *,
+        url: str,
+        is_primary: bool,
+        source: str,
+        expires_at: float,
+        username: str = "",
+        password: str = "",
+    ) -> Proxy: ...
+
+
+@runtime_checkable
+class _ProxySlot(Protocol):
+    proxy: Proxy
+    in_flight: int
+    throttled_until: float
+
+
+@runtime_checkable
+class _SlotFactory(Protocol):
+    def __call__(self, proxy: Proxy) -> _ProxySlot: ...
+
+
+@runtime_checkable
+class _Manager(Protocol):
+    config: StringConfig
+
+    def ProxyManager(self) -> "_ManagerInstance": ...
+
+
+class _ManagerInstance(Protocol):
+    _test_config: dict[str, int | str | bool]
+
+
+@runtime_checkable
+class _Patcher(Protocol):
+    config: StringConfig
+
+    async def _handle_response(self, proxy: Proxy, response: SimpleNamespace) -> None: ...
+
+    async def patched_aiohttp_request(self, session: object, method: str, url: str) -> object: ...
+
+
+_PLUGIN = "gsuid_core.plugins.ProxyManager.ProxyManager"
+_models = import_module(f"{_PLUGIN}.pm_core.models")
+ProxyClass = _models.Proxy
+ProxySlot = _models.ProxySlot
+assert isinstance(ProxyClass, _ProxyFactory)
+assert isinstance(ProxySlot, _SlotFactory)
+manager_module = import_module(f"{_PLUGIN}.pm_core.manager")
+assert isinstance(manager_module, _Manager)
+patcher_module = import_module(f"{_PLUGIN}.pm_patcher")
+assert isinstance(patcher_module, _Patcher)
 
 _DEFAULT_CONFIG = {
     "ProxyCacheSize": 2,
@@ -26,21 +91,19 @@ _DEFAULT_CONFIG = {
 
 @pytest.fixture
 def manager(monkeypatch):
-    import gsuid_core.plugins.ProxyManager.ProxyManager.pm_core.manager as manager_module
-
     values = dict(_DEFAULT_CONFIG)
     monkeypatch.setattr(
         manager_module.config,
         "get_config",
         lambda key: SimpleNamespace(data=values[key]),
     )
-    proxy_manager = ProxyManager()
+    proxy_manager = manager_module.ProxyManager()
     proxy_manager._test_config = values
     return proxy_manager
 
 
 def _proxy(host: str, expires_in: int = 60) -> Proxy:
-    return Proxy(
+    return ProxyClass(
         url=f"http://{host}:8080",
         is_primary=True,
         source="主代理(api)",
@@ -205,7 +268,7 @@ def test_punishment_removes_only_matching_idle_slot(manager):
 
 @pytest.mark.anyio
 async def test_connect_429_switches_proxy_and_releases_on_response_close(manager, monkeypatch):
-    import gsuid_core.plugins.ProxyManager.ProxyManager.pm_patcher as patcher
+    patcher = patcher_module
 
     first = _proxy("10.0.0.1")
     second = _proxy("10.0.0.2")
@@ -261,7 +324,7 @@ async def test_connect_429_switches_proxy_and_releases_on_response_close(manager
     monkeypatch.setattr(patcher, "proxy_manager", manager)
     monkeypatch.setattr(patcher, "get_proxy_for_url", get_proxy)
     monkeypatch.setattr(patcher, "original_aiohttp_request", request)
-    monkeypatch.setattr(patcher.aiohttp, "ClientHttpProxyError", Proxy429)
+    monkeypatch.setattr(aiohttp, "ClientHttpProxyError", Proxy429)
     monkeypatch.setattr(
         patcher.config,
         "get_config",
@@ -292,7 +355,7 @@ async def test_connect_429_switches_proxy_and_releases_on_response_close(manager
 
 @pytest.mark.anyio
 async def test_target_429_is_not_proxy_quality_failure(manager, monkeypatch):
-    import gsuid_core.plugins.ProxyManager.ProxyManager.pm_patcher as patcher
+    patcher = patcher_module
 
     monkeypatch.setattr(patcher, "proxy_manager", manager)
     monkeypatch.setattr(
@@ -314,7 +377,7 @@ async def test_target_429_is_not_proxy_quality_failure(manager, monkeypatch):
 
 @pytest.mark.anyio
 async def test_status_redacts_proxy_password(manager):
-    proxy = Proxy(
+    proxy = ProxyClass(
         url="http://10.0.0.1:8080",
         is_primary=True,
         source="主代理(api)",

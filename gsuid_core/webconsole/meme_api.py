@@ -97,6 +97,7 @@ class MemeBatchDeleteRequest(BaseModel):
 
 
 class MemeDeleteFilter(BaseModel):
+    pack_id: str | None = Field(None, min_length=1, max_length=64)
     folder: Optional[str] = Field(None, max_length=64)
     persona_hint: Optional[str] = Field(None, max_length=64)
     status: Optional[str] = Field(None, max_length=32)
@@ -818,6 +819,9 @@ async def preview_meme_delete(
         folder if folder is not None else (_folder_for_persona(persona_hint) if persona_hint is not None else None)
     )
     status = filter_data.status if filter_data is not None else req.status
+    pack_id = filter_data.pack_id if filter_data is not None else None
+    if pack_id is not None and persona_hint is not None:
+        return {"status": 1, "msg": "pack_id 与 persona_hint 互斥", "data": None}
     if status is not None and status not in _VALID_MEME_STATUSES:
         return {"status": 1, "msg": f"无效的状态: {status}", "data": None}
     try:
@@ -830,6 +834,7 @@ async def preview_meme_delete(
             folder=effective_folder,
             persona_hint=persona_hint,
             status=status,
+            pack_id=pack_id,
         )
         status_counts: Dict[str, int] = {}
         for target in targets:

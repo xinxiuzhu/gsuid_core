@@ -58,6 +58,19 @@ def test_autoindex_picks_highest_version_zip() -> None:
     assert picked == ("v0.10.0.zip", (0, 10, 0))
 
 
+def test_custom_build_keeps_bundled_frontend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bundled = _write_dist(tmp_path / "bundled", "0.4.2", "custom")
+    (bundled / "version.json").write_text(json.dumps({"version": "0.4.2", "custom_build": True}), encoding="utf-8")
+    extra = _write_dist(tmp_path / "extra", "99.0.0", "upstream")
+    holder = FrontendDist(select_frontend_dist(bundled, extra, probe_local_dists(bundled, extra)))
+    seen = _patch_site(monkeypatch, base="http://resource.test", pages={}, bundled=bundled, extra=extra)
+
+    assert holder.path == bundled
+    assert asyncio.run(dist_sync.sync_remote_webconsole(holder)) is False
+    assert holder.path == bundled
+    assert seen == []
+
+
 def test_equal_or_missing_local_dist_selection(tmp_path: Path) -> None:
     bundled = _write_dist(tmp_path / "bundled", "0.4.0", "bundled")
     extra = _write_dist(tmp_path / "extra", "0.4.0", "extra")

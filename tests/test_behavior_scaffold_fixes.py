@@ -28,16 +28,19 @@ def test_stale_topic_triggers_note() -> None:
 
 def test_fresh_topic_no_note() -> None:
     now = time.time()
-    history = [_msg("user", 3, now)]
+    history = [_msg("user", 1, now)]
     assert build_staleness_section(history, now) == ""
+    # 上游语义: 3-20 分钟为开放话题区, 注入时间差感而非冷话题提示
+    delayed = build_staleness_section([_msg("user", 5, now)], now)
+    assert "才看到" in delayed or "时间差" in delayed
 
 
 def test_assistant_message_also_anchors_staleness() -> None:
     """bot 刚发过言也应刷新时间锚；空历史不注入冷场提示。"""
     now = time.time()
-    assert build_staleness_section([_msg("assistant", 5, now)], now) == ""
+    assert build_staleness_section([_msg("assistant", 1, now)], now) == ""
     assert build_staleness_section([_msg("assistant", 40, now)], now) != ""
-    assert build_staleness_section([_msg("user", 40, now), _msg("assistant", 5, now)], now) == ""
+    assert build_staleness_section([_msg("user", 40, now), _msg("assistant", 1, now)], now) == ""
     assert build_staleness_section([], now) == ""
 
 

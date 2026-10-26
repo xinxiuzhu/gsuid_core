@@ -122,7 +122,7 @@ def test_capture_classifies_text_and_png() -> None:
     note_outbound("捕获结束后不记")
 
 
-def test_plugin_anchor_unwraps_wrapper_and_ignores_framework(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_plugin_anchor_unwraps_wrapper_and_ignores_framework(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from functools import wraps
 
     from gsuid_core.ai_core.command_aside.plugin_read import plugin_anchor
@@ -138,7 +138,7 @@ def test_plugin_anchor_unwraps_wrapper_and_ignores_framework(monkeypatch: pytest
 
     def fake_getfile(func: object) -> str:
         seen.append(func)
-        return r"F:\repo\gsuid_core\plugins\DemoPlug\pkg\handler.py"
+        return str(tmp_path / "gsuid_core" / "plugins" / "DemoPlug" / "pkg" / "handler.py")
 
     monkeypatch.setattr("gsuid_core.ai_core.command_aside.plugin_read.inspect.getfile", fake_getfile)
     anchor = plugin_anchor(wrapped)
@@ -149,7 +149,7 @@ def test_plugin_anchor_unwraps_wrapper_and_ignores_framework(monkeypatch: pytest
 
     def framework_file(func: object) -> str:
         del func
-        return r"F:\repo\gsuid_core\sv.py"
+        return str(tmp_path / "gsuid_core" / "sv.py")
 
     monkeypatch.setattr("gsuid_core.ai_core.command_aside.plugin_read.inspect.getfile", framework_file)
     assert plugin_anchor(real) is None

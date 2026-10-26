@@ -5,7 +5,7 @@ from typing import Any, Optional, Sequence
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
-from sqlmodel import col, delete, select, update
+from sqlmodel import col, select, update
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
@@ -88,6 +88,7 @@ async def create_delete_preview(
     folder: Optional[str] = None,
     persona_hint: Optional[str] = None,
     status: Optional[str] = None,
+    pack_id: str | None = None,
 ) -> tuple[AiMemeDeleteOperation, list[AiMemeDeleteTarget]]:
     """Persist one transactionally consistent operation and target snapshot."""
     from gsuid_core.utils.database.base_models import async_maker
@@ -110,6 +111,11 @@ async def create_delete_preview(
             stmt = stmt.where(col(AiMemeRecord.folder) == folder)
         if status is not None:
             stmt = stmt.where(col(AiMemeRecord.status) == status)
+        if pack_id is not None:
+            from gsuid_core.ai_core.meme.pack_model import AiMemePackItem
+
+            member_ids = select(AiMemePackItem.meme_id).where(col(AiMemePackItem.pack_id) == pack_id)
+            stmt = stmt.where(col(AiMemeRecord.meme_id).in_(member_ids))
         records = list((await session.execute(stmt)).scalars().all())
         targets = [
             AiMemeDeleteTarget(
@@ -383,9 +389,7 @@ async def _execute_target_batch(operation_id: str, targets: list[AiMemeDeleteTar
         try:
             async with _meme_index_lock:
                 await _remove_many_from_qdrant(candidate_ids)
-                async with async_maker() as session:
-                    await session.execute(delete(AiMemeRecord).where(col(AiMemeRecord.meme_id).in_(candidate_ids)))
-                    await session.commit()
+                await AiMemeRecord.delete_by_meme_ids(candidate_ids)
             database_deleted_ids.update(candidate_ids)
         except Exception as exc:
             for meme_id in candidate_ids:

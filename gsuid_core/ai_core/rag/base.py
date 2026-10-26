@@ -16,11 +16,10 @@ import httpx
 from huggingface_hub import snapshot_download
 
 try:
-    from fastembed import SparseTextEmbedding
+    from fastembed import SparseTextEmbedding as _SparseTextEmbedding
 except ImportError:
-    SparseTextEmbedding = None  # type: ignore[assignment]
-    # onnxruntime 缺少当前平台 wheel（如 macOS x86_64），fastembed 无法加载
-from qdrant_client import AsyncQdrantClient
+    # darwin x86_64 等平台缺 onnxruntime wheel, BM25 稀疏嵌入整体跳过
+    _SparseTextEmbedding = None
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
@@ -540,6 +539,7 @@ def _is_models_cache_valid() -> bool:
 
 def _prefetch_local_embedding_model(model_name: str) -> None:
     """用 fastembed 拉当前模型的 ONNX，保证 local_files_only 启动能命中缓存。"""
+    # darwin x86_64 不装 fastembed; 调用方有 try/except 降级
     from fastembed import TextEmbedding
 
     TextEmbedding(
@@ -664,7 +664,7 @@ def _get_sparse_model():
     if not is_enable_ai():
         return
 
-    if SparseTextEmbedding is None:
+    if _SparseTextEmbedding is None:
         logger.warning(t("log.memory.fastembed_unavailable"))
         return None
 
@@ -673,9 +673,7 @@ def _get_sparse_model():
             # 双重检查锁定
             if _sparse_model is None:
                 try:
-                    from fastembed import SparseTextEmbedding
-
-                    _sparse_model = SparseTextEmbedding(
+                    _sparse_model = _SparseTextEmbedding(
                         model_name="Qdrant/bm25",
                         cache_dir=str(MODELS_CACHE),
                         threads=2,

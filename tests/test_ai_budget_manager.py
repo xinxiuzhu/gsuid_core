@@ -188,7 +188,9 @@ def test_update_rejects_final_all_zero_limits_and_normalizes_dimension_switch() 
         )
 
     assert result["status"] == 0
-    payload = update_data.await_args.kwargs["update_data"]
+    call = update_data.await_args
+    assert call is not None
+    payload = call.kwargs["update_data"]
     assert payload["scope_id"] == ""
     assert payload["member_id"] == ""
 

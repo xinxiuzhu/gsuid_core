@@ -14,7 +14,7 @@ from collections.abc import Iterator
 import httpx2
 import pytest
 from anthropic import Omit, APIStatusError
-from pydantic_ai.models import ModelRequestParameters
+from pydantic_ai.models import ModelRequestParameters, override_allow_model_requests
 from pydantic_ai.messages import (
     TextPart,
     ModelMessage,
@@ -351,7 +351,9 @@ def _posts(
             await model.client.close()
             await http.aclose()
 
-    asyncio.run(_run())
+    # 此客户端只使用 MockTransport，允许验证请求编码但不会访问模型服务。
+    with override_allow_model_requests(True):
+        asyncio.run(_run())
     return posted
 
 

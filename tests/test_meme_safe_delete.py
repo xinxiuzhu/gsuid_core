@@ -22,13 +22,11 @@ async def _database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'meme-delete.db'}")
     maker = async_sessionmaker(engine, expire_on_commit=False)
-    tables = [
-        AiMemeRecord.__table__,
-        AiMemeDeleteOperation.__table__,
-        AiMemeDeleteTarget.__table__,
-    ]
+    from gsuid_core.ai_core.meme.pack_model import AiMemePackItem  # noqa: F401  确保挂载表先注册
+
+    # __table__ 在类型层不可见, 建 metadata 里已注册的全部表(独立测试库, 无副作用)
     async with engine.begin() as connection:
-        await connection.run_sync(SQLModel.metadata.create_all, tables=tables)
+        await connection.run_sync(SQLModel.metadata.create_all)
     monkeypatch.setattr(base_models, "async_maker", maker)
     return engine, maker
 
@@ -162,11 +160,41 @@ def test_batch_delete_retries_file_after_sql_success(tmp_path: Path, monkeypatch
 
         monkeypatch.setattr(deletion, "enqueue_delete_operation", no_enqueue)
         try:
+            from gsuid_core.webconsole.meme_api import (
+                MemeDeleteFilter,
+                MemeDeleteSelection,
+                MemeDeletePreviewRequest,
+                preview_meme_delete,
+            )
+            from gsuid_core.ai_core.meme.pack_model import AiMemePackItem
+
             async with maker() as session:
-                session.add(_record("a" * 16, "common/a.png"))
+                session.add_all(
+                    [
+                        _record("a" * 16, "common/a.png"),
+                        _record("b" * 16, "common/b.png"),
+                        AiMemePackItem(pack_id="pack-a", meme_id="a" * 16),
+                        AiMemePackItem(pack_id="pack-b", meme_id="b" * 16),
+                    ]
+                )
                 await session.commit()
-            operation, _ = await deletion.create_delete_preview("owner@example.com")
-            operation = await deletion.confirm_delete_operation(operation.operation_id, "owner@example.com", "DELETE 1")
+            preview = await preview_meme_delete(
+                MemeDeletePreviewRequest(
+                    selection=MemeDeleteSelection(
+                        mode="filter",
+                        filter=MemeDeleteFilter(pack_id="pack-a", folder=None, persona_hint=None, status=None, q=None),
+                    ),
+                    folder=None,
+                    persona_hint=None,
+                    status=None,
+                    q=None,
+                ),
+                {"email": "owner@example.com"},
+            )
+            assert preview["status"] == 0
+            assert preview["data"]["matched_count"] == 1
+            operation_id = preview["data"]["preview_id"]
+            operation = await deletion.confirm_delete_operation(operation_id, "owner@example.com", "DELETE 1")
 
             original_unlink = Path.unlink
             failed_once = False
@@ -186,6 +214,9 @@ def test_batch_delete_retries_file_after_sql_success(tmp_path: Path, monkeypatch
             assert meme_file.exists()
             async with maker() as session:
                 assert await session.get(AiMemeRecord, "a" * 16) is None
+                assert await session.get(AiMemePackItem, ("pack-a", "a" * 16)) is None
+                assert await session.get(AiMemeRecord, "b" * 16) is not None
+                assert await session.get(AiMemePackItem, ("pack-b", "b" * 16)) is not None
 
             monkeypatch.setattr(Path, "unlink", original_unlink)
             await deletion.retry_delete_operation(operation.operation_id, "owner@example.com")
@@ -445,11 +476,13 @@ def test_safe_path_and_qdrant_match_any(tmp_path: Path, monkeypatch: pytest.Monk
     with pytest.raises(ValueError):
         deletion.safe_meme_path(tmp_path, str(tmp_path / "absolute.png"))
 
+    from gsuid_core.ai_core.rag.qmodels import Filter, MatchAny, FieldCondition
+
     class FakeClient:
         def __init__(self) -> None:
-            self.selector = None
+            self.selector: Filter | None = None
 
-        async def delete(self, *, collection_name, points_selector):
+        async def delete(self, *, collection_name: str, points_selector: Filter) -> None:
             assert collection_name == library.MEME_COLLECTION_NAME
             self.selector = points_selector
 
@@ -459,6 +492,12 @@ def test_safe_path_and_qdrant_match_any(tmp_path: Path, monkeypatch: pytest.Monk
         client = FakeClient()
         monkeypatch.setattr(base, "client", client)
         await library._remove_many_from_qdrant(["a" * 16, "b" * 16, "a" * 16])
-        assert client.selector.must[0].match.any == ["a" * 16, "b" * 16]
+        assert isinstance(client.selector, Filter)
+        must = client.selector.must
+        assert must is not None
+        condition = must[0]
+        assert isinstance(condition, FieldCondition)
+        assert isinstance(condition.match, MatchAny)
+        assert condition.match.any == ["a" * 16, "b" * 16]
 
     asyncio.run(run())

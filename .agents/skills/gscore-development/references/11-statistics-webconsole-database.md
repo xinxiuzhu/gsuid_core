@@ -54,6 +54,8 @@ active-users / trigger-distribution / intent-distribution / errors / heartbeat /
 Hub 静态资源由 `webconsole/static_serve.py::build_frontend_router` 挂在 `/app/`。
 `setup_frontend_b` 把 dist 放在 `FrontendDist` 上，每次请求再读路径：资源站 zip 覆盖
 `data/dist` 之后只改这个路径，不重挂路由。`index.html` 是 `no-cache`，刷新后拿到新 hash。
+本 fork 的 Hub 构建会写 `version.json` 的 `custom_build: true`：包内 dist 就绪时优先使用它，
+并跳过官方 zip 同步，避免预算与表情包管理等定制界面被覆盖。未标记构建仍按上游版本选择。
 
 - 带 hash 的 `assets/**`：`Cache-Control: public, max-age=31536000, immutable`
 - `index.html` / `version.json`：`no-cache`（禁止长期缓存 HTML，否则升级后会请求已删除的旧 hash）

@@ -158,6 +158,9 @@ class AiMemeRecord(SQLModel, table=True):
         record = result.scalar_one_or_none()
         if record is None:
             return False
+        from gsuid_core.ai_core.meme.pack_model import AiMemePackItem
+
+        await session.execute(delete(AiMemePackItem).where(col(AiMemePackItem.meme_id) == meme_id))
         await session.delete(record)
         return True
 
@@ -196,6 +199,9 @@ class AiMemeRecord(SQLModel, table=True):
         """按 meme_id 列表批量删除数据库记录，返回删除行数。"""
         if not meme_ids:
             return 0
+        from gsuid_core.ai_core.meme.pack_model import AiMemePackItem
+
+        await session.execute(delete(AiMemePackItem).where(col(AiMemePackItem.meme_id).in_(meme_ids)))
         result = await session.execute(delete(cls).where(col(cls.meme_id).in_(meme_ids)))
         return result.rowcount if isinstance(result, CursorResult) else 0
 

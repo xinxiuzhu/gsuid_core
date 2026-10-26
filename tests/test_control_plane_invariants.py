@@ -455,8 +455,9 @@ def test_slim_group_pool_carries_control_tools() -> None:
     assert "check_delegation" not in SLIM_GROUP_CORE_TOOLS
     assert "find_tools" in SLIM_GROUP_CORE_TOOLS
     assert "create_subagent" in SLIM_GROUP_CORE_TOOLS
-    assert "send_meme" not in SLIM_GROUP_CORE_TOOLS
-    assert "send_meme" not in MAIN_AGENT_CORE_TOOLS
+    # 本 fork 保留 send_meme 主动工具进核心（上游已改走 <meme:情绪> 回复协议）
+    assert "send_meme" in SLIM_GROUP_CORE_TOOLS
+    assert "send_meme" in MAIN_AGENT_CORE_TOOLS
     assert "capability_map" in SLIM_GROUP_CORE_TOOLS
     assert "web_search_tool" not in SLIM_GROUP_CORE_TOOLS
     assert "add_once_task" in SLIM_GROUP_CORE_TOOLS

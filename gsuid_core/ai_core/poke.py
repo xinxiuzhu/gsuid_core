@@ -118,12 +118,12 @@ async def _send_persona_meme(
     from gsuid_core.ai_core.buildin_tools.meme_tools import send_meme_record
 
     try:
+        # 新版 pick 只从该人格绑定的包里选, 「严格人格专属」语义天然成立
         record, _ = await pick(
             mood=mood,
             scene="戳一戳互动",
             persona=persona_name,
             session_id=ev.session_id,
-            fallback_common=False,
         )
         if record is None and mood:
             record, _ = await pick(
@@ -131,7 +131,6 @@ async def _send_persona_meme(
                 scene="",
                 persona=persona_name,
                 session_id=ev.session_id,
-                fallback_common=False,
             )
         if record is None:
             return False

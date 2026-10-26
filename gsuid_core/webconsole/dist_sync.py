@@ -8,7 +8,7 @@ import shutil
 import asyncio
 import zipfile
 import tempfile
-from typing import TypedDict
+from typing import TypedDict, NotRequired
 from pathlib import Path
 from urllib.parse import quote
 
@@ -27,6 +27,7 @@ _S_IFLNK = 0o120000
 
 class FrontendVersionFile(TypedDict):
     version: str
+    custom_build: NotRequired[bool]
 
 
 class LocalDists(TypedDict):
@@ -48,7 +49,10 @@ def _read_version_json(path: Path) -> FrontendVersionFile | None:
     version = loaded["version"]
     if not isinstance(version, str):
         return None
-    return {"version": version}
+    info: FrontendVersionFile = {"version": version}
+    if "custom_build" in loaded and loaded["custom_build"] is True:
+        info["custom_build"] = True
+    return info
 
 
 def parse_version(version_str: str) -> tuple[int, ...]:
@@ -124,6 +128,10 @@ def probe_local_dists(bundled: Path, extra: Path) -> LocalDists:
 
 def select_frontend_dist(bundled: Path, extra: Path, local: LocalDists) -> Path:
     """两份都在时取 version.json 较新的；相同用包内 dist。"""
+    if local["bundled_ready"]:
+        version = local["bundled_version"]
+        if version is not None and "custom_build" in version and version["custom_build"]:
+            return bundled
     if local["extra_ready"] and local["bundled_ready"]:
         if compare_versions(local["extra_version"], local["bundled_version"]) > 0:
             return extra
@@ -374,6 +382,10 @@ async def _sync_remote_webconsole(holder: FrontendDist) -> bool:
 
 async def sync_remote_webconsole(holder: FrontendDist) -> bool:
     """下载并覆盖 data/dist。返回是否换上了新目录。失败时保留已挂载的本地 dist。"""
+    local = await asyncio.to_thread(probe_local_dists, DIST_PATH, DIST_EX_PATH)
+    bundled = local["bundled_version"]
+    if local["bundled_ready"] and bundled is not None and "custom_build" in bundled and bundled["custom_build"]:
+        return False
     # 目录页和 zip 都是外部输入，解析失败不能拆掉已经挂上的 /app。
     try:
         return await _sync_remote_webconsole(holder)

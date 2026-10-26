@@ -60,14 +60,16 @@ dependencies = [
     # fastmcp.tools.base(ToolResult) 自 3.2.0 才有, 3.1 及以前叫 tools/tool.py
     "fastmcp>=3.2.0,<4",
     "markdownify>=1.2.2",
-    # darwin x86_64 无新版 onnxruntime wheel, fastembed 全系不可装;
-    # 代码按平台检测降级(见 rag/embedding/local.py), 服务器为 Debian x86_64
-    "fastembed>=0.9.0; sys_platform != 'darwin' or platform_machine == 'arm64'",
-    "onnxruntime>=1.24.1; sys_platform != 'darwin' or platform_machine == 'arm64'",
+    # Intel macOS 的 ORT 停在 1.23.x；Python 3.14 起走远程嵌入降级。
+    "fastembed>=0.9.0; sys_platform != 'darwin' or platform_machine != 'x86_64' or python_version < '3.14'",
+    "onnxruntime>=1.24.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "onnxruntime>=1.23.2,<1.24.0; sys_platform == 'darwin' and platform_machine == 'x86_64' and python_version < '3.14'",
     "socksio>=1.0.0",
     "pytakumi>=0.1.5",
     "bilibili-api>=4.1.0",
     "firecrawl-py>=4.40.0",
+    # rag/base.py 直接 import; 原为 fastembed 传递依赖, darwin x86_64 不装 fastembed 后需显式声明
+    "huggingface_hub>=0.34.0",
     # 0.1.x 的 Usage 带 output_reasoning_tokens, 需 pydantic-ai-slim>=2.54.0 才认, 否则归零
     "genai-prices>=0.1.9",
     "pydantic-monty>=1.0.0",

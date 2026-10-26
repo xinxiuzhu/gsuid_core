@@ -112,5 +112,6 @@ def test_kernel_family_close_skips_attach_article() -> None:
     assert "add_once_task" in names
     assert "attach_article" not in names
     assert "list_scheduled_tasks" not in names
-    assert "send_meme" not in MAIN_AGENT_CORE_TOOLS
-    assert "send_meme" not in names
+    # 本 fork 保留 send_meme 主动工具进核心（上游已改走 <meme:情绪> 回复协议）
+    assert "send_meme" in MAIN_AGENT_CORE_TOOLS
+    assert "send_meme" in names

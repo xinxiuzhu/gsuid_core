@@ -1,8 +1,12 @@
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from collections.abc import Awaitable
 
+import pytest
 from msgspec import json as msgjson
+from starlette.types import Message as ASGIMessage
+from starlette.websockets import WebSocket
 
 from gsuid_core.bot import Bot, _Bot
 from gsuid_core.models import Event, MessageSend
@@ -42,7 +46,8 @@ def test_poke_rejects_other_targets(monkeypatch) -> None:
     _reset_state()
     resolver = AsyncMock()
     monkeypatch.setattr(poke, "_generate_reaction", resolver)
-    _run(poke.handle_persona_poke(SimpleNamespace(), _event(target_id="someone-else")))
+    ev = _event(target_id="someone-else")
+    _run(poke.handle_persona_poke(Bot(_Bot("yunzai"), ev), ev))
     resolver.assert_not_awaited()
 
 
@@ -68,13 +73,19 @@ def test_poke_records_context_and_respects_session_cooldown(monkeypatch) -> None
     )
     monkeypatch.setattr(poke, "_send_persona_meme", AsyncMock(return_value=True))
 
-    bot = SimpleNamespace(send=AsyncMock(), poke=AsyncMock())
+    bot = Bot(_Bot("yunzai"), ev)
+    send = AsyncMock()
+    poke_back = AsyncMock()
+    monkeypatch.setattr(bot, "send", send)
+    monkeypatch.setattr(bot, "poke", poke_back)
     _run(poke.handle_persona_poke(bot, ev))
     _run(poke.handle_persona_poke(bot, ev))
 
-    bot.send.assert_awaited_once()
-    assert bot.send.await_args.kwargs["observe_memory"] is False
-    bot.poke.assert_awaited_once()
+    send.assert_awaited_once()
+    call = send.await_args
+    assert call is not None
+    assert call.kwargs["observe_memory"] is False
+    poke_back.assert_awaited_once()
     records = history.get_history(ev)
     assert [record.content for record in records] == [
         "<互动：戳了你一下>",
@@ -105,7 +116,8 @@ def test_full_ai_capacity_does_not_queue_or_send_fallback(monkeypatch) -> None:
     monkeypatch.setattr(poke, "_generate_reaction", generate)
     monkeypatch.setattr(poke, "_send_persona_meme", fallback)
 
-    _run(poke.handle_persona_poke(SimpleNamespace(), ev))
+    bot = Bot(_Bot("yunzai"), ev)
+    _run(poke.handle_persona_poke(bot, ev))
 
     generate.assert_not_awaited()
     fallback.assert_not_awaited()
@@ -128,62 +140,49 @@ def test_failed_ai_releases_slot_and_uses_persona_fallback(monkeypatch) -> None:
     fallback = AsyncMock(return_value=True)
     monkeypatch.setattr(poke, "_send_persona_meme", fallback)
 
-    _run(poke.handle_persona_poke(SimpleNamespace(), ev))
+    bot = Bot(_Bot("yunzai"), ev)
+    _run(poke.handle_persona_poke(bot, ev))
 
-    fallback.assert_awaited_once_with(SimpleNamespace(), ev, "Sayu")
+    fallback.assert_awaited_once_with(bot, ev, "Sayu")
     assert poke._active_ai_requests == 0
 
 
-def test_bot_poke_encodes_single_control_packet() -> None:
+@pytest.mark.parametrize("explicit", [False, True])
+def test_bot_poke_encodes_single_control_packet(explicit: bool, monkeypatch: pytest.MonkeyPatch) -> None:
     async def run() -> None:
         ev = _event()
-        raw_bot = _Bot("yunzai")
         packets: list[bytes] = []
 
-        async def capture(coro):
-            queued = await raw_bot._send_queue.get() if False else None
-            del queued
-            original = raw_bot.bot
-            raw_bot.bot = SimpleNamespace(send_bytes=AsyncMock(side_effect=lambda body: packets.append(body)))
-            try:
-                await coro
-            finally:
-                raw_bot.bot = original
+        async def receive() -> ASGIMessage:
+            return {"type": "websocket.connect"}
 
-        raw_bot._enqueue_send = capture  # type: ignore[method-assign]
-        await Bot(raw_bot, ev).poke()
+        async def send(message: ASGIMessage) -> None:
+            if message["type"] == "websocket.send":
+                body = message["bytes"]
+                assert isinstance(body, bytes)
+                packets.append(body)
+
+        ws = WebSocket({"type": "websocket"}, receive, send)
+        await ws.accept()
+        raw_bot = _Bot("yunzai", ws)
+
+        async def capture(coro: Awaitable[None]) -> None:
+            await coro
+
+        monkeypatch.setattr(raw_bot, "_enqueue_send", capture)
+        bot = Bot(raw_bot, ev)
+        if explicit:
+            assert await bot.poke_user("chosen-user")
+        else:
+            assert await bot.poke()
 
         assert len(packets) == 1
         packet = msgjson.decode(packets[0], type=MessageSend)
         assert packet.target_type == "group"
         assert packet.target_id == "g1"
-        assert packet.content and len(packet.content) == 1
+        assert packet.content is not None and len(packet.content) == 1
         assert packet.content[0].type == "excute_poke_user"
-        assert packet.content[0].data == {"user_id": "u1", "group_id": "g1"}
-
-    _run(run())
-
-
-def test_bot_poke_user_encodes_explicit_group_target() -> None:
-    async def run() -> None:
-        ev = _event(user_id="speaker")
-        raw_bot = _Bot("yunzai")
-        packets: list[bytes] = []
-
-        async def capture(coro):
-            original = raw_bot.bot
-            raw_bot.bot = SimpleNamespace(send_bytes=AsyncMock(side_effect=lambda body: packets.append(body)))
-            try:
-                await coro
-            finally:
-                raw_bot.bot = original
-
-        raw_bot._enqueue_send = capture  # type: ignore[method-assign]
-        assert await Bot(raw_bot, ev).poke_user("chosen-user") is True
-
-        packet = msgjson.decode(packets[0], type=MessageSend)
-        assert packet.target_type == "group"
-        assert packet.target_id == "g1"
-        assert packet.content[0].data == {"user_id": "chosen-user", "group_id": "g1"}
+        expected_user = "chosen-user" if explicit else "u1"
+        assert packet.content[0].data == {"user_id": expected_user, "group_id": "g1"}
 
     _run(run())
