@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
 
 from gsuid_core import server
 
@@ -53,7 +54,8 @@ def _uv_argv(index: str | None, packages: list[str], upgrade: bool) -> list[str]
     if index is not None:
         argv.extend(["--default-index", index])
     if upgrade:
-        argv.append("--upgrade")
+        for package in packages:
+            argv.extend(["--upgrade-package", Requirement(package).name])
     argv.extend(packages)
     return argv
 
@@ -63,7 +65,7 @@ def _pip_argv(index: str | None, packages: list[str], upgrade: bool) -> list[str
     if index is not None:
         argv.extend(["--index-url", index])
     if upgrade:
-        argv.append("--upgrade")
+        argv.extend(["--upgrade", "--upgrade-strategy", "only-if-needed"])
     argv.extend(packages)
     return argv
 
@@ -94,6 +96,23 @@ def test_pip_install_when_uv_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     joined = " ".join(calls[0])
     for host in _OLD_HOSTS:
         assert host not in joined
+
+
+@pytest.mark.parametrize("uv", [_UV, None])
+def test_plugin_upgrade_preserves_satisfied_transitive_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+    uv: str | None,
+) -> None:
+    packages = ["sklandcore>=0.0.2", "dna-builder-sdk[extra]>=0.2.0"]
+    calls = _run(monkeypatch, uv=uv, index=None, packages=packages, upgrade=True)
+    command = calls[0]
+    if uv is not None:
+        assert "--upgrade" not in command
+        targets = [command[i + 1] for i, arg in enumerate(command) if arg == "--upgrade-package"]
+        assert targets == ["sklandcore", "dna-builder-sdk"]
+        assert "anyio" not in targets
+    else:
+        assert command[command.index("--upgrade-strategy") + 1] == "only-if-needed"
 
 
 def test_uv_failure_does_not_change_index(monkeypatch: pytest.MonkeyPatch) -> None:

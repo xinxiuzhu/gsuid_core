@@ -937,7 +937,12 @@ def build_dep_install_cmd(packages: list[str], upgrade: bool, index_url: str | N
             cmd.extend(["--index-url", index_url])
         uses_pip = True
     if upgrade:
-        cmd.append("--upgrade")
+        if uses_pip:
+            cmd.extend(["--upgrade", "--upgrade-strategy", "only-if-needed"])
+        else:
+            # 只升级插件指定的包，避免替换核心已加载且仍满足约束的间接依赖。
+            for package in packages:
+                cmd.extend(["--upgrade-package", Requirement(package).name])
     cmd.extend(packages)
     return cmd, uses_pip
 

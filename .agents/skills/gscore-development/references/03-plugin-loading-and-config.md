@@ -84,6 +84,10 @@ PATH 上有 `uv` 时执行 `uv pip install --python <当前解释器> --default-
 `python -m pip install --index-url <索引>`。未设置或空白时不传索引参数，由 uv / pip 读自己的配置
 （`uv.toml`、`UV_INDEX_URL`、`pip.conf` 等），都没有配置时就是官方 PyPI。失败不换源。
 
+插件要求自动升级时，uv 用 `--upgrade-package <包名>` 逐项指定目标；pip 用
+`--upgrade --upgrade-strategy only-if-needed`。已满足约束的间接依赖保留当前版本，
+避免在启动进程中替换核心已经加载的模块，造成 anyio 等包的新旧版本混用。
+
 ```python
 ignore_dep = {"python", "fastapi", "pydantic", "gsuid-core", "toml", "packaging"}
 ```
