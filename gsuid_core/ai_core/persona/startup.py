@@ -20,6 +20,11 @@ async def init_default_personas():
     之前完成 (那一步会用严格 ``Dict[str, GSC]`` schema 加载所有 persona
     ``config.json``, 旁路字段会触发死循环)。
     """
+    from gsuid_core.ai_core.prompt_group.store import sync_default_group
+
+    if sync_default_group():
+        logger.info(t("log.persona.default_prompt_group_synced"))
+
     if not ai_config.get_config("enable").data:
         logger.info(t("log.persona.init_skip_ai_master_switch_off"))
         return
@@ -33,6 +38,9 @@ async def init_default_personas():
             logger.info(t("log.persona.default_card_synced_from_code"))
     else:
         await persona.save_content(sayu_persona_prompt)
+        from gsuid_core.ai_core.meme.pack_model import mount_default_pack
+
+        await mount_default_pack(persona.name)
 
     # 一次性迁移：扫描所有 persona 目录, 把残留的 voice_anchor 字段搬出 config.json。
     # 幂等: 已迁移过的 persona 不会重复处理 (新位置不存在 / 字段已不在 JSON 中)。

@@ -11,7 +11,7 @@
 
 import uuid
 import asyncio
-from typing import List, Self, Optional, TypedDict, NotRequired
+from typing import List, Self, TypeVar, Optional, TypedDict, NotRequired
 from datetime import datetime, timezone, timedelta
 
 from sqlmodel import Field, SQLModel, Relationship, col, select, update
@@ -27,6 +27,7 @@ from sqlalchemy import (
     and_,
     desc,
     func,
+    not_,
     union as sql_union,
     exists,
     insert,
@@ -102,9 +103,69 @@ def _ids_matching_tokens(
     return select(unioned.c.eid)
 
 
-# ─────────────────────────────────────────────
-# 多对多关联表
-# ─────────────────────────────────────────────
+_TScopeModel = TypeVar("_TScopeModel", bound=SQLModel)
+
+
+def _exclude_assistant_turns(content: ColumnElement[str]) -> ColumnElement[bool]:
+    """与 _assistant_turn 同一前缀。抽样前剔除，避免助手行占掉名额。"""
+    trimmed = func.ltrim(content)
+    return and_(
+        not_(func.lower(trimmed).startswith("assistant:")),
+        not_(trimmed.startswith("[我此前说过]")),
+    )
+
+
+async def _scope_rows_uniform(
+    session: AsyncSession,
+    model: type[_TScopeModel],
+    key: str,
+    scope_key: str,
+    limit: int,
+    ties: tuple[str, ...] = (),
+    extra: ColumnElement[bool] | None = None,
+) -> list[_TScopeModel]:
+    """同一 scope 跨全程取至多 ``limit`` 行，按 valid_at 升序返回。
+
+    总量超限时**等距抽样**而不是取前 N 条。取前 N 会让长对话的后半程完全进不来，
+    而依赖「末尾若干行不裁」的尾部保护只能在已载入的前缀里抽，前缀一截断就等于失效。
+
+    抽样判据是「缩放值相对上一行递增」，不是按固定步长取模。步长只能取整数，总量刚过
+    上限时 ceil(total/limit)=2 会让密度直接腰斩（20001/20000 只剩约 1 万行）。
+    取 v(rn)=trunc((rn-1)*(limit-1)/(total-1))：分母用 total-1 而非 total，末行才必然
+    落在一次递增上（用 total 时，total 是 limit 整数倍会漏掉末行）。每步只可能 +0/+1，
+    递增次数**恰好 limit-1**，再显式并上 rn=1，故样本数**恰好 limit**、首末行都在。
+
+    ``key`` 是该表的行身份列（主键），各表不同：episode 用 ``id``、gist 用 ``episode_id``。
+    ``ties`` 是 valid_at 并列时的定序列：不给的话 row_number 在同刻行之间不确定，
+    同一份数据两次抽样会选到不同行，A/B 就没有可比性。
+    """
+    t = _model_table(model)
+    c = t.c
+    id_col = _as_str_col(c[key])
+    scope_col = _as_str_col(c.scope_key)
+    at_col = _as_dt_col(c.valid_at)
+    tie_cols = [_as_dt_col(c[name]) if name == "valid_at" else c[name] for name in ties]
+    order = [at_col.asc(), *[col.asc() for col in tie_cols]]
+
+    scope_eq = scope_col == scope_key
+    filt = scope_eq if extra is None else and_(scope_eq, extra)
+    total = int(await session.scalar(select(func.count()).select_from(t).where(filt)) or 0)
+    if total <= limit:
+        stmt = select(model).where(_as_bool_expr(filt)).order_by(*order)
+        return list((await session.execute(stmt)).scalars().all())
+
+    inner = select(id_col.label("rid"), func.row_number().over(order_by=order).label("rn")).where(filt).subquery()
+    # 身份列显式起别名 rid：各表列名不同（id / episode_id），不能靠 inner.c.<原名> 取。
+    # 除法是各后端都有的向零截断整除；rn=1 时 (rn-2) 为负、截断成 0，故首行要显式并上。
+    step = max(0, limit - 1)
+    cur_scaled = (inner.c.rn - 1) * step // (total - 1)
+    prev_scaled = (inner.c.rn - 2) * step // (total - 1)
+    keep = select(inner.c.rid).where(or_(inner.c.rn == 1, cur_scaled > prev_scaled))
+    stmt = select(model).where(_as_bool_expr(id_col.in_(keep))).order_by(*order)
+    return list((await session.execute(stmt)).scalars().all())
+
+
+# --- 多对多关联表 ---
 mem_episode_entity_mentions = Table(
     "mem_episode_entity_mentions",
     SQLModel.metadata,
@@ -122,9 +183,7 @@ mem_category_entity_members = Table(
 )
 
 
-# ─────────────────────────────────────────────
-# Episode：原始对话片段（Base Graph 第一层）
-# ─────────────────────────────────────────────
+# --- Episode：原始对话片段（Base Graph 第一层） ---
 class AIMemEpisode(SQLModel, table=True):
     """存储经聚合的对话片段，是所有记忆的原始素材。"""
 
@@ -142,10 +201,7 @@ class AIMemEpisode(SQLModel, table=True):
     valid_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     qdrant_id: str = Field(index=True, max_length=36)
-    # §3.2① 冷热分集合标记：is_archived=True 表示已降级为"冷"——其向量已迁出热集合
-    # memory_episodes（迁入冷集合 memory_episodes_cold），SQL 文本保留可审计。System-1
-    # 只查热集合，故冷 Episode 退出在线向量暴力扫描、不再抬高交互检索成本（缓解 P0-1/P0-2）。
-    # 旧库无此列，由 utils/database/startup.py 的 ALTER 语句补齐（默认 False）。
+    # 冷热分集合标记：is_archived=True 表示向量已迁入冷集合，降低在线检索开销。
     is_archived: bool = Field(default=False)
     # 时间 gap 切出的 session；旧库由 ALTER + backfill_sessions 补齐。
     session_id: Optional[str] = Field(default=None, max_length=36, index=True)
@@ -585,13 +641,64 @@ class AIMemEpisode(SQLModel, table=True):
         session: AsyncSession,
         scope_key: str,
         limit: int = 2000,
+        sample: bool = False,
+        user_only: bool = False,
     ) -> list["AIMemEpisode"]:
-        """同一 scope 按时间取出全部 Episode（评测还原 haystack 会话）。"""
+        """按时间取 Episode。sample 才等距抽，默认连续前缀。
+
+        user_only 在抽样前去掉助手行，避免助手占掉回填名额。
+        """
         if not scope_key or limit <= 0:
             return []
-        stmt = select(cls).where(col(cls.scope_key) == scope_key).order_by(col(cls.valid_at).asc()).limit(limit)
-        result = await session.execute(stmt)
-        return list(result.scalars().all())
+        extra = _exclude_assistant_turns(_as_str_col(_model_table(cls).c.content)) if user_only else None
+        if sample:
+            return await _scope_rows_uniform(
+                session,
+                cls,
+                "id",
+                scope_key,
+                limit,
+                ties=("turn_index", "id"),
+                extra=extra,
+            )
+        stmt = (
+            select(cls)
+            .where(col(cls.scope_key) == scope_key)
+            .order_by(col(cls.valid_at).asc(), col(cls.turn_index).asc(), col(cls.id).asc())
+            .limit(limit)
+        )
+        if extra is not None:
+            stmt = stmt.where(extra)
+        return list((await session.execute(stmt)).scalars().all())
+
+    @classmethod
+    @with_read_session
+    async def list_without_gist(
+        cls,
+        session: AsyncSession,
+        scope_key: str,
+        limit: int,
+    ) -> list["AIMemEpisode"]:
+        """还没有 gist 的用户 turn，按时间取前 limit 条。
+
+        浅睡预算很小。等距抽样只取决于行号和 limit，每轮都会重写同一批。
+        """
+        if not scope_key or limit <= 0:
+            return []
+        user_turn = _exclude_assistant_turns(_as_str_col(_model_table(cls).c.content))
+        has_gist = exists().where(col(AIMemTurnGist.episode_id) == col(cls.id))
+        stmt = (
+            select(cls)
+            .where(
+                col(cls.scope_key) == scope_key,
+                col(cls.valid_at).is_not(None),
+                user_turn,
+                ~has_gist,
+            )
+            .order_by(col(cls.valid_at).asc(), col(cls.turn_index).asc(), col(cls.id).asc())
+            .limit(limit)
+        )
+        return list((await session.execute(stmt)).scalars().all())
 
     @classmethod
     @with_read_session
@@ -905,9 +1012,7 @@ class AIMemEpisode(SQLModel, table=True):
         logger.info(t("log.memory.session_backfill", scope_key=scope_key, n=written, sessions=len(fresh)))
         return written
 
-    # ── §3.2① Episode 保留策略 / 冷热分集合 ──────────
-    # Episode 是"每条放行消息都写"的无界增长主力（P0-2）。以下方法为生命周期 Worker
-    # 提供"降级（热→冷）"与"每 scope 物理上限"两级裁剪支持，纯规则、零 LLM。
+    # Episode 保留策略与冷热分集合：提供降级（热→冷）及单 scope 物理上限裁剪。
 
     @classmethod
     @with_session
@@ -1264,17 +1369,39 @@ class AIMemTurnGist(SQLModel, table=True):
         session: AsyncSession,
         scope_key: str,
         limit: int = 4000,
+        sample: bool = False,
     ) -> list["AIMemTurnGist"]:
+        """同一 scope 的 turn gist。sample 才等距抽，默认连续前缀。"""
         if not scope_key or limit <= 0:
             return []
+        if sample:
+            # ties 含 turn_index：valid_at 并列时 row_number 才稳定。
+            # 不给 ties，同刻行两次抽样会选到不同行。
+            return await _scope_rows_uniform(
+                session, cls, "episode_id", scope_key, limit, ties=("turn_index", "episode_id")
+            )
         stmt = (
             select(cls)
             .where(col(cls.scope_key) == scope_key)
-            .order_by(col(cls.valid_at).asc(), col(cls.turn_index).asc())
+            .order_by(col(cls.valid_at).asc(), col(cls.turn_index).asc(), col(cls.episode_id).asc())
             .limit(limit)
         )
-        result = await session.execute(stmt)
-        return list(result.scalars().all())
+        return list((await session.execute(stmt)).scalars().all())
+
+    @classmethod
+    @with_read_session
+    async def list_by_episode_ids(cls, session: AsyncSession, episode_ids: list[str]) -> list["AIMemTurnGist"]:
+        """按抽中的 episode 取 gist。IN 分块，避免一次塞过 SQLite 变量上限。"""
+        if not episode_ids:
+            return []
+        out: list[AIMemTurnGist] = []
+        # SQLite 单条语句变量上限约 3 万，IN 按 500 分块。
+        step = 500
+        for start in range(0, len(episode_ids), step):
+            chunk = episode_ids[start : start + step]
+            stmt = select(cls).where(col(cls.episode_id).in_(chunk))
+            out.extend((await session.execute(stmt)).scalars().all())
+        return out
 
     @classmethod
     @with_read_session
@@ -1376,9 +1503,7 @@ class AIMemThread(SQLModel, table=True):
         )
 
 
-# ─────────────────────────────────────────────
-# Entity：提取出的实体节点（Base Graph 第二层）
-# ─────────────────────────────────────────────
+# --- Entity：提取出的实体节点（Base Graph 第二层） ---
 class AIMemEntity(SQLModel, table=True):
     """从 Episode 中提取的实体，是知识图谱的核心节点。"""
 
@@ -1692,9 +1817,7 @@ class AIMemEntity(SQLModel, table=True):
 
         return name_to_id, vector_payloads, new_entity_count
 
-    # ── 孤儿实体回收（C11 扩展：实体级 GC）──────────
-    # Edge 会被生命周期 Worker 衰减→遗忘物理删除，但其连接的 Entity 没人回收，
-    # 久而久之孤儿实体只增不减，膨胀分层图分类成本。以下两个方法为后台 GC 提供支持。
+    # 孤儿实体回收：清理因 Edge 衰减删除而残留的未关联实体。
 
     @classmethod
     @with_session
@@ -1862,9 +1985,7 @@ class AIMemEntity(SQLModel, table=True):
         return list((await session.execute(stmt)).scalars().all())
 
 
-# ─────────────────────────────────────────────
-# Edge：实体间的关系（Base Graph 第三层）
-# ─────────────────────────────────────────────
+# --- Edge：实体间的关系（Base Graph 第三层） ---
 class EventWriteRow(TypedDict):
     summary: str
     start_at: datetime | None
@@ -1995,9 +2116,7 @@ class AIMemEdge(SQLModel, table=True):
     # C1 跨发言者归并：同一 fact 被不同 source 重复陈述时，命中既有 Edge 只累加此计数，
     # 不再写入 N 条重复 Edge。旧库无此列，由 startup.py 的 ALTER 语句补齐（默认 1）。
     mention_count: int = Field(default=1)
-    # C11 记忆生命周期：时效衰减分。检索排序按 reranker_score × decay_score 加权；
-    # 长期未被检索的 Edge 由衰减 Worker 周期性下调，decay_score < 阈值则被遗忘。
-    # 旧库无此列，由 startup.py 的 ALTER 语句补齐（默认 1.0）。
+    # 时效衰减分：检索时按 decay_score 加权，衰减 Worker 周期下调长期未访问项。
     decay_score: float = Field(default=1.0)
     # C11：最近一次被检索命中的时间，衰减判定的依据。旧库由 ALTER 补齐（默认 NULL）。
     last_accessed: Optional[datetime] = Field(default=None)
@@ -2254,9 +2373,7 @@ class AIMemEdge(SQLModel, table=True):
         return victims
 
 
-# ─────────────────────────────────────────────
-# C11：记忆矛盾记录（Contradiction Engine）
-# ─────────────────────────────────────────────
+# --- C11：记忆矛盾记录（Contradiction Engine） ---
 class AIMemConflict(SQLModel, table=True):
     """记录一对语义冲突的 Edge（同实体/关系但事实相反）。
 
@@ -2348,9 +2465,7 @@ class AIMemConflict(SQLModel, table=True):
         return [row[0] for row in result.all() if row[0]]
 
 
-# ─────────────────────────────────────────────
-# Category ↔ Category 层次关联（链接模型）
-# ─────────────────────────────────────────────
+# --- Category ↔ Category 层次关联（链接模型） ---
 class AIMemCategoryEdge(SQLModel, table=True):
     """记录父 Category → 子 Category 的归属关系，支持多对多。"""
 
@@ -2358,9 +2473,7 @@ class AIMemCategoryEdge(SQLModel, table=True):
     child_category_id: str = Field(foreign_key="aimemcategory.id", primary_key=True, max_length=36)
 
 
-# ─────────────────────────────────────────────
-# Category：分层语义图节点（Hierarchical Graph）
-# ─────────────────────────────────────────────
+# --- Category：分层语义图节点（Hierarchical Graph） ---
 class AIMemCategory(SQLModel, table=True):
     """分层语义图的类目节点。Layer=1 最具体，Layer 越大越抽象。"""
 
@@ -2432,13 +2545,7 @@ class AIMemCategory(SQLModel, table=True):
         return list(result.scalars().all())
 
 
-# ─────────────────────────────────────────────
-# 程序性 / 偏好记忆（Procedural / Preference Memory）
-# 设计：plans/procedural_preference_memory_design_20260614.md §3
-# 与 Episode/Entity/Edge 三层陈述性记忆正交：本表承载"针对 Agent 未来行为的
-# 程序性指令/纠错规程/偏好规则"（如"调 generate_image 用竖图""按用户时区"），
-# SQL-only 结构化真值、不写向量（精确召回比向量更快更准，避免向量模糊性与对账负担）。
-# ─────────────────────────────────────────────
+# 程序性/偏好记忆：承载未来行为规程与偏好规则，结构化存储于 SQL，不写向量。
 class AIMemPreference(SQLModel, table=True):
     """程序性/偏好记忆规则。一条规则 = "在某 target_context 下，该/不该如何做"。
 

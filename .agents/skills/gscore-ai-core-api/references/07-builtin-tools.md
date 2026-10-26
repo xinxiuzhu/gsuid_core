@@ -274,10 +274,22 @@ async def web_fetch_tool(
 ) -> str
 ```
 
-> 默认 **Jina Reader**（`r.jina.ai`，Key 可选）+ 备用 **local** 本机直连；
+> 默认 **Jina Reader**（`r.jina.ai`，Key 可选）。可选 DeepSeek、Exa Contents、**local** 本机直连；
 > 字段 `webfetch_provider` / `webfetch_lb_strategy` / `webfetch_fallback_order` 与搜索同构。
 > 空正文或抛错会触发换源；外层 `timeout=100`。详见 [§11.3b](./11-mcp-image-search-and-meme.md)。
 > 成功返回同样前缀 `[source=web|staleness_risk=high]\n…`（时效契约同源）。
+
+### `run_code` — 沙箱 Python 汇总只读结果
+
+```python
+@ai_tools(category="buildin", timeout=None, code_callable=False)
+async def run_code(ctx: RunContext[ToolContext], code: str) -> str
+```
+
+模型写一段 Python，汇总本轮已暴露且 `code_callable=True` 的查询/读取工具。
+`code_callable` 默认 True，插件只读工具不必声明。发消息、写入、委派必须显式
+`code_callable=False`。代码里尽量只查；发消息和写入在代码外直调。
+交回最后一行表达式。`print` 不是返回值。墙钟 230 秒。
 
 ### `get_self_info` — 获取完整自我认知
 
@@ -346,7 +358,7 @@ async def search_image(
     ctx: RunContext[ToolContext],
     query: str,                      # 自然语言查询
     limit: int = 10,                 # 最大返回数量
-    score_threshold: float = 0.45,   # 相似度阈值（0~1）
+    score_threshold: float = 0.45,   # 相似度阈值（0 到 1）
 ) -> str
 ```
 
@@ -379,16 +391,10 @@ async def set_user_favorability(
 > **仅主人可用**（2026-07-08）：绝对值设定是管理动作，`check_func` 校验发起者为 master，
 > 普通用户调用返回拒绝文案。
 
-### `send_meme` — 发送表情包
+### 发表情 — 回复里的 `<meme:情绪>`
 
-```python
-@ai_tools(category="common")
-async def send_meme(
-    ctx: RunContext[ToolContext],
-    mood: Optional[str] = None,    # 情绪标签
-    scene: Optional[str] = None,   # 场景标签
-) -> str
-```
+主人格没有 `send_meme` 工具。要发表情，在回复里单独写一行 `<meme:情绪>` 或 `<meme:情绪 场景>`。
+呈现层解析标记、选图并发送。历史写成 `[表情:情绪]`。
 
 ### `collect_meme` — 收藏表情包
 
@@ -475,12 +481,47 @@ async def render_html_to_image(
     ctx: RunContext[ToolContext],
     html_content: str,
     image_format: Literal["png", "jpeg"] = "png",
-    max_width: int = 800,
+    max_width: int = 840,
 ) -> str | bytes
 ```
 
 - 默认自由 HTML；原生 `<table>` → `table_rewrite` flex 网格；自动嵌 `https`/`icon:`/`img_`/`res_`。
+- 默认逻辑宽 840，2 倍像素比出图；嵌入的位图最长边保留 1280px。全宽大图最多 3 处，整图高宽比不超过 3.8。`render_embed_images` 默认开启，关闭后不再搜图。
+- HTML 用到 `gs-` 类时，渲染前自动注入移动端组件库（`buildin_tools/render_kit.py`）：
+  外层 `<div class="gs-page layout-xxx theme-xxx">`，主题有 paper / ocean / forest / sunset / sakura /
+  violet / slate / ink。agent 自写的 `<style>` 排在组件库之后，可以覆盖。
+- 版式（`RENDER_LAYOUTS`）按内容形态选：`feature` 图文专题、`gallery` 图鉴、`magazine` 专题解读、
+  `dashboard` 数据看板、`ranking` 排行、`compare` 对比、`timeline` 时间线、`brief` 简报。
+  页头组件有 `gs-hero`（照片，`short` / `tall` / `plain`）、`gs-band`（色带）、`gs-split`（左文右图）、
+  `gs-stat-hero`（大数字）；主体另有 `gs-rank`、`gs-compare-*`、`gs-quote`、`gs-steps`、`gs-grid cols-3`。
+- 照片闸门：嵌图开启时，只有 `PHOTO_LAYOUTS`（feature / gallery / magazine）或没声明版式的 HTML
+  必须先 `find_images` 并写进 `img_`，否则拒绝渲染。其余版式照片可选。
+- 涨跌色：组件库 `--gs-up` 红、`--gs-down` 绿（`theme-ink` 用亮一档的同色相），`render_chart_spec(signed=True)` 用同一套值。
+- 图标可带颜色：`icon:mdi/map-marker?color=1d6fb8`（Iconify 出图时着色）。
 - 约束见工具 docstring、[`TAKUMI_HTML_GUIDE.md`](../../../../docs/TAKUMI_HTML_GUIDE.md)。
+
+### `find_images` — 按搜索词找配图
+
+```python
+@ai_tools(category="media", capability_domain="资料出图", code_callable=False)
+async def find_images(
+    ctx: RunContext[ToolContext],
+    queries: list[str],    # 最多 10 个，每个对象一个词，「范围词 对象名」
+    per_query: int = 2,    # 最多 4
+) -> str
+```
+
+- 只在 `render_agent` 白名单里；其他能力代理的工具回填会剔除它。
+- 来源按 `ai_config.render_image_sources` 的顺序尝试，前一个凑够张数就停：
+  - `插件图库`：插件用 `ai_image` 登记的图。向量召回后还要求查询里第一个词之后的词
+    都出现在图片描述、标签、插件名或文件名里，避免召回同插件的其他对象。
+  - `Firecrawl`：官方 `sources: images`。没填 Key 时用 v2 同步客户端走免费档，排在 Tavily 前面
+    （`Firecrawl()` / `AsyncFirecrawl()` 在 4.49.3 会先建 v1，没 Key 直接抛错）。
+  - `360`：360 图片搜索的公开接口，不需要 Key，和 Firecrawl 同属免费源。
+  - `Tavily`：配了 Tavily Key 时用 `include_images`，排在免费源后面。
+- 每张图都会下载、解码、校验尺寸（短边 ≥240、长边 ≥400、宽高比 0.4～2.8），
+  按原始字节去重，缩到最长边 1280 后登记成 `img_` 句柄（30 分钟有效）。
+- 返回每个词对应的句柄、横 / 竖 / 方、尺寸和图注；没找到时提示换词或改用图标。
 
 ### `render_chart_spec` — 声明式图表 → 内联 SVG（2026-08，2026-08-16 编码补强）
 
@@ -508,7 +549,7 @@ async def render_chart_spec(
 编码硬规则（防信息误解）：
 
 - 多实体 × 多指标：**必须** `series`（每实体一个 `name`）+ 图例。禁止把身份拍扁进单柱 label。
-- `signed` 只表达正负；系列身份不用升/降色。有负值走零轴。
+- `signed` 只表达正负（正红负绿，与组件库 `--gs-up` / `--gs-down` 同值）；系列身份不用升/降色。有负值走零轴。
 - 缺测点断线，禁止补 0。一个字段一个值，禁止把分歧来源画成未标注的两根柱。
 - 类目标签保留约 18 字。身份色避开升/降红绿。
 
@@ -680,7 +721,7 @@ Persona 与能力代理**同构为一个 `AgentNode` 定义**（`gsuid_core.ai_c
 `capability_evaluator` 仅服务评估，插件勿覆盖。业务节点（如 `stock_agent` /
 `stock_report_agent`）由插件注册。
 
-**`render_agent`**：`tool_packs=[]` + 渲染白名单（含 **`render_chart_spec`**）；
+**`render_agent`**：`tool_packs=[]` + 渲染白名单（含 **`render_chart_spec`** / **`find_images`**）；
 runner **禁止** task 向量回填（防 web）。主人格多项数据出图委派它，勿自写 HTML。
 
 ### 7.8.1 插件创建并注册业务节点
@@ -701,7 +742,7 @@ FINANCE_PROMPT = """你是一个严谨的「量化操盘代理」。你没有任
 只对任务结果负责，不做角色扮演、不加语气词。
 
 【工作流】
-1. 规划：先输出 <TODO_LIST>，把任务拆成 2~5 步。
+1. 规划：先输出 <TODO_LIST>，把任务拆成 2 到 5 步。
 2. 执行：优先调用当前工具列表中的金融专业工具：
    - 行情查询：send_stock_info / send_my_stock / search_stock
    - 估值：send_stock_PB_info（PB/PE/PS）

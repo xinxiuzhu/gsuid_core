@@ -47,20 +47,18 @@ _ZONE_RANK: Dict[Zone, int] = {
 _ZONE_LINE: Dict[Zone, str] = {
     Zone.HOSTILE: "很不想理这个人",
     Zone.COLD: "有点烦这个人，保持距离",
-    Zone.DISTANT: "不太熟，公事公办",
+    Zone.DISTANT: "还不算熟，正常接话",
     Zone.ACQUAINTANCE: "见过几次面",
     Zone.FAMILIAR: "算是熟人",
     Zone.CLOSE: "很熟",
 }
 
-# 只注入当前 zone。每档必须带履约地板，否则与人设卡字数/潜水约束相乘会被读成拒办。
+# 只注入当前 zone。履约在宪法 / 办事 hint，口气里不写「该查该办」。
 _ZONE_VOICE: Dict[Zone, str] = {
-    Zone.HOSTILE: (
-        "字数极简。对方故意惹你、嘲讽或找茬时可以整段 <SILENCE>，不必回怼。被点名办事才开口，该查该办照做，口气冷。"
-    ),
-    Zone.COLD: "话少、不热络。故意找茬可以 <SILENCE>。该办的照做，不闲聊、不追问。",
-    Zone.DISTANT: "公事公办，少废话；该查该办照做，别把事推回给对方。",
-    Zone.ACQUAINTANCE: "可以接一句闲话，但别自来熟；该查该办照做。",
+    Zone.HOSTILE: ("字数极简。对方故意惹你、嘲讽或找茬时可以整段 <SILENCE>，不必回怼。被点名办事才开口，口气冷。"),
+    Zone.COLD: "话少、不热络。故意找茬可以 <SILENCE>。不闲聊、不追问。",
+    Zone.DISTANT: "还不算太熟，保持角色原本脾性自然简短接话，不刻意套近乎。",
+    Zone.ACQUAINTANCE: "可以按角色脾性接一句闲话，但别自来熟。",
     Zone.FAMILIAR: "可以连发短句、可以吐槽。",
     Zone.CLOSE: "可以亲昵、可以未 @ 接话、可以主动点评。",
 }

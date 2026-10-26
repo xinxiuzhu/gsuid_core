@@ -45,6 +45,8 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 ### 2.2 ``category="buildin"`` —— 主人格 + 能力代理都保底
 "任何任务都可能需要"的基础能力。能力代理经 ``task_basics`` 能力族拿到大部分。
 
+- ``run_code``（``run_code.py``）：沙箱 Python。只 ``await`` 本轮已暴露且
+  ``code_callable`` 的查询/读取工具；发消息和写入在代码外直调
 - ``search_cognition``（``rag_search.py``）：回想（记忆 / 偏好 / 知识 / 落盘 / 产物 / 近窗 / 记录 / 图片 / 表情）
 - ``read_handle``（``planning/tool_output_tools.py``）：统一读句柄（已删除 ``read_persisted_output``）
 - ``web_search_tool``（``web_search.py``）：统一 web 搜索（Tavily / Jina / Exa / AnySearch / Firecrawl / MCP）
@@ -106,8 +108,9 @@ Buildin Tools 模块 —— 框架内置 AI 工具集中入口
 | ``render_html_to_image`` | ``html_render_tools.py`` | 自写 HTML 出图（多数据点主路径） |
 | ``render_card`` | ``html_render_tools.py`` | 结构化 JSON 固定布局 → 图片 |
 | ``render_markdown_to_image`` | ``html_render_tools.py`` | Markdown → 图片 |
+| ``find_images`` | ``image_finder.py`` | 按搜索词找配图，下载校验后返回 ``img_`` 句柄 |
 
-> 三者同属 ``capability_domain="资料出图"``，由能力代理 ``render_agent`` 白名单持有；
+> 以上同属 ``capability_domain="资料出图"``，由能力代理 ``render_agent`` 白名单持有；
 > 主人格经 exclusive 剥离后**不应**直调，应
 > ``create_subagent(agent_profile="render_agent", task=事实包)``。
 
@@ -204,6 +207,9 @@ from gsuid_core.ai_core.buildin_tools.get_time import (
     _get_current_date,
 )
 
+# 沙箱 Python：模型写的代码在 Monty worker 子进程里跑
+from gsuid_core.ai_core.buildin_tools.run_code import run_code
+
 # Subagent工具 - 创建子Agent完成特定任务
 from gsuid_core.ai_core.buildin_tools.subagent import create_subagent
 
@@ -234,9 +240,8 @@ from gsuid_core.ai_core.buildin_tools.self_info import (
 # 网页抓取工具 - 抓取网页内容并转换为Markdown
 from gsuid_core.ai_core.buildin_tools.web_fetch import web_fetch_tool
 
-# 表情包工具 - 发送/收藏/搜索表情包
+# 表情包工具 - 收藏/搜索表情包
 from gsuid_core.ai_core.buildin_tools.meme_tools import (
-    send_meme,
     search_meme,
     collect_meme,
 )
@@ -261,6 +266,13 @@ from gsuid_core.ai_core.buildin_tools.file_manager import (
     diff_file_content,
     read_file_content,
     write_file_content,
+)
+
+# HTML渲染与图片检索工具 - 将HTML/Markdown/结构化卡片渲染为图片 / 搜索网络配图
+# （外链/icon/资源图在 render_html_to_image 内自动嵌 data URI，无独立嵌图工具）
+from gsuid_core.ai_core.buildin_tools.image_finder import (
+    find_images,
+    search_web_images,
 )
 
 # 图片读取工具 - 按图片ID取回群聊图片并转述为文字（保底）
@@ -303,20 +315,16 @@ from gsuid_core.ai_core.buildin_tools.file_operations import (
     pack_to_zip,
 )
 from gsuid_core.ai_core.buildin_tools.memory_timeline import (
-    timeline,
     read_session,
     search_turns,
     mark_evidence,
     recall_session,
-    recall_timeline,
 )
 
 # 技能安装工具 - 从 git/zip/SKILL.md 直链安装技能到 SKILLS_PATH 并热重载（限主人）
 from gsuid_core.ai_core.buildin_tools.skill_installer import install_skill
 
-# R2（C5 落地后）：移除 agent_mesh 的"假持久化" PersistentAgent 及其 4 个工具。
-# 跨天 / 步骤化长任务改由 ai_core/planning 的真持久化三表 + 定时唤醒承担。
-# 命令执行工具 - 执行系统命令
+# 命令执行工具
 from gsuid_core.ai_core.buildin_tools.command_executor import execute_shell_command
 
 # 插件开发工具 - 让「插件开发代理」在工作区脚手架/自检，审批后热加载一个 GsCore 插件
@@ -331,9 +339,6 @@ from gsuid_core.ai_core.buildin_tools.plugin_developer import (
     pull_installed_plugin,
     read_plugin_dev_guide,
 )
-
-# HTML渲染工具 - 将HTML/Markdown/结构化卡片渲染为图片
-# （外链/icon/资源图在 render_html_to_image 内自动嵌 data URI，无独立嵌图工具）
 from gsuid_core.ai_core.buildin_tools.html_render_tools import (
     render_card,
     render_html_to_image,
@@ -359,11 +364,9 @@ __all__ = [
     # 认知检索（主人格唯一「回想」动词）+ RAG 图片检索
     "search_cognition",
     "search_image",
-    "recall_timeline",
     "recall_session",
     "search_turns",
     "read_session",
-    "timeline",
     "mark_evidence",
     "read_chat_history",
     "attach_article",
@@ -375,6 +378,7 @@ __all__ = [
     "get_user_avatar",
     # Web搜索工具
     "web_search_tool",
+    "run_code",
     # 网页抓取工具
     "web_fetch_tool",
     # 消息发送工具
@@ -397,7 +401,6 @@ __all__ = [
     # 群成员称呼 / 身份
     "remember_user_alias",
     # 表情包工具
-    "send_meme",
     "collect_meme",
     "search_meme",
     # AI日期工具
@@ -459,7 +462,9 @@ __all__ = [
     "record_update",
     "record_delete",
     "record_summary",
-    # HTML渲染工具
+    # HTML渲染与图片检索工具
+    "find_images",
+    "search_web_images",
     "render_card",
     "render_chart_spec",
     "render_html_to_image",

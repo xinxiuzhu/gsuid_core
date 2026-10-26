@@ -1,6 +1,8 @@
+import os
 import re
 import sys
 import time
+import shutil
 import asyncio
 import inspect
 import importlib
@@ -22,7 +24,12 @@ except ImportError:
     # 引导期依赖缺失提示：早于 i18n 导入，保持纯中文
     print("正在安装必要依赖 'packaging'...")
     subprocess.check_call([sys.executable, "-m", "ensurepip"])
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "packaging"])
+    # 与 package_index_url() 同一规则；此处还不能调用它（import 尚未结束）。
+    _bootstrap_index = os.environ.get("UV_DEFAULT_INDEX", "").strip()
+    _bootstrap_cmd = [sys.executable, "-m", "pip", "install"]
+    if _bootstrap_index:
+        _bootstrap_cmd.extend(["--index-url", _bootstrap_index])
+    subprocess.check_call([*_bootstrap_cmd, "packaging"])
     from packaging.requirements import Requirement
 
 
@@ -151,7 +158,7 @@ installed_dependencies: Dict[str, str] = {}
 _module_cache: Dict[str, ModuleType] = {}
 _added_paths: Set[str] = set()
 # 待安装/待更新依赖累积器：逐插件检查时只收集，
-# 最后由 flush_pending_installs() 合并为一次 pip 调用
+# 最后由 flush_pending_installs() 合并为一次安装
 _pending_install: List[str] = []
 _pending_update: List[str] = []
 # 插件导入耗时记录 (插件名, 耗时秒)，用于启动耗时归因
@@ -454,9 +461,7 @@ class GsServer:
         if module_name in _module_cache:
             return _module_cache[module_name]
 
-        # fix: 已在 sys.modules 中(通常是被其它模块作为依赖传递导入并执行过),
-        # 直接复用, 不重复 exec —— 否则模块级副作用(如 scheduler.add_job)会重复执行,
-        # 重载场景下会导致 ConflictingIdError 等冲突。
+        # 已在 sys.modules 时直接复用，避免重复 exec 导致副作用（如定时任务）重复注册。
         if module_name in sys.modules:
             module = sys.modules[module_name]
             _module_cache[module_name] = module
@@ -530,6 +535,9 @@ class GsServer:
     async def load_plugins(self, dev_mode: bool = False):
         logger.info(t("log.server.load_start"))
         _load_start = time.time()
+        from gsuid_core.ai_core.heavy_import_gate import install_ai_off_heavy_gate
+
+        install_ai_off_heavy_gate()
         refresh_installed_dependencies()
         # fix: path append
         root_path = str(Path(__file__).parents[1])
@@ -594,9 +602,10 @@ class GsServer:
 
         if bot_id in self.active_bot:
             bot = self.active_bot[bot_id]
-            disconnected_at: Optional[float] = getattr(bot, "_disconnected_at", None)
-            # 若断连超过 5 分钟或 _disconnected_at 异常为 None，丢弃旧实例避免内存泄漏
-            if disconnected_at is None or time.time() - disconnected_at > 300:
+            disconnected_at: Optional[float] = bot._disconnected_at
+            # 仅在实例已断开（bot.bot 为空）且超时 5 分钟时重建，避免丢弃在途发送队列。
+            stale = bot.bot is None and (disconnected_at is None or time.time() - disconnected_at > 300)
+            if stale:
                 logger.warning(t("log.server.bot_timeout_recreate", bot_id=bot_id))
                 # 先 cancel 旧 send_task，防止孤儿 Task 持续运行
                 if bot._send_task and not bot._send_task.done():
@@ -645,90 +654,112 @@ class GsServer:
             logger.exception(e)
         return bot
 
-    async def disconnect(self, bot_id: str):
-        """断开 Bot 连接并清理相关资源。
+    async def disconnect(self, bot_id: str, websocket: Optional[WebSocket] = None) -> None:
+        """关闭这条连接，并保留 _Bot 供 5 分钟内重连。
 
-        修复要点：
-        1. 取消 _send_task，防止孤儿协程持续占用内存
-        2. 清理 Bot.instances / mutiply_instances / mutiply_map 中属于该 bot_id 的条目
-        3. 保留 Bot 实例在 active_bot 中，以便重连时复用（避免消息丢失）
+        websocket 是这次收尾的套接字。active_ws 已是另一条连接时直接返回。
+        close() 返回后，只删除仍指向该套接字的登记。
         """
-        if bot_id not in self.active_ws and bot_id not in self.active_bot:
-            # 已经断开过了，幂等返回
+
+        target: Optional[WebSocket] = None
+
+        def still_ours(candidate: _Bot) -> bool:
+            if self.active_bot.get(bot_id) is not candidate:
+                return False
+            current = self.active_ws.get(bot_id)
+            owned = websocket if websocket is not None else target
+            if current is not None and owned is not None and current is not owned:
+                return False
+            if owned is None:
+                return True
+            live = candidate.bot
+            return live is None or live is owned
+
+        registered = self.active_ws.get(bot_id)
+        if websocket is not None and registered is not None and registered is not websocket:
+            # 新套接字已登记。这次收尾只属于传入的那条连接。
             return
 
-        # ws 已移除且实例已标记断连(保留等待重连)时, 重复调用幂等返回, 避免重复清理与告警
+        if bot_id not in self.active_ws and bot_id not in self.active_bot:
+            return
+
         if bot_id not in self.active_ws:
-            _retained = self.active_bot.get(bot_id)
-            if _retained is not None and getattr(_retained, "_disconnected_at", None) is not None:
+            retained = self.active_bot.get(bot_id)
+            if retained is None:
+                return
+            if retained._disconnected_at is not None or not still_ours(retained):
                 return
 
         from gsuid_core.bot import Bot
 
-        if bot_id in self.active_ws:
+        target = self.active_ws.get(bot_id)
+        if target is not None and (websocket is None or target is websocket):
             try:
-                await self.active_ws[bot_id].close(code=1001)
+                await target.close(code=1001)
             except Exception:
                 pass
-            del self.active_ws[bot_id]
+            # close() 会让出事件循环。期间换上的新登记必须留下。
+            if self.active_ws.get(bot_id) is target:
+                del self.active_ws[bot_id]
 
-        if bot_id in self.active_bot:
-            bot = self.active_bot[bot_id]
+        bot = self.active_bot.get(bot_id)
+        if bot is None:
+            logger.warning(t("log.server.bot_disconnect_keep", bot_id=bot_id))
+            return
+        if not still_ours(bot):
+            return
 
-            # 1. 取消发送 worker，防止孤儿 Task
-            if bot._send_task and not bot._send_task.done():
-                bot._send_task.cancel()
-                try:
-                    await bot._send_task
-                except asyncio.CancelledError:
-                    pass
-            bot._send_task = None
-            bot.bot = None  # 标记 ws 已断开，send_worker 重启前不会发送
-            bot._disconnected_at = time.time()
+        if bot._send_task and not bot._send_task.done():
+            bot._send_task.cancel()
+            try:
+                await bot._send_task
+            except asyncio.CancelledError:
+                pass
+        if not still_ours(bot):
+            # 等待发送任务时，connect() 可能已换上新的 _Bot。
+            return
+        bot._send_task = None
+        bot.bot = None
+        bot._disconnected_at = time.time()
 
-            # 2. 取消所有后台任务并等待其真正结束
-            tasks_to_cancel = [_t for _t in bot.bg_tasks if not _t.done()]
-            for _t in tasks_to_cancel:
-                _t.cancel()
-            for _t in tasks_to_cancel:
-                try:
-                    await _t
-                except (asyncio.CancelledError, Exception):
-                    pass
+        tasks_to_cancel = [_t for _t in bot.bg_tasks if not _t.done()]
+        for _t in tasks_to_cancel:
+            _t.cancel()
+        for _t in tasks_to_cancel:
+            try:
+                await _t
+            except (asyncio.CancelledError, Exception):
+                pass
+        if not still_ours(bot):
+            return
 
-            # 2.5 唤醒所有等待 recall 回执的 future（set_result(None)），避免插件协程挂起到超时；
-            # None 会在收集时被过滤 ⇒ 调用方拿到已到达的部分（可能为空 list）。并清空防止跨重连泄漏。
-            for _fut in list(bot._recall_waiters.values()):
-                if not _fut.done():
-                    _fut.set_result(None)
-            bot._recall_waiters.clear()
-            bot._recall_timeout_streak = 0
+        # set_result(None) 后，收集处会丢掉 None。调用方拿到已到达的那部分。
+        for _fut in list(bot._recall_waiters.values()):
+            if not _fut.done():
+                _fut.set_result(None)
+        bot._recall_waiters.clear()
+        bot._recall_timeout_streak = 0
 
-            # 同步唤醒并清空数据请求回执（如群成员列表）的 future
-            for _fut in list(bot._data_waiters.values()):
-                if not _fut.done():
-                    _fut.set_result(None)
-            bot._data_waiters.clear()
+        # 同步唤醒并清空数据请求回执（如群成员列表）的 future
+        for _fut in list(bot._data_waiters.values()):
+            if not _fut.done():
+                _fut.set_result(None)
+        bot._data_waiters.clear()
 
-            # 3. 清理 Bot.instances 中属于该 bot_id 的条目
-            session_ids_to_remove = [sid for sid, b in Bot.instances.items() if b.bot_id == bot_id]
-            for sid in session_ids_to_remove:
-                del Bot.instances[sid]
+        session_ids_to_remove = [sid for sid, b in Bot.instances.items() if b.bot_id == bot_id]
+        for sid in session_ids_to_remove:
+            del Bot.instances[sid]
 
-            # 4. 清理 Bot.mutiply_instances 中属于该 bot_id 的条目
-            mutiply_ids_to_remove = [sid for sid, b in Bot.mutiply_instances.items() if b.bot_id == bot_id]
-            for sid in mutiply_ids_to_remove:
-                del Bot.mutiply_instances[sid]
+        mutiply_ids_to_remove = [sid for sid, b in Bot.mutiply_instances.items() if b.bot_id == bot_id]
+        for sid in mutiply_ids_to_remove:
+            del Bot.mutiply_instances[sid]
 
-            # 5. 清理 Bot.mutiply_map 中对应的映射
-            # 假设：mutiply_map 的结构为 {gid: session_id}，与 mutiply_instances 的 key 对应
-            map_keys_to_remove = [gid for gid, sid in Bot.mutiply_map.items() if sid in mutiply_ids_to_remove]
-            for gid in map_keys_to_remove:
-                del Bot.mutiply_map[gid]
-            if mutiply_ids_to_remove and not map_keys_to_remove:
-                logger.warning(t("log.server.mutiply_map_leak", count=len(mutiply_ids_to_remove)))
-
-            # 不再删除 active_bot[bot_id]，保留实例等待重连
+        # mutiply_map 的值是 mutiply_instances 的键。只删这次移除的会话。
+        map_keys_to_remove = [gid for gid, sid in Bot.mutiply_map.items() if sid in mutiply_ids_to_remove]
+        for gid in map_keys_to_remove:
+            del Bot.mutiply_map[gid]
+        if mutiply_ids_to_remove and not map_keys_to_remove:
+            logger.warning(t("log.server.mutiply_map_leak", count=len(mutiply_ids_to_remove)))
 
         logger.warning(t("log.server.bot_disconnect_keep", bot_id=bot_id))
 
@@ -778,6 +809,11 @@ def check_pyproject(pyproject: Path):
             logger.debug(t("log.server.special_dep_header"))
             logger.debug(sp_dep)
             process_dependencies(sp_dep, update=True)
+        upgrade_dep = toml_data["project"].get("gscore_auto_upgrade_dep", [])
+        if upgrade_dep:
+            logger.debug(t("log.server.special_dep_header"))
+            logger.debug(upgrade_dep)
+            process_dependencies(upgrade_dep, always_upgrade=True)
 
     elif "tool" in toml_data and "poetry" in toml_data["tool"]:
         # 处理 Poetry 格式
@@ -791,10 +827,7 @@ def check_pyproject(pyproject: Path):
             if isinstance(v, dict):
                 v = v.get("version", "*")
 
-            # 3. 简单的 Poetry 语法转换 ( ^ -> ~= )
-            # Poetry 的 ^ 表示 "Next Major Version"，
-            # pip 的 ~= 表示 "Compatible release"
-            # 虽然不完全等价，但在安装依赖场景下，转为 ~= 或 >= 能让 pip 读懂
+            # 3. Poetry 语法转换：将 ^ 转换为 pip 兼容的 ~=。
             if isinstance(v, str):
                 if v.startswith("^"):
                     v = "~=" + v[1:]
@@ -809,12 +842,12 @@ def check_pyproject(pyproject: Path):
         process_dependencies(dependencies, update=auto_update_dep)
 
 
-def process_dependencies(dependency_list: List[str], update: bool = False):
+def process_dependencies(dependency_list: List[str], update: bool = False, always_upgrade: bool = False):
     """检查依赖并收集待安装/待更新项。
 
     实际安装不在此处执行，而是由 load_plugins() 在所有插件检查完毕后
-    调用 flush_pending_installs() 合并为一次 pip 调用，
-    避免逐插件触发独立的 pip 子进程。
+    调用 flush_pending_installs() 合并为一次安装，
+    避免逐插件各起一个安装子进程。
     """
     for dep_str in dependency_list:
         try:
@@ -829,6 +862,11 @@ def process_dependencies(dependency_list: List[str], update: bool = False):
             if req_name not in installed_dependencies:
                 logger.info(t("log.server.dep_missing", req_name=req_name, raw=req.name))
                 _pending_install.append(dep_str)
+                continue
+
+            # 版本已满足也照样 --upgrade，拉到约束内的最新版
+            if always_upgrade:
+                _pending_update.append(dep_str)
                 continue
 
             # 已安装且开启更新 -> 检查版本是否满足
@@ -854,9 +892,8 @@ def process_dependencies(dependency_list: List[str], update: bool = False):
 def flush_pending_installs():
     """合并所有插件收集到的待安装/待更新依赖，一次性安装。
 
-    避免逐插件触发独立的 pip 子进程（每次还带镜像源 fallback），
-    首次启动或新增插件时可显著缩短耗时。
-    install_packages() 内部会在结束后刷新 installed_dependencies。
+    避免逐插件各起一个安装子进程。
+    install_packages() 结束后刷新 installed_dependencies。
     """
     global _pending_install, _pending_update
 
@@ -878,59 +915,60 @@ def flush_pending_installs():
         install_packages(update_list, upgrade=True)
 
 
+# 与 Core 的 uv 共用 UV_DEFAULT_INDEX，失败不换源。未设置时不传索引参数，
+# 交给 uv.toml / UV_INDEX_URL / pip.conf 等自身配置，都没配就是官方 PyPI。
+def package_index_url() -> str | None:
+    configured = os.environ.get("UV_DEFAULT_INDEX", "").strip()
+    if configured:
+        return configured
+    return None
+
+
+def build_dep_install_cmd(packages: list[str], upgrade: bool, index_url: str | None) -> tuple[list[str], bool]:
+    uv_bin = shutil.which("uv")
+    if uv_bin is not None:
+        cmd = [uv_bin, "pip", "install", "--python", sys.executable]
+        if index_url is not None:
+            cmd.extend(["--default-index", index_url])
+        uses_pip = False
+    else:
+        cmd = [sys.executable, "-m", "pip", "install"]
+        if index_url is not None:
+            cmd.extend(["--index-url", index_url])
+        uses_pip = True
+    if upgrade:
+        cmd.append("--upgrade")
+    cmd.extend(packages)
+    return cmd, uses_pip
+
+
 def install_packages(packages: List[str], upgrade: bool = False):
     if not packages:
         return
 
+    index_url = package_index_url()
     logger.info(t("log.server.install_start", packages=packages))
+    if index_url is None:
+        logger.info(t("log.server.install_using_tool_index"))
+    else:
+        logger.info(t("log.server.install_using_index", index_url=index_url))
 
-    # 定义镜像源列表 (名称, URL)
-    # 顺序: 阿里 -> 字节 -> 清华 -> 官方
-    mirrors = [
-        ("阿里源 (Aliyun)", "https://mirrors.aliyun.com/pypi/simple/"),
-        ("字节源 (Volces)", "https://mirrors.volces.com/pypi/simple/"),
-        ("清华源 (Tsinghua)", "https://pypi.tuna.tsinghua.edu.cn/simple"),
-        ("官方源 (PyPI)", "https://pypi.org/simple"),
-    ]
+    cmd, uses_pip = build_dep_install_cmd(packages, upgrade, index_url)
+    retcode, output = execute_cmd(cmd)
+    if uses_pip and retcode != 0 and "No module named pip" in output:
+        execute_cmd([sys.executable, "-m", "ensurepip"])
+        retcode, output = execute_cmd(cmd)
 
-    # 构建基础命令
-    base_cmd = [sys.executable, "-m", "pip", "install"]
-    if upgrade:
-        base_cmd.append("-U")
-
-    # 追加包名
-    base_cmd.extend(packages)
-
-    install_success = False
-
-    # 轮询尝试
-    for mirror_name, mirror_url in mirrors:
-        logger.info(t("log.server.install_trying_mirror", mirror_name=mirror_name))
-
-        # 组装完整命令，加入 -i 参数
-        cmd = base_cmd + ["-i", mirror_url]
-
-        # 有些环境可能需要信任 host，防止 SSL 报错，可选添加:
-        # host = mirror_url.split("//")[-1].split("/")[0]
-        # cmd.extend(["--trusted-host", host])
-
-        retcode, result = execute_cmd(cmd)
-
-        if "No module named pip" in result:
-            execute_cmd([sys.executable, "-m", "ensurepip"])
-            execute_cmd(cmd)
-
+    if index_url is None:
         if retcode == 0:
-            logger.info(t("log.server.install_mirror_ok", mirror_name=mirror_name))
-            install_success = True
-            break  # 安装成功，跳出循环
+            logger.info(t("log.server.install_tool_index_ok"))
         else:
-            logger.warning(t("log.server.install_mirror_fail", mirror_name=mirror_name))
+            logger.error(t("log.server.install_tool_index_fail"))
+    elif retcode == 0:
+        logger.info(t("log.server.install_index_ok", index_url=index_url))
+    else:
+        logger.error(t("log.server.install_index_fail", index_url=index_url))
 
-    if not install_success:
-        logger.error(t("log.server.install_all_fail"))
-
-    # 刷新依赖状态
     refresh_installed_dependencies()
 
 

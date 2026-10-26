@@ -18,6 +18,7 @@ from pydantic import Field, BaseModel
 
 from gsuid_core.webconsole.app_app import app
 from gsuid_core.webconsole.web_api import require_auth, require_admin
+from gsuid_core.ai_core.followup_window import get_gate_stats, list_active_windows
 
 from ._api_tags import AGENT_DEBUG
 
@@ -98,7 +99,7 @@ async def ops_sessions(_user: Dict = Depends(require_auth)) -> Dict[str, Any]:
     registry = get_ai_session_registry()
     hm = get_history_manager()
     sessions = registry.get_all_ai_sessions()
-    # HistoryManager 没有 get_session_meta；用 get_all_sessions_info 按 session_id 查 last_access
+    # 通过 get_all_sessions_info 获取各会话的 last_access。
     try:
         all_session_info = hm.get_all_sessions_info()
     except Exception:
@@ -150,11 +151,11 @@ async def ops_sessions(_user: Dict = Depends(require_auth)) -> Dict[str, Any]:
 
 @app.get("/api/ops/followup", summary="续聊窗口列表", tags=_OPS)
 async def ops_followup(_user: Dict = Depends(require_auth)) -> Dict[str, Any]:
-    from gsuid_core.ai_core.followup_window import list_active_windows
-
     window = int(_cfg_get("follow_up_window", 0) or 0)
     ceiling = int(_cfg_get("follow_up_max_total", 0) or 0)
-    items = list_active_windows(window, ceiling)
+    raw_replies = _cfg_get("follow_up_max_replies", 2)
+    max_replies = raw_replies if isinstance(raw_replies, int) and not isinstance(raw_replies, bool) else 2
+    items = list_active_windows(window, ceiling, max_replies)
     return {
         "status": 0,
         "msg": "ok",
@@ -163,6 +164,7 @@ async def ops_followup(_user: Dict = Depends(require_auth)) -> Dict[str, Any]:
             "max_total_seconds": ceiling,
             "active_count": sum(1 for x in items if x.get("active")),
             "items": items,
+            "gate_stats": get_gate_stats(),
             "ts": time.time(),
         },
     }

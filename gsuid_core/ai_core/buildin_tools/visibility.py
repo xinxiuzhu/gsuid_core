@@ -163,7 +163,9 @@ def visibility_user_hint(
     if not addressed:
         return ""
     if not create_ok:
-        return "（系统：本轮是管理已有条目：不要新建，用查询/修改/取消。）"
+        from gsuid_core.ai_core.control.lines import VISIBILITY_MANAGE_EXISTING
+
+        return VISIBILITY_MANAGE_EXISTING
     return ""
 
 
@@ -212,5 +214,16 @@ def context_has_video(ctx: VisibilityScanCtx) -> bool:
         return True
     for text in _iter_context_texts(ctx):
         if "vid_" in text or "视频ID" in text:
+            return True
+    return False
+
+
+def visible_when_directive_present(ctx: VisibilityScanCtx) -> bool:
+    """内部校验/纠偏指令出现时才暴露 dispute_directive。"""
+    deps = ctx.deps
+    if deps is not None and "dispute_extra" in deps.extra:
+        return True
+    for text in _iter_context_texts(ctx):
+        if "系统校验" in text or "[框架·" in text:
             return True
     return False

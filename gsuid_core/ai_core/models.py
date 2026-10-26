@@ -28,8 +28,10 @@ class ToolContext:
     # 渐进式工具暴露：find_tools 本轮命中的工具名集合，RetrievableToolset 每 step 读它
     # 解析成可调用工具。作用域为单次 run（ToolContext 每轮新建），轮末自然丢弃。
     dynamic_tool_names: Set[str] = field(default_factory=set)
-    # 主人格交互轮：能力代理专属工具名。find_tools / RetrievableToolset 均不得回灌。
+    # 主人格交互轮：能力代理专属工具名。find_tools 默认不回灌。
     blocked_tool_names: Set[str] = field(default_factory=set)
+    # 别名锁定且没有对口代理时，这些 exclusive 工具本轮可调用。
+    alias_callable_tools: Set[str] = field(default_factory=set)
     # True：允许工具路径对用户会话出站（主人格）。能力代理 / 子 Agent 恒 False。
     allow_user_outbound: bool = True
     # 人格 enabled_tools 作用域快照。find_tools 检索时按它收放；None = 不限。
@@ -189,6 +191,7 @@ class ToolBase:
     schema_brief: str  # 下发 schema 用简述；检索仍用 description 全文
     category: str  # 注册分类；花名册按此跳过主人格调不到的族
     hide_from_main: bool  # visible_to_capability_only：主人格花名册/速览不列
+    code_callable: bool  # 模型写的 Python 可否按名 await 本工具
 
     def __init__(
         self,
@@ -204,6 +207,7 @@ class ToolBase:
         schema_brief: str = "",
         category: str = "",
         hide_from_main: bool = False,
+        code_callable: bool = True,
     ):
         self.name = name
         self.description = description
@@ -217,6 +221,7 @@ class ToolBase:
         self.schema_brief = schema_brief or description
         self.category = category
         self.hide_from_main = hide_from_main
+        self.code_callable = code_callable
 
     @property
     def retrieval_text(self) -> str:

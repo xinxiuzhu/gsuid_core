@@ -13,6 +13,7 @@ from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.web_search import web_search
 from gsuid_core.ai_core.configs.ai_config import ai_config
+from gsuid_core.ai_core.web_search.date_utils import normalize_published_date
 
 
 def _format_results_for_model(results: list[dict], query: str = "") -> str:
@@ -52,6 +53,9 @@ def _format_results_for_model(results: list[dict], query: str = "") -> str:
         title = (item.get("title") or "").strip()
         url = (item.get("url") or "").strip()
         content = (item.get("content") or "").strip()
+        published = ""
+        if "published_date" in item and item["published_date"] is not None:
+            published = normalize_published_date(item["published_date"])
         if kind == "image" or image_url:
             img_i += 1
             img = image_url or url
@@ -65,6 +69,8 @@ def _format_results_for_model(results: list[dict], query: str = "") -> str:
         lines.append(f"[{text_i}]" + (f" {title}" if title else ""))
         if url:
             lines.append(url)
+        if published:
+            lines.append(f"published: {published}")
         if content:
             lines.append(content)
         # 个别 provider 在正文结果上附带缩略图
@@ -78,7 +84,12 @@ def _format_results_for_model(results: list[dict], query: str = "") -> str:
 
 
 # 多源 failover 可能串行多次检索，外层包装需覆盖单源超时之和
-@ai_tools(category="buildin", timeout=100.0)
+@ai_tools(
+    category="buildin",
+    timeout=100.0,
+    code_callable=True,
+    covers=["网页搜索", "网络检索", "天气查询", "新闻资讯", "外网搜索"],
+)
 async def web_search_tool(
     ctx: RunContext[ToolContext],
     query: str,
@@ -87,7 +98,7 @@ async def web_search_tool(
     """
     Web 搜索（外网摘要兜底；可信度通常低于结构化数据工具）。
 
-    适用：新闻/事件脉络、公告背景、开放问答、池中无结构化接口时。
+    适用：天气出行、新闻/事件脉络、公告背景、开放问答、池中无结构化接口时。
     不适用：把摘要数字/状态当「当前实时值」——网页常过时。
     query 须自带可检索的具体槽。槽在说话人身上且当前消息没写时，先
     `search_cognition` 自己组合查询词填槽，禁止空槽直搜。

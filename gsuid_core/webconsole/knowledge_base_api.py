@@ -16,7 +16,7 @@ from fastapi.responses import StreamingResponse
 
 from gsuid_core.webconsole.app_app import app
 from gsuid_core.webconsole.web_api import require_auth
-from gsuid_core.ai_core.rag.chunking import DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_OVERLAP
+from gsuid_core.ai_core.rag.chunking import DEFAULT_CHUNK_OVERLAP
 from gsuid_core.ai_core.rag.knowledge import (
     add_knowledge_document,
     list_knowledge_plugins,
@@ -34,9 +34,7 @@ from gsuid_core.ai_core.rag.knowledge import (
 
 from ._api_tags import KNOWLEDGE
 
-# WebConsole 端点捕获的"合法运行时/DB 故障"：转成 status=1 返回前端，**不**包括编程错误
-# （KeyError/AttributeError/TypeError/NameError 等）——后者应冒泡到 FastAPI 500 处理器，
-# 避免被宽 except 吞掉、线上难以定位（见 CODE_REVIEW §4）。
+# 合法运行时与数据库异常转换为 status=1 响应，代码逻辑错误冒泡至 500 处理器。
 _RUNTIME_ERRORS = (SQLAlchemyError, OSError, ValueError)
 
 
@@ -61,8 +59,8 @@ class KnowledgeBaseUpdate(BaseModel):
 class KnowledgeBulkImport(BaseModel):
     """批量导入（服务端分片）请求模型
 
-    full_text 与 items 二选一：full_text 由服务端按 chunk_size/overlap 分片；
-    items 为客户端已分好的分片列表（每项含 content）。
+    full_text 与 items 二选一。两者都再走同一把切刀。
+    chunk_size 为 0 时跟当前模型的 token 上限。更大的请求夹回该预算。
     """
 
     title: str
@@ -71,7 +69,7 @@ class KnowledgeBulkImport(BaseModel):
     items: Optional[List[Dict[str, Any]]] = None
     tags: List[str] = []
     plugin: str = "manual"
-    chunk_size: int = DEFAULT_CHUNK_SIZE
+    chunk_size: int = 0
     chunk_overlap: int = DEFAULT_CHUNK_OVERLAP
     replace: bool = True
 
@@ -327,10 +325,8 @@ async def delete_knowledge_base(
     }
 
 
-# ─────────────────────────────────────────────
 # 批量导入 / 文档管理 / 备份导出导入
 # 设计见 plans/knowledge_base_bulk_import_assessment_20260614.md §5
-# ─────────────────────────────────────────────
 
 
 @app.post("/api/ai/knowledge/bulk", summary="批量导入（服务端分片，导入长文/数十万字）", tags=KNOWLEDGE)
@@ -340,10 +336,10 @@ async def bulk_import_knowledge(
 ) -> Dict[str, Any]:
     """批量导入一篇文档（服务端分片 + 批量嵌入 + 幂等入库）
 
-    用于把数十万字长文一次导入：服务端按 chunk_size/overlap 分片，每片单独成向量，
-    避免整段长文被嵌入模型按上限静默截断。同一 doc_id 重导即覆盖（幂等）。
+    用于把数十万字长文一次导入：服务端按 chunk_size 和 overlap 分片，每片单独成向量。
+    chunk_size 为 0 时跟当前模型。整串不超过该模型的字符预算。同一 doc_id 重导即覆盖。
 
-    请求体：full_text（整篇，服务端分片）与 items（已分片数组）二选一。
+    请求体：full_text 与 items 二选一。items 里的小节也会再切。
 
     Returns:
         data: {doc_id, total_chunks, written, skipped}

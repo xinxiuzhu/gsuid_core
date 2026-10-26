@@ -166,6 +166,23 @@ def test_addressed_suffix_keeps_voice_anchor_outside_product_cap() -> None:
     assert "task" not in idle_ctx.blocks
     assert "memory" not in idle_ctx.blocks
 
+    soft_ctx = AgentHookContext(
+        point=AgentHookPoint.COMPOSE_CONTEXT,
+        turn_graph=idle,
+        cheap_gate="full",
+        soft_triggered=True,
+    )
+    assert suffix_allowed_blocks(soft_ctx) == frozenset({"voice_anchor", "history", "soft_trigger"})
+    soft_ctx.blocks = {
+        "voice_anchor": voice,
+        "history": "H" * 100,
+        "soft_trigger": "（系统提示：免唤醒续聊）",
+        "memory": "M" * 80,
+    }
+    _apply_suffix_block_policy(soft_ctx)
+    assert "soft_trigger" in soft_ctx.blocks
+    assert "memory" not in soft_ctx.blocks
+
 
 def test_directed_assistant_line_is_not_a_user_alias_source() -> None:
     from gsuid_core.ai_core.context_assembly import history_line_is_assistant
@@ -174,6 +191,73 @@ def test_directed_assistant_line_is_not_a_user_alias_source() -> None:
     assert history_line_is_assistant("[14:32:18] AI→小明(用户ID:456): 晴天")
     assert not history_line_is_assistant("[14:32:05] 小明(用户ID:456): 今天天气怎么样")
     assert not history_line_is_assistant("[历史对话] 旧→新")
+
+
+def test_alias_note_ignores_the_persona_name() -> None:
+    """叫人格名是在找你：同名实体不得写进别名表，否则闲聊会被当成插件查询。"""
+    from gsuid_core.ai_core.entity_index import clear_entity_index, register_entity_surface
+    from gsuid_core.ai_core.context_assembly import assemble_dynamic_context
+
+    def _assemble(query: str, history: str) -> str:
+        full, _ = asyncio.run(
+            assemble_dynamic_context(
+                query=query,
+                user_id="test_u",
+                bot_id="TEST",
+                persona_name="北辰星",
+                mood_key="test_u",
+                history_context=history,
+            )
+        )
+        return full
+
+    _load_kits_once()
+    clear_entity_index()
+    register_entity_surface("北辰星", "北辰星", "SomePlugin")
+    register_entity_surface("长离", "长离", "OtherPlugin")
+    try:
+        assert "别名表命中" not in _assemble("北辰星早上好", "")
+        assert "别名表命中" not in _assemble("早上好", "[历史对话] 旧→新\n小明: 北辰星在吗")
+        assert "别名表命中" not in _assemble(
+            "傻孩子我是怕你被压扁",
+            "[历史对话] 旧→新\n[15:40:01] 路人(用户ID:other_u): 长离今天怎么样",
+        )
+        mixed = _assemble("北辰星，长离用什么武器", "")
+        assert "长离→OtherPlugin" in mixed
+        assert "北辰星→" not in mixed
+    finally:
+        clear_entity_index()
+
+
+def test_non_empty_history_preserves_system_prompt_part() -> None:
+    """非空 history（HTTP 历史装入或首条 proactive 发言）须保留 SystemPromptPart，防 pydantic_ai 漏注 system_prompt。"""
+    from pydantic_ai.messages import ModelRequest, SystemPromptPart
+
+    from gsuid_core.ai_core.gs_agent import create_agent
+    from gsuid_core.webconsole.chat_with_history_api import ChatHistoryTurn, _load_request_history
+
+    agent = create_agent(system_prompt="你是测试角色。", persona_name="早柚", create_by="Chat")
+    _load_request_history(
+        agent,
+        [
+            ChatHistoryTurn(role="user", content="你好"),
+            ChatHistoryTurn(role="assistant", content="你好呀"),
+        ],
+        guard_on=False,
+    )
+    assert isinstance(agent.history[0], ModelRequest)
+    assert any(isinstance(p, SystemPromptPart) and p.content == "你是测试角色。" for p in agent.history[0].parts)
+
+    proactive_agent = create_agent(system_prompt="你是巡检角色。", persona_name="早柚", create_by="Chat")
+    proactive_agent.append_proactive_assistant_turn(
+        content="群里好安静呀",
+        source="heartbeat",
+        trigger_reason="test",
+    )
+    assert isinstance(proactive_agent.history[0], ModelRequest)
+    assert any(
+        isinstance(p, SystemPromptPart) and p.content == "你是巡检角色。" for p in proactive_agent.history[0].parts
+    )
 
 
 if __name__ == "__main__":

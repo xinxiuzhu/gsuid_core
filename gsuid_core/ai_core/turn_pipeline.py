@@ -32,6 +32,7 @@ from gsuid_core.ai_core.utils import (
 )
 from gsuid_core.message_history import get_history_manager
 from gsuid_core.ai_core.quota_guard import quota_breaker
+from gsuid_core.ai_core.control.lines import MSG_SECTION_HEAD
 from gsuid_core.ai_core.history_format import compose_group_history
 from gsuid_core.message_history.manager import MessageRecord
 from gsuid_core.ai_core.persona.settings import persona_name_from_event
@@ -130,7 +131,7 @@ async def apply_summary_guard(event: Event, user_messages: Sequence[UserContent]
     summarized = await summarize_long_input(event.raw_text, max_tokens=18000)
     if not isinstance(user_messages, list) or not user_messages or not isinstance(user_messages[0], str):
         return
-    marker = "--- 消息 ---\n"
+    marker = MSG_SECTION_HEAD
     header_end = user_messages[0].find(marker)
     if header_end != -1:
         header = user_messages[0][: header_end + len(marker)]
@@ -352,9 +353,18 @@ def prior_user_turns_for_intent(event: Event, query: str) -> Tuple[List[str], Li
     return prior[-4:], records
 
 
-def stale_request(enqueue_ts: Optional[float], ttl: float) -> bool:
-    """O-A 队头阻塞防护：排队过久（全局过载）时话题大概率已翻篇，直接放弃。"""
-    if enqueue_ts is None:
+def stale_request(
+    enqueue_ts: Optional[float],
+    ttl: float,
+    *,
+    event: Optional[Event] = None,
+    is_framework_injection: bool = False,
+) -> bool:
+    """O-A 队头阻塞防护。私聊排队过久则丢；群/频道共享 session 不丢；回灌永不丢。"""
+    if is_framework_injection or enqueue_ts is None:
+        return False
+    # 群/频道多人共用一把 _run_lock：后到只是在等锁，晚回优于静默。
+    if event is not None and event.user_type != "direct":
         return False
     waited = time.time() - enqueue_ts
     if waited <= ttl:

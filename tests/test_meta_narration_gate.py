@@ -254,16 +254,22 @@ def test_prompt_stops_prescribing_a_fixed_failure_phrase() -> None:
     for term in ("、库", "分值"):
         assert term not in SYSTEM_CONSTRAINTS, f"禁词表不该收「{term}」：要么过宽、要么是业务词"
     assert len(SYSTEM_CONSTRAINTS) <= 1600, len(SYSTEM_CONSTRAINTS)
+    assert "禁止记账" in SYSTEM_CONSTRAINTS
+    assert "第几次" in SYSTEM_CONSTRAINTS
+    assert "角色化拒绝" not in SYSTEM_CONSTRAINTS
+    assert "群闲聊≤15字" not in SYSTEM_CONSTRAINTS
 
 
 def test_find_tools_miss_is_capability_shaped_not_data_shaped() -> None:
     """C-3：未命中说的是「没有对口能力」，不是「你要的资料不存在」。"""
+    from gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery import FIND_TOOLS_GAP_NOTE
+
     src = (
         Path(__file__).resolve().parent.parent / "gsuid_core/ai_core/buildin_tools/dynamic_tool_discovery.py"
     ).read_text(encoding="utf-8")
     assert "本次没有对口的专用能力" in src
     assert "未检索到与" not in src, "未命中回执仍是检索语汇"
-    assert "禁止说成「你要的东西不存在」" in src
+    assert "禁止说成「你要的东西不存在」" in FIND_TOOLS_GAP_NOTE
 
 
 def test_answer_contract_forbids_defining_the_shape_of_an_absence() -> None:

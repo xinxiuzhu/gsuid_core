@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from gsuid_core.ai_core.agent_run.speech_policy import (
     spoken_user_body,
     spoken_user_body_len,
@@ -14,6 +16,7 @@ from gsuid_core.ai_core.agent_run.speech_policy import (
     looks_like_inflight_quota_speech,
 )
 from gsuid_core.ai_core.buildin_tools.chart_svg import chart_spec_to_svg
+from gsuid_core.ai_core.buildin_tools.render_kit import RENDER_KIT_CSS
 
 
 def test_grouped_bar_has_legend_and_full_labels() -> None:
@@ -133,6 +136,25 @@ def test_signed_bars_use_zero_baseline() -> None:
     assert bars[0][0] < bars[1][0]
 
 
+@pytest.mark.parametrize(("dark", "selector"), [(False, ".gs-page{"), (True, ".gs-page.theme-ink{")])
+def test_signed_colors_follow_render_kit(dark: bool, selector: str) -> None:
+    block = RENDER_KIT_CSS[RENDER_KIT_CSS.index(selector) :].split("}", 1)[0]
+    up = re.search(r"--gs-up:(#[0-9a-f]{6})", block)
+    down = re.search(r"--gs-down:(#[0-9a-f]{6})", block)
+    assert up is not None and down is not None
+    svg = chart_spec_to_svg(
+        {
+            "type": "bar",
+            "signed": True,
+            "dark": dark,
+            "data": [{"label": "涨", "value": 3}, {"label": "跌", "value": -2}],
+        }
+    )
+    fills = re.findall(r'<rect [^>]*fill="(#[0-9a-f]{6})"', svg)
+    assert up.group(1) in fills and down.group(1) in fills
+    assert fills.index(up.group(1)) < fills.index(down.group(1))
+
+
 def test_multi_line_keeps_series_legend() -> None:
     svg = chart_spec_to_svg(
         {
@@ -184,8 +206,19 @@ def test_inflight_and_active_task_block_numeric_dump() -> None:
         has_status_tool=True,
         tool_calls_so_far=["check_delegation"],
         has_active_task=True,
+        fact_pack_pending=True,
     )
     assert blk2 and why2 == "numeric_recitation"
+    bare, bare_why = should_block_user_visible_text(
+        "free",
+        dump,
+        pending_async=False,
+        image_sent=False,
+        has_status_tool=True,
+        tool_calls_so_far=["check_delegation"],
+        has_active_task=True,
+    )
+    assert not bare, bare_why
 
     blk3, _ = should_block_user_visible_text(
         "free",

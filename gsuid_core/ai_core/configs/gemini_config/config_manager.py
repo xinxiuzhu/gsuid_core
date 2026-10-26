@@ -64,9 +64,14 @@ GEMINI_CONFIG_TEMPLATE: Dict[str, GSC] = {
     ),
     "model_effort": GsStrConfig(
         title="模型性能",
-        desc="指定模型思考性能, 不同模型的标准不同，该选项并不保证能真实起效",
+        desc=(
+            "思考档位。adaptive 不传思考参数。"
+            "enable 打开，disable 关闭；minimal / low / medium / high / xhigh 按该档发送。"
+            "Gemini 3 用 thinking_level，Gemini 2.5 用 thinking_budget。"
+            "模型名未被标成支持思考时，仍按所选档位发送。上游拒绝时，错误原样返回"
+        ),
         data="enable",
-        options=["enable", "disable", "minimal", "low", "medium", "high", "xhigh"],
+        options=["adaptive", "enable", "disable", "minimal", "low", "medium", "high", "xhigh"],
     ),
     "max_concurrency": GsIntConfig(
         title="允许并发数",

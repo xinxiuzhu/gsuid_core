@@ -1,17 +1,12 @@
 """
 MCP 工具启动注册模块
 
-在框架启动时，读取所有启用的 MCP 配置，连接 MCP 服务器获取工具列表，
-并将每个 MCP 工具动态注册为 AI 工具（ai_tools），使 AI 可以自由调用。
-
-注册流程:
-1. 从 mcp_config_manager 获取所有 enabled 的配置
-2. 对每个配置，创建 MCPClient 并获取工具列表
-3. 为每个 MCP 工具动态创建包装函数并注册到 _TOOL_REGISTRY
+启动时读取已启用的 MCP 配置。配置里已有工具清单时直接注册，不连接服务器。
+真正调用工具时才建立连接。清单为空时启动跳过；控制台单独注册才会去连。
 """
 
 import inspect
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, TypedDict
 
 from pydantic_ai import RunContext
 from pydantic_ai.tools import Tool
@@ -23,8 +18,7 @@ from gsuid_core.ai_core.models import ToolBase, ToolContext
 from gsuid_core.ai_core.mcp.client import MCPClient
 from gsuid_core.ai_core.mcp.config_manager import MCPConfig, mcp_config_manager
 
-# _TOOL_REGISTRY 使用延迟导入以避免循环导入
-# （register -> utils -> image_understand -> minimax_understand -> mcp -> startup -> register）
+# 延迟导入 _TOOL_REGISTRY 避免循环依赖。
 
 
 def _get_tool_registry() -> dict:
@@ -39,6 +33,153 @@ _mcp_clients: Dict[str, MCPClient] = {}
 
 # MCP 工具分类名称
 MCP_CATEGORY = "mcp"
+
+JsonScalar = str | int | float | bool | None
+JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+
+
+class JsonSchemaProperty(TypedDict, total=False):
+    type: str
+    description: str
+    enum: list[JsonValue]
+    default: JsonValue
+    anyOf: list[JsonValue]
+    allOf: list[JsonValue]
+    oneOf: list[JsonValue]
+    items: JsonValue
+
+
+class JsonSchemaObject(TypedDict, total=False):
+    type: str
+    properties: dict[str, JsonSchemaProperty]
+    required: list[str]
+
+
+def _as_json_value(raw: object) -> JsonValue | None:
+    if raw is None or isinstance(raw, (str, int, float, bool)):
+        return raw
+    if isinstance(raw, list):
+        items: list[JsonValue] = []
+        for item in raw:
+            converted = _as_json_value(item)
+            if converted is None and item is not None:
+                continue
+            items.append(converted)
+        return items
+    if isinstance(raw, dict):
+        mapping: dict[str, JsonValue] = {}
+        for key, val in raw.items():
+            if not isinstance(key, str):
+                continue
+            converted = _as_json_value(val)
+            if converted is None and val is not None:
+                continue
+            mapping[key] = converted
+        return mapping
+    return None
+
+
+def _json_schema_property(spec: object) -> JsonSchemaProperty:
+    prop: JsonSchemaProperty = {}
+    if not isinstance(spec, dict):
+        return prop
+    type_name = spec["type"] if "type" in spec else ""
+    if isinstance(type_name, str) and type_name:
+        prop["type"] = type_name
+    description = spec["description"] if "description" in spec else ""
+    if isinstance(description, str) and description:
+        prop["description"] = description
+    for extra_key in ("enum", "default", "anyOf", "allOf", "oneOf", "items"):
+        if extra_key not in spec:
+            continue
+        converted = _as_json_value(spec[extra_key])
+        if converted is None and spec[extra_key] is not None:
+            continue
+        if extra_key == "enum" and isinstance(converted, list):
+            prop["enum"] = converted
+        elif extra_key == "items" and converted is not None:
+            prop["items"] = converted
+        elif extra_key == "anyOf" and isinstance(converted, list):
+            prop["anyOf"] = converted
+        elif extra_key == "allOf" and isinstance(converted, list):
+            prop["allOf"] = converted
+        elif extra_key == "oneOf" and isinstance(converted, list):
+            prop["oneOf"] = converted
+        elif extra_key == "default":
+            prop["default"] = converted
+    return prop
+
+
+def _schema_object(properties: dict[str, JsonSchemaProperty], required: list[str]) -> JsonSchemaObject:
+    schema: JsonSchemaObject = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _input_schema_from_parameters(parameters: object) -> JsonSchemaObject:
+    """把配置里的扁平参数还原成注册函数签名用的 JSON Schema。"""
+    properties: dict[str, JsonSchemaProperty] = {}
+    required: list[str] = []
+    if not isinstance(parameters, dict):
+        return _schema_object(properties, required)
+    for name, spec in parameters.items():
+        if not isinstance(name, str) or not isinstance(spec, dict):
+            continue
+        properties[name] = _json_schema_property(spec)
+        if "required" in spec and spec["required"] is True:
+            required.append(name)
+    return _schema_object(properties, required)
+
+
+def _input_schema_from_json_schema(raw: object) -> JsonSchemaObject:
+    """MCP list_tools 给的已是 JSON Schema object。"""
+    properties: dict[str, JsonSchemaProperty] = {}
+    required: list[str] = []
+    if not isinstance(raw, dict):
+        return _schema_object(properties, required)
+    raw_props = raw["properties"] if "properties" in raw else None
+    if isinstance(raw_props, dict):
+        for name, spec in raw_props.items():
+            if not isinstance(name, str):
+                continue
+            properties[name] = _json_schema_property(spec)
+    raw_required = raw["required"] if "required" in raw else None
+    if isinstance(raw_required, list):
+        required = [item for item in raw_required if isinstance(item, str)]
+    return _schema_object(properties, required)
+
+
+def _make_mcp_client(config: MCPConfig) -> MCPClient:
+    return MCPClient(
+        name=config.name,
+        transport=config.get_transport(),
+        command=config.command,
+        args=config.args,
+        env=config.env,
+        url=config.url,
+        headers=config.headers,
+    )
+
+
+def _register_catalog(config_id: str, config: MCPConfig) -> int:
+    """按已保存的工具清单注册。不连接服务器。"""
+    client = _make_mcp_client(config)
+    _mcp_clients[config_id] = client
+    registered_count = 0
+    for tool_def in config.tools:
+        try:
+            _register_mcp_tool(
+                client,
+                tool_def.name,
+                tool_def.description,
+                _input_schema_from_parameters(tool_def.parameters),
+                config=config,
+            )
+            registered_count += 1
+        except Exception as e:
+            logger.error(t("log.mcp.fail_register_tool_failed", p0=config.name, p1=tool_def.name, e=e))
+    return registered_count
 
 
 def _json_schema_type_to_python(json_type: str) -> type:
@@ -58,7 +199,7 @@ def _build_mcp_tool_function(
     client: MCPClient,
     tool_name: str,
     tool_description: str,
-    input_schema: dict[str, Any],
+    input_schema: JsonSchemaObject,
 ) -> Any:
     """
     为 MCP 工具动态创建包装函数。
@@ -75,16 +216,15 @@ def _build_mcp_tool_function(
     Returns:
         动态创建的异步函数
     """
-    # 解析 input_schema 中的 properties 和 required
-    properties: Dict[str, Any] = input_schema.get("properties", {})
-    required_fields: List[str] = input_schema.get("required", [])
+    properties: dict[str, JsonSchemaProperty] = input_schema["properties"] if "properties" in input_schema else {}
+    required_fields: list[str] = input_schema["required"] if "required" in input_schema else []
 
     # 构建函数参数注解
     annotations: Dict[str, Any] = {"ctx": RunContext[ToolContext]}
     default_values: Dict[str, Any] = {}
 
     for param_name, param_schema in properties.items():
-        param_type_str = param_schema.get("type", "string")
+        param_type_str = param_schema["type"] if "type" in param_schema else "string"
         param_type = _json_schema_type_to_python(param_type_str)
         annotations[param_name] = param_type
 
@@ -202,7 +342,7 @@ def _register_mcp_tool(
     client: MCPClient,
     tool_name: str,
     tool_description: str,
-    input_schema: dict[str, Any],
+    input_schema: JsonSchemaObject,
     config: MCPConfig | None = None,
 ) -> None:
     """
@@ -271,15 +411,7 @@ async def _register_mcp_server(config_id: str, config: MCPConfig) -> int:
     Returns:
         成功注册的工具数量
     """
-    client = MCPClient(
-        name=config.name,
-        transport=config.get_transport(),
-        command=config.command,
-        args=config.args,
-        env=config.env,
-        url=config.url,
-        headers=config.headers,
-    )
+    client = _make_mcp_client(config)
 
     try:
         tools = await client.list_tools()
@@ -297,7 +429,7 @@ async def _register_mcp_server(config_id: str, config: MCPConfig) -> int:
                 client,
                 tool_info.name,
                 tool_info.description,
-                tool_info.input_schema,
+                _input_schema_from_json_schema(tool_info.input_schema),
                 config=config,
             )
             registered_count += 1
@@ -307,26 +439,16 @@ async def _register_mcp_server(config_id: str, config: MCPConfig) -> int:
     return registered_count
 
 
-async def unregister_mcp_server(config_id: str) -> int:
-    """
-    注销单个 MCP 服务器的所有已注册工具。
-
-    Args:
-        config_id: 配置 ID
-
-    Returns:
-        移除的工具数量
-    """
+def _forget_mcp_server(config_id: str) -> int:
+    """从注册表摘掉该服务器的工具。不写向量库。"""
     tool_registry = _get_tool_registry()
     if MCP_CATEGORY not in tool_registry:
         return 0
 
-    # 找到该服务器注册的所有工具（通过 plugin 前缀匹配）
     config = mcp_config_manager.get_config(config_id)
     if config is None:
-        # 配置已删除，尝试从 _mcp_clients 获取名称
-        client = _mcp_clients.get(config_id)
-        server_name = client.name if client else config_id
+        client = _mcp_clients[config_id] if config_id in _mcp_clients else None
+        server_name = client.name if client is not None else config_id
     else:
         server_name = config.name
 
@@ -337,18 +459,40 @@ async def unregister_mcp_server(config_id: str) -> int:
         del tool_registry[MCP_CATEGORY][tool_name]
         logger.info(t("log.mcp.unregister_name_tool", tool_name=tool_name))
 
-    # 清理客户端引用
     if config_id in _mcp_clients:
         del _mcp_clients[config_id]
 
     return len(tools_to_remove)
 
 
+async def _sync_tool_index() -> None:
+    # RAG 的 sync_tools 早于 MCP 注册。这里不再同步，向量检索就看不到这些工具。
+    from gsuid_core.ai_core.register import get_all_tools
+    from gsuid_core.ai_core.rag.tools import sync_tools
+
+    await sync_tools(get_all_tools())
+
+
+async def unregister_mcp_server(config_id: str) -> int:
+    """
+    注销单个 MCP 服务器的所有已注册工具，并按当前注册表同步向量库。
+
+    Args:
+        config_id: 配置 ID
+
+    Returns:
+        移除的工具数量
+    """
+    removed = _forget_mcp_server(config_id)
+    await _sync_tool_index()
+    return removed
+
+
 async def register_single_mcp_server(config_id: str) -> tuple[int, str]:
     """
     注册单个 MCP 服务器的工具（用于 API 实时注册）。
 
-    先注销该服务器的旧工具，再重新注册。
+    先注销该服务器的旧工具，再重新注册，然后同步向量库。
 
     Args:
         config_id: 配置 ID
@@ -361,40 +505,45 @@ async def register_single_mcp_server(config_id: str) -> tuple[int, str]:
         return 0, f"配置 '{config_id}' 不存在"
 
     if not config.enabled:
-        # 如果配置被禁用，只注销旧工具
         removed = await unregister_mcp_server(config_id)
         return 0, f"配置 '{config.name}' 已禁用，移除了 {removed} 个旧工具"
 
-    # 先注销旧工具
-    await unregister_mcp_server(config_id)
-
-    # 重新注册
-    count = await _register_mcp_server(config_id, config)
+    _forget_mcp_server(config_id)
+    count = 0
+    try:
+        count = await _register_mcp_server(config_id, config)
+    finally:
+        await _sync_tool_index()
     return count, f"注册完成，共 {count} 个工具"
 
 
 async def register_all_mcp_tools() -> None:
-    """
-    启动时注册所有启用的 MCP 服务器工具。
+    """启动时按已保存的工具清单注册。不连接 MCP 服务器。
 
     由 ai_core/startup.py 的 init_ai_core() 在框架启动后台阶段调用。
+    清单为空的服务器跳过，等控制台单独注册时再连接。
+    注册表稳定后同步一次工具向量库。
     """
     enabled_configs = mcp_config_manager.get_enabled_configs()
 
     if not enabled_configs:
         logger.info(t("log.mcp.enabled_configurations_skipping"))
-        return
+    else:
+        logger.info(t("log.mcp.found_enabled_configurations", p0=len(enabled_configs)))
 
-    logger.info(t("log.mcp.found_enabled_configurations", p0=len(enabled_configs)))
+        total_registered = 0
+        for config_id, config in enabled_configs:
+            logger.info(t("log.mcp.registering_server_config", p0=config.name, config_id=config_id))
+            if not config.tools:
+                logger.info(t("log.mcp.catalog_empty_defer_connect", p0=config.name, config_id=config_id))
+                continue
+            count = _register_catalog(config_id, config)
+            total_registered += count
+            logger.info(t("log.mcp.registration_tools_total", p0=config.name, count=count))
 
-    total_registered = 0
-    for config_id, config in enabled_configs:
-        logger.info(t("log.mcp.registering_server_config", p0=config.name, config_id=config_id))
-        count = await _register_mcp_server(config_id, config)
-        total_registered += count
-        logger.info(t("log.mcp.registration_tools_total", p0=config.name, count=count))
+        logger.info(t("log.mcp.tools_registered_total", total_registered=total_registered))
 
-    logger.info(t("log.mcp.tools_registered_total", total_registered=total_registered))
+    await _sync_tool_index()
 
 
 async def shutdown_mcp_clients() -> None:

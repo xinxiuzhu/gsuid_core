@@ -20,11 +20,17 @@ self_model 结构（存于 state_store）::
 """
 
 import re
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
+from datetime import datetime, timezone
 
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
 from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+from gsuid_core.ai_core.memory.relative_schedule import (
+    preference_written_on,
+    one_off_schedule_expired,
+    looks_like_one_off_relative_schedule,
+)
 
 if TYPE_CHECKING:
     from gsuid_core.ai_core.relationship import RelationshipView
@@ -40,6 +46,7 @@ _FIELDS = ("commitments", "preferences_learned", "recurring_topics", "self_notes
 _ONTOLOGY_FIELD = "self_ontology"
 # 笔记里点名的用户。短数字（日期、版本）不算。
 _PINNED_SPEAKER_RE = re.compile(r"\d{5,}|[0-9A-Fa-f]{16,}")
+_USER_MENTION_RE = re.compile(r"(?:用户ID[:：\s]*|用户[:：\s]*)([a-zA-Z0-9_\-]+)")
 # 主人自述槽，不跟纠错规则抢本轮名额。
 _STANDING_PREF_CONTEXTS = frozenset({"location", "possession"})
 
@@ -51,12 +58,7 @@ def default_self_ontology() -> str:
     aliases = [str(a) for a in raw] if isinstance(raw, list) and raw else ["GsCore", "gsuid_core"]
     names = "、".join(aliases) if aliases else "GsCore、gsuid_core"
     return (
-        f"- 「{names}」是承载我的宿主框架。"
-        "群友讨论这些名字 = 在讨论我的宿主。可以搭话，"
-        "必须用角色卡里的世界观转述，禁止用开发者口吻介绍架构。\n"
-        "- 「插件」是我可调用的能力；「更新/重启」= 我暂时离线。\n"
-        "- 群里的 bot 统计（DAU/消息量/留存）可能是在统计我这类角色。\n"
-        "- 配置里的 masters = 最高信任关系的人（如何称呼以角色卡为准）。"
+        f"- 「{names}」是宿主框架；被提起时用角色口吻转述，禁技术腔介绍架构。\n- 「插件」是能力，masters 为最高信任。"
     )
 
 
@@ -67,10 +69,23 @@ async def ensure_self_ontology(bot_id: str) -> str:
     raw = await state_get_value(_self_scope(bot_id), _SELF_MODEL_KEY)
     if isinstance(raw, dict) and _ONTOLOGY_FIELD in raw:
         val = raw[_ONTOLOGY_FIELD]
+        text_val = ""
         if isinstance(val, str) and val.strip():
-            return val.strip()
-        if isinstance(val, list) and val and isinstance(val[0], str) and val[0].strip():
-            return val[0].strip()
+            text_val = val.strip()
+        elif isinstance(val, list) and val and isinstance(val[0], str) and val[0].strip():
+            text_val = val[0].strip()
+        if text_val:
+            # 旧版冗长模板自动换成紧凑版
+            if "群友讨论这些名字" in text_val or "群里的 bot 统计" in text_val:
+                text_val = default_self_ontology()
+
+                def _mutate_refresh(current: Any) -> Dict[str, object]:
+                    model = _self_model_state(current)
+                    model[_ONTOLOGY_FIELD] = text_val
+                    return model
+
+                await state_mutate(_self_scope(bot_id), _SELF_MODEL_KEY, _mutate_refresh)
+            return text_val
     text = default_self_ontology()
 
     def _mutate(current: Any) -> Dict[str, object]:
@@ -149,9 +164,7 @@ async def add_self_note(
         return False
     content = content[:_MAX_NOTE_CHARS]
 
-    # 写入闸（防注入持久化）：「立持久说话规矩」（"以后每句加xx/结尾带xx/换风格说话"）
-    # 是漂移攻击的典型载荷——存进 bot 级 self_model 会让单轮防住的攻击跨会话、跨用户
-    # 永久生效（实测已发生：uwu 风格要求被记成了"学到的偏好"）。判据复用 C-2 结构判据。
+    # 写入安全闸：拦截修改全局说话规矩的注入攻击，防止持久化污染自我模型。
     from gsuid_core.ai_core.interaction_scaffold import is_persistent_style_rule
 
     if field == "preferences_learned" and is_persistent_style_rule(content):
@@ -368,9 +381,7 @@ async def build_self_cognition_context(
         lines.append(f"我的承诺: {'；'.join(model['commitments'][-5:])}")
     # 学到的偏好按当前说话人放在 user 尾，不进共享 system（换人会打掉前缀缓存）。
 
-    # recurring_topics：先尝试用本 scope 的 group_profile 累计 tag 实时计算
-    # （由 memory.ingestion.worker._ingest_batch 中的 record_entity_tags 维护），
-    # 拿不到再退回静态 self_model.recurring_topics（人工 / 离线写入的兜底）。
+    # recurring_topics：优先使用群画像累计标签，缺失时回退至静态配置。
     live_topics = await _compute_live_recurring_topics(scope_key) if scope_key else []
     # 过滤掉作为"话题"误注入的 schema 类型标签（Person/Game/Product… 不是话题）
     _SCHEMA_TAGS = {"Person", "Game", "Character", "Event", "Product", "Organization", "Location"}
@@ -395,6 +406,8 @@ async def build_self_cognition_context(
 def note_applies_to_speaker(note: str, speaker_id: str) -> bool:
     """没点名的笔记人人可见；点了用户 ID 的只给那个人。"""
     pinned = set(_PINNED_SPEAKER_RE.findall(note))
+    for m in _USER_MENTION_RE.finditer(note):
+        pinned.add(m.group(1))
     if not pinned:
         return True
     return speaker_id in pinned
@@ -402,7 +415,7 @@ def note_applies_to_speaker(note: str, speaker_id: str) -> bool:
 
 def collect_speaker_preference_rules(
     notes: list[str],
-    scoped_rules: list[tuple[str, str, bool]],
+    scoped_rules: Sequence[tuple[str, str, bool] | tuple[str, str, bool, Optional[datetime]]],
     speaker_id: str,
     *,
     limit: int,
@@ -415,7 +428,7 @@ def collect_speaker_preference_rules(
         body = text.strip()
         if not body or len(out) >= limit:
             return
-        key = body.lower().replace(" ", "")
+        key = body.lower().replace(" ", "").rstrip("。，.,!！")
         if key in seen:
             return
         seen.add(key)
@@ -428,9 +441,21 @@ def collect_speaker_preference_rules(
             item[0],
         ),
     )
-    for ctx, rule, _corr in ranked:
+    now = datetime.now(timezone.utc)
+    for item in ranked:
+        ctx = item[0]
+        rule = item[1]
+        created_at: datetime | None = item[3] if len(item) > 3 else None
         tag = f"{ctx}：" if ctx and ctx != "general" else ""
-        push(f"{tag}{rule}" if tag else rule)
+        date_prefix = f"[{preference_written_on(created_at)}] " if created_at is not None else ""
+        exp_tag = ""
+        if (
+            created_at is not None
+            and looks_like_one_off_relative_schedule(rule)
+            and one_off_schedule_expired(created_at, now=now)
+        ):
+            exp_tag = "（已过期日程）"
+        push(f"{date_prefix}{tag}{rule}{exp_tag}" if (tag or date_prefix or exp_tag) else rule)
     for note in notes:
         if note_applies_to_speaker(note, speaker_id):
             push(note)
@@ -457,7 +482,7 @@ async def load_speaker_preference_tail(bot_id: str, speaker_id: str) -> str:
     from gsuid_core.ai_core.memory.config import memory_config
 
     model = await get_self_model(bot_id)
-    scoped: list[tuple[str, str, bool]] = []
+    scoped: list[tuple[str, str, bool, Optional[datetime]]] = []
     if memory_config.enable_preference_memory:
         from gsuid_core.ai_core.memory.database.models import AIMemPreference
 
@@ -476,7 +501,7 @@ async def load_speaker_preference_tail(bot_id: str, speaker_id: str) -> str:
                 continue
             seen_ids.add(row.id)
             merged.append(row)
-        scoped = [(row.target_context, row.preference_rule, row.is_correction) for row in merged]
+        scoped = [(row.target_context, row.preference_rule, row.is_correction, row.created_at) for row in merged]
     rules = collect_speaker_preference_rules(
         model["preferences_learned"],
         scoped,

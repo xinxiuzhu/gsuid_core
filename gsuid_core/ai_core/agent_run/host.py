@@ -7,6 +7,7 @@ from asyncio import Event as AsyncEvent
 from datetime import datetime
 
 from pydantic_ai.messages import UserContent, ModelMessage
+from pydantic_ai.settings import ThinkingLevel
 
 from gsuid_core.bot import Bot
 from gsuid_core.models import Event
@@ -43,6 +44,7 @@ class RunOnceHost:
     dynamic_tools: bool | None
     wall_clock_budget: float | None
     capability_node_id: str
+    thinking: ThinkingLevel | None
     turn_clock: datetime | None
     _session_logger: AISessionLogger
     _run_sent_texts: set[str]
@@ -58,6 +60,7 @@ class RunOnceHost:
     _cancel_generation: AsyncEvent
     _history_iter_active: bool
     _consecutive_no_tool_rounds: int
+    _unmet_tool_promise: bool
     _last_drift_push_count: int
     _recent_tool_families: dict[str, int]
     _recent_user_texts: list[str]

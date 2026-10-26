@@ -16,10 +16,7 @@ ENABLE_PROGRESSIVE_TOOLS = True
 # 分类器会误判闲聊，工具装配不能因 intent=闲聊 砍召回。
 _PROGRESSIVE_TOOLS_SKIP_INTENTS = ("闲聊",)
 
-# 工具自动装配白名单：仅列表内 create_by 未显式传 tools 时走向量检索装配。
-# CapabilityAgent 自带显式 tools 故排除（见 runner.py）。
-# ScheduledTask_Exec（scheduled_task/executor.py 的定时任务执行体）必须在列：
-# 否则装配层跳过它，定时任务代理拿不到任何工具只能空手而归（实测踩坑）。
+# 工具自动装配白名单：列表内的 create_by 未显式传参时执行向量装配。
 _AGENTIC_CREATE_BY = ("SubAgent", "Chat", "Agent", "AutoPlanner", "ScheduledTask_Exec")
 
 # skills_toolset 挂载白名单：agentic + CapabilityAgent
@@ -40,6 +37,6 @@ _CONTENT_REJECT_CODES = ("1026",)
 # 这个重试必然复现，需要熔断而不是退避重试。判定见 quota_guard.classify_provider_error。
 ERROR_QUOTA_EXHAUSTED = "模型套餐用量已达上限"
 
-# O-A 群聊队头阻塞防护：交互式回复在 _run_lock 上排队超过此秒数（话题大概率已翻篇）
-# 则丢弃本次回复，避免对早已结束的话题"过期答复"。仅作用于 create_by=="Chat" 的主对话。
+# O-A 私聊队头阻塞防护：Chat 在 _run_lock / 全局闸上排队超过此秒数则丢弃。
+# 群/频道共享 session 不丢（后到说话人只是等锁）；框架回灌永不丢。
 STALE_CHAT_REQUEST_TTL = 8.0

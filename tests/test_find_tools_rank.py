@@ -182,6 +182,8 @@ def test_orchestration_prompt_follows_tier_order() -> None:
     assert "优先 create_subagent" not in TOOL_ORCHESTRATION_CONSTRAINTS
     assert "零调用禁止说做不到" in TOOL_ORCHESTRATION_CONSTRAINTS
     assert "列表没有对口工具先 `find_tools`" in TOOL_ORCHESTRATION_CONSTRAINTS
+    assert "run_code" in TOOL_ORCHESTRATION_CONSTRAINTS
+    assert "只查不写" in TOOL_ORCHESTRATION_CONSTRAINTS
 
 
 class _FakeTool:
@@ -253,6 +255,101 @@ def test_find_tools_matrix_need_loads_plugin_not_research() -> None:
     assert "memory_curator" not in out
     assert "有专用项时禁止选通用项" in out
     assert "send_waves_matrix_info" in ctx.deps.dynamic_tool_names
+
+
+def test_find_tools_alias_lock_rejects_other_plugin_and_unlocks_folded_tool() -> None:
+    """need 写成别的游戏时，锁定插件的 exclusive 工具仍可调用，对方代理不出现。"""
+    from gsuid_core.ai_core.entity_index import ALIAS_ROUTE_TEXT_KEY, ALIAS_PLUGIN_EXTRA_KEY
+    from gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery import find_tools
+
+    waves = _FakeTool("send_waves_wiki")
+    kb = _FakeTool("search_genshin_kb")
+
+    async def fake_search(**_kwargs: object) -> list[_FakeTool]:
+        return [waves]
+
+    async def fake_align(found: list[_FakeTool], plugin: str, query: str, scope: object = None) -> list[_FakeTool]:
+        assert plugin == "GenshinUID"
+        assert "风仙" in query
+        assert found == [waves]
+        return [kb]
+
+    def fake_find(name: str) -> SimpleNamespace | None:
+        if name == "send_waves_wiki":
+            return SimpleNamespace(
+                name=name,
+                category="by_trigger",
+                plugin="XutheringWavesUID",
+                hide_from_main=False,
+                covers=["鸣潮图鉴"],
+                description="鸣潮图鉴",
+                retrieval_text="send_waves_wiki 鸣潮图鉴",
+            )
+        if name == "search_genshin_kb":
+            return SimpleNamespace(
+                name=name,
+                category="common",
+                plugin="GenshinUID",
+                hide_from_main=False,
+                covers=["原神武器被动"],
+                description="检索原神知识库",
+                retrieval_text="search_genshin_kb 原神武器被动",
+            )
+        return None
+
+    class _OtherPlugin:
+        plugin = "XutheringWavesUID"
+
+    async def _empty_nodes(_need: str, *, limit: int = 5) -> list[str]:
+        return []
+
+    ctx = MagicMock()
+    ctx.deps = ToolContext(
+        extra={
+            EXPOSED_TOOLS_EXTRA_KEY: ["find_tools"],
+            ALIAS_PLUGIN_EXTRA_KEY: "GenshinUID",
+            ALIAS_ROUTE_TEXT_KEY: "风仙和沃雅妮莎都用什么武器比较好啊",
+        },
+        blocked_tool_names={"search_genshin_kb"},
+    )
+
+    async def _run() -> str:
+        with (
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery.search_tools_by_domain",
+                fake_search,
+            ),
+            patch("gsuid_core.ai_core.rag.tools.align_seeds_to_context_plugin", fake_align),
+            patch("gsuid_core.ai_core.register.find_tool_base", fake_find),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery._matched_capability_node_ids",
+                _empty_nodes,
+            ),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery.nodes_with_keyword_hit",
+                lambda _need: ["wuwa_agent"],
+            ),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery._node_on_topic",
+                lambda _need, node_id: node_id == "wuwa_agent",
+            ),
+            patch(
+                "gsuid_core.ai_core.agent_node.get_node",
+                lambda node_id: _OtherPlugin() if node_id == "wuwa_agent" else None,
+            ),
+            patch(
+                "gsuid_core.ai_core.agent_node.registry.owning_nodes_of_tools",
+                lambda _names: {},
+            ),
+        ):
+            return await find_tools(ctx, "查询鸣潮角色（风仙、沃雅妮莎）的武器推荐与配装数据")
+
+    out = asyncio.run(_run())
+    assert "search_genshin_kb" in out
+    assert "send_waves_wiki" not in out
+    assert "wuwa_agent" not in out
+    assert "search_genshin_kb" in ctx.deps.dynamic_tool_names
+    assert "search_genshin_kb" in ctx.deps.alias_callable_tools
 
 
 def _countdown_tb() -> SimpleNamespace:
@@ -597,6 +694,107 @@ def test_find_tools_unrelated_exclusive_fold_keeps_generic() -> None:
     assert "render_agent" not in out
     assert "research_agent" in out
     assert "有专用项时禁止选通用项" not in out
+
+
+def _mcp_row(name: str, plugin: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name,
+        category="mcp",
+        plugin=plugin,
+        hide_from_main=False,
+        covers=[],
+        description="[MCP:amp-weather] 查询中国城市天气",
+        retrieval_text=f"{name} [MCP:amp-weather] 查询中国城市天气",
+        tool=_FakeTool(name),
+    )
+
+
+def _ask_find_tools(
+    need: str,
+    registry: dict[str, SimpleNamespace],
+    *,
+    search_error: bool = False,
+) -> tuple[str, set[str]]:
+    from gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery import find_tools
+
+    async def fake_search(**_kwargs: object) -> list[_FakeTool]:
+        if search_error:
+            raise RuntimeError("rag off")
+        return []
+
+    async def fake_matched(_need: str, *, limit: int = 5) -> list[str]:
+        return ["research_agent"]
+
+    def fake_find(name: str) -> SimpleNamespace | None:
+        if name in registry:
+            return registry[name]
+        return None
+
+    def fake_node_hit(node_id: str, score: float) -> RankedHit | None:
+        if node_id == "research_agent":
+            return RankedHit(name="research_agent", label="多步外部资料收集", score=score)
+        return None
+
+    ctx = MagicMock()
+    ctx.deps = ToolContext(extra={EXPOSED_TOOLS_EXTRA_KEY: []}, blocked_tool_names=set())
+
+    async def _run() -> str:
+        with (
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery.search_tools_by_domain",
+                fake_search,
+            ),
+            patch("gsuid_core.ai_core.register.get_all_tools", lambda: registry),
+            patch("gsuid_core.ai_core.register.find_tool_base", fake_find),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery._matched_capability_node_ids",
+                fake_matched,
+            ),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery.nodes_with_keyword_hit",
+                lambda _n: [],
+            ),
+            patch(
+                "gsuid_core.ai_core.buildin_tools.dynamic_tool_discovery._node_hit",
+                fake_node_hit,
+            ),
+        ):
+            return await find_tools(ctx, need)
+
+    out = asyncio.run(_run())
+    names = ctx.deps.dynamic_tool_names
+    assert isinstance(names, set)
+    return out, names
+
+
+def test_find_tools_pins_mcp_name_when_vector_is_empty() -> None:
+    weather = _mcp_row("mcp_amp-weather_weather", "mcp_amp-weather")
+    registry = {weather.name: weather}
+    for need in ("mcp_amp-weather_weather", "mcp_amp-weather"):
+        out, names = _ask_find_tools(need, registry)
+        assert "mcp_amp-weather_weather" in out
+        assert "【专用工具】" in out
+        assert "research_agent" not in out
+        assert names == {"mcp_amp-weather_weather"}
+
+    out, names = _ask_find_tools("mcp_amp-weather_weather", registry, search_error=True)
+    assert "工具检索功能未启用" not in out
+    assert "mcp_amp-weather_weather" in out
+    assert "research_agent" not in out
+    assert names == {"mcp_amp-weather_weather"}
+
+
+def test_find_tools_does_not_pin_ambiguous_prefix_or_sentence() -> None:
+    weather = _mcp_row("mcp_amp-weather_weather", "mcp_amp-weather")
+    other = _mcp_row("mcp_other_ping", "mcp_other")
+    registry = {weather.name: weather, other.name: other}
+    for need in ("mcp", "查询广州最近天气的工具"):
+        out, names = _ask_find_tools(need, registry)
+        assert "mcp_amp-weather_weather" not in out
+        assert "mcp_other_ping" not in out
+        assert "research_agent" in out
+        assert "【专用工具】" not in out
+        assert names == set()
 
 
 def test_find_tools_gap_note_does_not_tell_model_to_give_up() -> None:

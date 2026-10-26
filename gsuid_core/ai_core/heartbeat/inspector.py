@@ -22,7 +22,12 @@ from gsuid_core.logger import logger
 from gsuid_core.models import Event
 from gsuid_core.message_history import get_history_manager
 from gsuid_core.ai_core.statistics import statistics_manager
-from gsuid_core.ai_core.persona.config import persona_config_manager, persona_should_inspect_session
+from gsuid_core.ai_core.persona.config import (
+    read_autonomy_runtime,
+    is_within_active_hours,
+    persona_config_manager,
+    persona_should_inspect_session,
+)
 from gsuid_core.ai_core.heartbeat.decision import run_heartbeat
 
 # 并发控制：最多同时进行 5 个 LLM 调用
@@ -41,6 +46,7 @@ class HeartbeatInspector:
         self._history_manager = get_history_manager()
         self._scheduled_jobs: dict[str, str] = {}  # persona_name -> job_id
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM_CALLS)
+        self._last_decision_human_sig: dict[str, str] = {}
 
     @property
     def is_running(self) -> bool:
@@ -140,10 +146,15 @@ class HeartbeatInspector:
 
     async def _inspect_all_sessions_for_persona(self, persona_name: str) -> None:
         """巡检所有与指定 persona 相关的会话"""
+        config = persona_config_manager.get_config(persona_name)
+        runtime = read_autonomy_runtime(config)
+        if not is_within_active_hours(list(runtime.active_hours), runtime.timezone):
+            logger.info(t("log.ai.active_hours_skip", persona_name=persona_name, kind="定时巡检"))
+            return
+
         logger.info(t("log.ai.heartbeat_persona_name_periodic_start_2", persona_name=persona_name))
 
         # 获取该 persona 配置的 target_groups
-        config = persona_config_manager.get_config(persona_name)
         scope = config.get_config("scope").data
         target_groups = config.get_config("target_groups").data
 
@@ -310,25 +321,39 @@ class HeartbeatInspector:
         if not user_id:
             return
 
-        # 3. 直接查会话的 persona 配置——**不通过 get_ai_session_by_id 创建主
-        #    GsCoreAIAgent**。run_heartbeat 只需要 persona_name，而旧路径会无
-        #    条件创建主 session + AISessionLogger，导致每个心跳触发都会留下一
-        #    个"只有 session_created + system_prompt 的 2-entry 空壳" 日志文件，
-        #    /api/ai/session_logs 看起来像一堆活跃但什么也没做的 session。
+        # 直接读取 persona 配置，避免无条件创建主 GsCoreAIAgent 产生空壳会话日志。
         session_id: str = event.session_id
         session_persona_name: Optional[str] = persona_config_manager.get_persona_for_session(session_id)
         if not session_persona_name:
             logger.debug(t("log.ai.heartbeat_session_event_persona", event=event))
             return
 
-        # 4. 决策阶段 (隐形 Sub-Agent)
-        # C8：从统一主动网关取出近窗口内的定时任务结果摘要，合并进决策语境，
-        # 让 AI 自然提及任务进展而非生硬另起一条播报。
+        # 决策阶段：从网关取近期定时任务摘要合并进决策语境。
         from gsuid_core.ai_core.heartbeat.dispatcher import get_dispatcher
 
         dispatcher = get_dispatcher()
         target_key = self._target_key(event, history)
         merge_ctx = dispatcher.peek_merge_context(target_key)
+
+        # 确定性前置：若无新人类发言且无待合并事件，跳过 LLM 决策
+        last_human = next((r for r in reversed(history) if r.role == "user"), None)
+        if last_human is None:
+            statistics_manager.record_heartbeat_decision(
+                group_id=group_id or "",
+                should_speak=False,
+            )
+            return
+
+        human_sig = f"{last_human.timestamp}:{last_human.user_id}:{len(history)}"
+        if self._last_decision_human_sig.get(target_key) == human_sig and not merge_ctx:
+            logger.debug(t("log.ai.heartbeat_session_history_unchanged_skip", target_key=target_key))
+            statistics_manager.record_heartbeat_decision(
+                group_id=group_id or "",
+                should_speak=False,
+            )
+            return
+        self._last_decision_human_sig[target_key] = human_sig
+
         meta = await run_heartbeat(
             event,
             history,

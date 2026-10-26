@@ -227,8 +227,10 @@ def main() -> int:
         extra=[
             cases_dir / "group_chat_expansion.yaml",
             cases_dir / "group_chat_prod_patterns.yaml",
+            cases_dir / "group_chat_voice_ooc.yaml",
             cases_dir / "cognition_hub_mixed.yaml",
             cases_dir / "speaker_slot_recall.yaml",
+            cases_dir / "run_code_fanout.yaml",
         ],
     )
     active = [c for c in cases if not c.get("needs_fixture")]

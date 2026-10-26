@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+
+import pytest
+
 
 def test_session_mute_lifecycle() -> None:
     from gsuid_core.ai_core.session_mute import (
@@ -71,6 +75,7 @@ def test_group_broadcast_is_not_directed_at_event_user() -> None:
     fill = "群通知：记录已完成"
     assert proactive_directed_target(ev, fill) == ""
     assert proactive_directed_target(ev, "@100000001 图给你了") == "100000001"
+    assert proactive_directed_target(ev, "[CQ:at,qq=100000001] 图给你了") == "100000001"
     assert proactive_directed_target(ev, "@user-42 图给你了") == "user-42"
     assert proactive_directed_target(ev, "@the 图给你了") == ""
     private = Event(
@@ -151,9 +156,191 @@ def test_delivery_ledger_unique_constraint_present() -> None:
     assert hasattr(DeliveryLedger, "release")
 
 
-def test_image_placeholder_keeps_topic_and_handle() -> None:
-    from gsuid_core.ai_core.outbound import format_outbound_image_placeholder
+def test_image_placeholder_keeps_topic_and_handle(monkeypatch) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
+    from gsuid_core.models import Event
+    from gsuid_core.ai_core.utils import prepare_content_payload
+    from gsuid_core.ai_core.outbound import (
+        QuoteResolve,
+        topic_from_extra,
+        remember_outbound_topic,
+        format_outbound_image_placeholder,
+    )
+    from gsuid_core.ai_core.agent_run.state import RunOnceState
+    from gsuid_core.ai_core.followup_window import (
+        _states,
+        note_hard_trigger,
+        in_followup_window,
+        revoke_fresh_hard_trigger,
+    )
+    from gsuid_core.ai_core.agent_run.settle import _has_unread_attachment
 
     assert format_outbound_image_placeholder("对照图A", "res_e82bab86168f").startswith("[图片·")
     assert "res_e82bab86168f" in format_outbound_image_placeholder("对照图A", "res_e82bab86168f")
     assert format_outbound_image_placeholder("", "") == "[图片]"
+
+    extra: dict[str, object] = {}
+    remember_outbound_topic(
+        extra,
+        "[框架·任务完成] 根任务: a416b1f81f84\n\n任务#1「珠海横琴+澳门三日游攻略与花费估算」已结束",
+    )
+    assert topic_from_extra(extra) == "珠海横琴+澳门三日游攻略"
+
+    extra_at: dict[str, object] = {}
+    remember_outbound_topic(extra_at, "@3230820675 珠海行程图给你画好了")
+    assert topic_from_extra(extra_at) == "珠海行程图给你画好了"
+
+    # 纯图引用：展开引用段落与归属行（换行分隔），且不触发「未读新附图」纠偏
+    ev = Event(
+        bot_id="onebot",
+        bot_self_id="self1",
+        user_type="group",
+        group_id="g1",
+        user_id="2281353706",
+        WS_BOT_ID="ws1",
+        is_tome=True,
+        reply="",
+        reply_id="998877",
+        text="我超",
+        raw_text="我超",
+        image_id_list=["img_quoted01"],
+    )
+    quote_line = "（被引用对象：你 23:25 发给 3230820675 的「珠海横琴+澳门三日游攻略」，句柄 res_36de5e7e129f）"
+    own_line = "（你刚把「珠海横琴+澳门三日游攻略」发给了 3230820675；本条来自别的群友，不是刚才那位）"
+
+    async def _fake_resolve(_ev: Event) -> QuoteResolve:
+        return QuoteResolve(
+            line=quote_line,
+            topic="珠海横琴+澳门三日游攻略",
+            handle="res_36de5e7e129f",
+            target="3230820675",
+        )
+
+    async def _fake_ownership(_ev: Event) -> str:
+        return own_line
+
+    monkeypatch.setattr("gsuid_core.ai_core.outbound.resolve_quote", _fake_resolve)
+    monkeypatch.setattr("gsuid_core.ai_core.outbound.ownership_hint", _fake_ownership)
+    monkeypatch.setattr(
+        "gsuid_core.ai_core.configs.ai_config.ai_config.get_config",
+        lambda _k: SimpleNamespace(data=False),
+    )
+    msgs, _ = asyncio.run(prepare_content_payload(ev, quoted_tome=True))
+    body = str(msgs[0])
+    assert f"--- 引用消息 ---\n[引用图片消息]\n{quote_line}\n{own_line}\n" in body
+    assert "--- 被引用消息图片ID: img_quoted01 ---" in body
+
+    st = RunOnceState(
+        user_message=msgs,
+        bot=None,
+        ev=ev,
+        rag_context="",
+        tools=[],
+        return_mode="by_bot",
+        output_type=None,
+        intent="闲聊",
+        has_active_task=False,
+        budget_gate=False,
+        suppress_intermediate_text=False,
+        fake_done_retry=False,
+        turn_graph=None,
+        cheap_gate=None,
+        is_framework_injection=False,
+    )
+    assert not _has_unread_attachment(st, video_readable=False)
+
+    # 引用触发若最终 <SILENCE>：撤销刚开启的单次续聊窗，已有多轮互动的窗保留
+    _states.clear()
+    note_hard_trigger("s_quote", "u_bystander", 300, 900)
+    assert in_followup_window("s_quote", "u_bystander", 300, 900)
+    revoke_fresh_hard_trigger("s_quote", "u_bystander")
+    assert not in_followup_window("s_quote", "u_bystander", 300, 900)
+
+    note_hard_trigger("s_multi", "u_active", 300, 900)
+    _states["s_multi::u_active"].burst_start -= 10.0
+    revoke_fresh_hard_trigger("s_multi", "u_active")
+    assert in_followup_window("s_multi", "u_active", 300, 900)
+    _states.clear()
+
+
+def test_emit_proactive_stores_rewritten_at_not_cq(monkeypatch: pytest.MonkeyPatch) -> None:
+    """主动消息写入审计和会话的是 @用户ID，不是 CQ 码。"""
+    from gsuid_core.bot import Bot
+    from gsuid_core.models import Event
+    from gsuid_core.ai_core.output_gate import GateResult, GateDecision
+    from gsuid_core.ai_core.session_logger import ProactiveSource
+    from gsuid_core.ai_core.proactive.emitter import emit_proactive_message
+
+    captured: dict[str, str] = {}
+
+    class _Disp:
+        def should_suppress_heartbeat(self, _key: str) -> bool:
+            return False
+
+        def register_send(self, _key: str, _source: str, _summary: str) -> None:
+            return None
+
+    async def fake_send(_bot: Bot, _message: str, **_kwargs: str | Event | dict[str, str] | None) -> None:
+        return None
+
+    async def fake_record(
+        *,
+        ev: Event | None,
+        session_id: str,
+        text: str,
+        image_id: str,
+        topic: str,
+        target_user: str,
+        target_name: str = "",
+    ) -> None:
+        captured["record"] = text
+        captured["target"] = target_user
+
+    async def fake_sync(
+        *,
+        event: Event,
+        message: str,
+        source: ProactiveSource,
+        trigger_reason: str,
+        generator_log_files: list[str],
+    ) -> None:
+        captured["sync"] = message
+
+    monkeypatch.setattr("gsuid_core.ai_core.proactive.emitter.send_chat_result", fake_send)
+    monkeypatch.setattr("gsuid_core.ai_core.outbound.record_outbound", fake_record)
+    monkeypatch.setattr("gsuid_core.ai_core.proactive.emitter._sync_to_main_session", fake_sync)
+    monkeypatch.setattr("gsuid_core.ai_core.proactive.emitter.get_dispatcher", lambda: _Disp())
+    monkeypatch.setattr(
+        "gsuid_core.ai_core.output_gate.pre_send_gate",
+        lambda *_a, **_k: GateResult(decision=GateDecision.ALLOW),
+    )
+    monkeypatch.setattr(
+        "gsuid_core.ai_core.persona.settings.persona_name_from_event",
+        lambda _ev: "",
+    )
+
+    ev = Event(
+        bot_id="onebot",
+        bot_self_id="self1",
+        user_type="group",
+        group_id="g1",
+        user_id="100000002",
+        WS_BOT_ID="ws1",
+    )
+    ok = asyncio.run(
+        emit_proactive_message(
+            ev,
+            "[CQ:at,qq=100000001] 到时间啦",
+            source="scheduled_task",
+            trigger_reason="test",
+            bot=Bot.__new__(Bot),
+            suppress_when_heartbeat_recent=False,
+        )
+    )
+    assert ok is True
+    assert "CQ:at" not in captured["record"]
+    assert "@100000001" in captured["record"]
+    assert captured["sync"] == captured["record"]
+    assert captured["target"] == "100000001"

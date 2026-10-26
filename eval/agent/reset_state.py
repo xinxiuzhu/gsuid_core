@@ -1,17 +1,26 @@
-"""评测前清副作用：取消 eval_ 定时任务，清空 eval_ 记忆与好感。
+"""评测前清副作用：取消评测定时任务，清空评测记忆与好感。
 
-不碰公共 RAG / 生产记忆。评测 user_id / group_id 带 eval_ 前缀。
+不碰公共 RAG / 生产记忆。评测 user_id / group_id 带 eval_ 前缀；
+用例正文里的说话人 ID（如「用户ID:1006」）只清 HTTP bot 下的好感与提醒。
 """
 
 from __future__ import annotations
 
+from typing import Sequence
+
 from sqlmodel import col
-from sqlalchemy import or_, delete, update
+from sqlalchemy import or_, and_, delete, update
+from sqlalchemy.orm import Mapped
 from sqlalchemy.engine import CursorResult
+from sqlalchemy.sql.elements import ColumnElement
 
 from gsuid_core.utils.database import base_models
 from gsuid_core.ai_core.database.models import UserFavorability
 from gsuid_core.ai_core.scheduled_task.models import AIScheduledTask
+
+# SQLite LIKE 里 _ 匹配任意一字。评测 id 的下划线要按字面量匹配。
+_EVAL_USER_LIKE = "eval\\_%"
+_EVAL_LIKE_ESCAPE = "\\"
 
 _EVAL_MEM_PREFIXES = (
     "group:eval_grp_",
@@ -19,24 +28,37 @@ _EVAL_MEM_PREFIXES = (
     "user_in_group:eval_",
 )
 
+# 不清的话说话人好感跨轮累积，掉进冷淡区后未 @ 的群消息会被开口门直接拦掉
+_EVAL_BOT_ID = "HTTP"
 
-async def reset_eval_side_effects() -> dict[str, int]:
-    """取消评测定时任务并清空评测记忆/好感。返回计数。"""
+
+def _eval_owned(user_id: Mapped[str], bot_id: Mapped[str], speakers: Sequence[str]) -> ColumnElement[bool]:
+    eval_user = user_id.like(_EVAL_USER_LIKE, escape=_EVAL_LIKE_ESCAPE)
+    if not speakers:
+        return eval_user
+    return or_(eval_user, and_(bot_id == _EVAL_BOT_ID, user_id.in_(speakers)))
+
+
+async def reset_eval_side_effects(fixture_speakers: Sequence[str] = ()) -> dict[str, int]:
+    """取消评测定时任务并清空评测记忆/好感。返回计数。
+
+    fixture_speakers：本次用例正文里出现的说话人 ID。
+    """
     await base_models.init_database()
     async with base_models.async_maker() as session:
         stmt = (
             update(AIScheduledTask)
             .where(
-                or_(
-                    col(AIScheduledTask.status).in_(("pending", "paused")),
-                    col(AIScheduledTask.user_id).like("eval_%"),
-                )
+                _eval_owned(col(AIScheduledTask.user_id), col(AIScheduledTask.bot_id), fixture_speakers),
+                col(AIScheduledTask.status).in_(("pending", "paused")),
             )
             .values(status="cancelled")
         )
         result = await session.execute(stmt)
         n_sched = result.rowcount if isinstance(result, CursorResult) else 0
-        fav_stmt = delete(UserFavorability).where(col(UserFavorability.user_id).like("eval_%"))
+        fav_stmt = delete(UserFavorability).where(
+            _eval_owned(col(UserFavorability.user_id), col(UserFavorability.bot_id), fixture_speakers)
+        )
         fav_result = await session.execute(fav_stmt)
         n_fav = fav_result.rowcount if isinstance(fav_result, CursorResult) else 0
         await session.commit()

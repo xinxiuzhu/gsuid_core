@@ -116,7 +116,7 @@ if TYPE_CHECKING:
     )
 
 # 主动消息来源枚举，供 webconsole 与前端复用
-ProactiveSource = Literal["heartbeat", "scheduled_task", "kanban", "tool"]
+ProactiveSource = Literal["heartbeat", "scheduled_task", "kanban", "tool", "autonomy"]
 
 # history_reset entry 的 data.reason（供前端区分色块），各 reason 语义见 log_history_reset：
 # user_clear=用户清空、persona_switch=人格热切换、auto_compact=Agent 自动裁剪超长历史。
@@ -136,12 +136,7 @@ class ProactiveEmissionPayload(TypedDict):
     generator_log_files: List[str]
 
 
-# linked_agents 中 agent_type 可选枚举值：
-# - "sub_agent"            原有：由本 Agent 创建的子 Agent
-# - "peer_agent"           预留：同级 / 对等 Agent
-# - "parent_agent"         预留：父 Agent
-# - "proactive_generator"  主动消息生成子 Agent（Heartbeat 决策 / 发言、
-#                          Kanban 转译、ScheduledTask 执行体等）
+# linked_agents 的 agent_type 枚举：子 Agent、对等 Agent、父 Agent 或主动消息生成体。
 LinkedAgentType = Literal["sub_agent", "peer_agent", "parent_agent", "proactive_generator"]
 
 # 会话窗口：同一 session_id 的日志在该时间窗口内续写同一文件，
@@ -152,9 +147,7 @@ SESSION_WINDOW_SECONDS: int = 3600  # 1 小时
 # （分段对用户不可见，见 docstring「逻辑会话链」）。2000 兼顾「一文件一会话」与单文件体积可控。
 MAX_ENTRIES_PER_FILE: int = 2000
 
-# 全部合法 entry 类型白名单。新增 entry 类型必须在此登记，
-# 否则 _add_entry 会记 warning（仍按统一结构落盘，不丢数据）。
-# 这是"绝不允许不规范格式"的强制点。
+# 合法 entry 类型白名单；未在此登记的类型在写入时将记录 warning。
 SESSION_ENTRY_TYPES: frozenset[str] = frozenset(
     {
         # 生命周期
@@ -170,6 +163,7 @@ SESSION_ENTRY_TYPES: frozenset[str] = frozenset(
         "system_injection",
         # 模型产出
         "thinking",
+        "thinking_effort",
         "text_output",
         # 工具
         "tool_call",
@@ -194,11 +188,7 @@ SESSION_ENTRY_TYPES: frozenset[str] = frozenset(
 )
 
 
-# ── base64 图片外置（见模块 docstring "图片外置规则"）──────────────────────
-# 匹配日志字符串里的 DataURI 图片：data:image/<subtype>;base64,<base64>
-# base64 段用 [A-Za-z0-9+/]+={0,2}，遇到引号/空白/中括号等非 base64 字符即停止，
-# 因此对 list 形式 user_message 的 repr（含 ImageUrl(url='data:image/...;base64,...')）
-# 同样适用——不会越界吞掉后面的内容。
+# 匹配日志字符串中的 DataURI 图片，并在遇到引号、空白等非 base64 字符处停止。
 _DATAURI_IMAGE_RE = re.compile(r"data:image/([A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/]+={0,2})")
 
 # MIME subtype → 文件扩展名（识别不出时统一用 .img）
@@ -348,14 +338,7 @@ class AISessionLogger:
         # 关联 Agent 列表（持久化 + 活跃状态），元素结构见 LinkedAgentRecord
         self.linked_agents: List[LinkedAgentRecord] = []
 
-        # ── 磁盘日志回放 / 会话窗口续写（非 subagent） ──
-        # 当主 session 被 AISessionRegistry 空闲清理后，主动消息（Heartbeat /
-        # ScheduledTask）通过 log_standalone_proactive 向磁盘日志文件追加了 entry。
-        # 用户下次搭话时 _get_or_create_ai_session 创建新的 GsCoreAIAgent +
-        # AISessionLogger，若不复用已有文件，就会产生两个独立日志文件（不同
-        # session_uuid），破坏"同一 session 所有日志在同一文件"的语义。因此对非
-        # subagent logger，初始化时按会话窗口（SESSION_WINDOW_SECONDS）检查磁盘上
-        # 是否已有同 session_id 且未超时的日志文件，有则回放续写；超时则滚动新文件。
+        # 磁盘日志回放：非 subagent 初始化时若存在窗口期内的未超时日志，则回放续写。
         resumed: Optional[SessionLogFileData] = None
         resumed_path: Optional[Path] = None
         if not is_subagent:
@@ -665,11 +648,17 @@ class AISessionLogger:
         tools_hash: str = "",
         system_hash: str = "",
         tools_diff: dict[str, list[str]] | None = None,
+        break_pos: int | None = None,
+        approx_tokens_before: int | None = None,
     ) -> None:
-        """记录本 run 相对上一 run 的前缀失配类别。"""
+        """记录本 run 相对上一 run 的前缀失配类别及中段失配位置。"""
         data: dict[str, object] = {"reason": reason, "tools_hash": tools_hash, "system_hash": system_hash}
         if tools_diff is not None:
             data["tools_diff"] = tools_diff
+        if break_pos is not None:
+            data["break_pos"] = break_pos
+        if approx_tokens_before is not None:
+            data["approx_tokens_before"] = approx_tokens_before
         self._add_entry("prefix_break", data)
 
     def log_outbound_audit(
@@ -731,6 +720,12 @@ class AISessionLogger:
                 return
         self._add_entry("thinking", {"content": content})
 
+    def log_request_thinking_effort(self, effort: str | None) -> None:
+        """记录这次请求 JSON 里的思考档位。没有该字段时 effort 为 None。"""
+        shown = "null" if effort is None else effort
+        logger.info(t("log.ai.gscore_request_thinking_effort", effort=shown))
+        self._add_entry("thinking_effort", {"effort": effort})
+
     def log_tool_call(self, tool_name: str, args: Any, tool_call_id: str) -> None:
         """记录工具调用请求。
 
@@ -778,18 +773,41 @@ class AISessionLogger:
         self._add_entry("text_output", {"content": content})
 
     def log_task_ack(self, content: str, *, source: str) -> None:
-        """记录框架补发的接任务应（persona.json 配置句）。"""
+        """记录 create_subagent 代发的开场句（模型自己写的台词，框架不代写）。"""
         self._add_entry("task_ack", {"content": content, "source": source})
 
-    def log_result(self, output: Any, tool_calls: List[str]) -> None:
+    def log_result(
+        self,
+        output: Any,
+        tool_calls: List[str],
+        *,
+        silence_reason: Optional[str] = None,
+    ) -> None:
         """记录单次 run 的最终结果"""
-        self._add_entry(
-            "result",
-            {
-                "output": str(output),
-                "tool_calls": tool_calls,
-            },
-        )
+        out_str = str(output).strip()
+        from gsuid_core.ai_core.utils import is_silence_marker
+
+        if is_silence_marker(out_str) or not out_str:
+            self._add_entry(
+                "result",
+                {
+                    "output": str(output),
+                    "tool_calls": tool_calls,
+                    "silence_reason": silence_reason or "model_voluntary",
+                },
+            )
+            return
+        if silence_reason is not None:
+            self._add_entry(
+                "result",
+                {
+                    "output": str(output),
+                    "tool_calls": tool_calls,
+                    "silence_reason": silence_reason,
+                },
+            )
+            return
+        self._add_entry("result", {"output": str(output), "tool_calls": tool_calls})
 
     def log_error(self, error_type: str, message: str) -> None:
         """记录错误信息"""

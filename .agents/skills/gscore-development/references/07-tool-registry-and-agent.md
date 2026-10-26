@@ -43,16 +43,35 @@ async def my_tool(ctx: RunContext[ToolContext], ...) -> str: ...
 > **工具健康度（2026-08）**：包装层对连续 `❌` 开头返回 / 超时记账；达阈值临时冻结执行
 > （schema 仍可见，避免装配抖动）。`⚠️` 软失败**不**记入连败（防业务校验冻死工具）。
 
+## 7.1b `run_code`（Monty）
+
+`buildin_tools/run_code.py` 让模型写一段 Python。Core 进程拥有 1～2 个 Monty
+worker 子进程，脚本在那些 worker 里跑，不在 Core 的 Python 解释器里 `exec`。
+没人调用过就不启动；关机钩子关掉 worker。通道核和 `task_basics` 都挂这个名字，
+所以主人格和能力代理每一轮都看得到。
+
+沙箱里能 `await` 的名字必须同时满足：本轮已暴露、`ToolBase.code_callable is True`、
+没被 `blocked_tool_names` 或人格工具范围拿掉。`code_callable` 默认 True，插件只读
+工具不用声明。框架把发消息、写入、委派、改状态、装技能、跑命令标成 `False`。
+插件写工具同样要显式 `code_callable=False`。`run_code` 自己不能被嵌套 await。
+系统提示和本工具 brief/docstring 都写：代码里只查不写，发消息和写入在代码外直调。
+
+宿主调用仍进原工具包装，并记进 session log（`tool_call_id` 前缀 `mc_`）。
+脚本的中间值不进模型上下文；交回的是最后一行表达式，`print` 不交回。
+单次上限约 128 次宿主调用、16MB 堆、沙箱自己的执行时间 3 秒（等待宿主时不计）。
+整段脚本墙钟 230 秒；到点会取消还在跑的宿主回调（搜索 / 抓页的包装函数体一并停）。
+不挂文件系统，不开网络。一个 worker 崩溃只丢掉这一次脚本，池子自己换掉它。
+
 ## 7.2 工具分类（category）与加载方式
 
 | 分类 | 加载方式 | 典型工具 |
 |------|----------|----------|
-| `self` | 仅主 Agent 可执行；**不一定进通道核** | `send_message_by_ai`、`send_meme`；`add_once_task`/`add_interval_task` 钉核，列出/改/删走 L2 或检索（白名单拦插件滥用 `self`） |
+| `self` | 仅主 Agent 可执行；**不一定进通道核** | `send_message_by_ai`；`add_once_task`/`add_interval_task` 钉核，列出/改/删走 L2 或检索（白名单拦插件滥用 `self`） |
 | `buildin` | 可检索；核内只留通道能力 | 核：`search_cognition`、`read_handle`。`web_search_tool` / `get_self_info` / `state_*` 按需 |
 | `common` | 向量检索按需 | `create_subagent`、`collect_meme`、Kanban 管理类、`state_list`/`state_delete`/`state_append`。`search_image`/`search_meme`/`list_persisted_outputs`/`grep_persisted_outputs`/`artifact_get` 对主人格 `visible_to_capability_only`（回想走 `search_cognition`，深读走 `read_handle`） |
 | `media` | 向量检索按需；**主人格 exclusive 剥离** | `render_html_to_image`、`render_card`、`render_markdown_to_image`、**`render_chart_spec`**（声明式 SVG 图表；由 **`render_agent`** 白名单持有） |
 | `by_trigger` | 向量检索按需 | 插件 `to_ai` 自动注册的触发器工具 |
-| `mcp` | 启动注册 + 向量检索按需 | 用户配置的 MCP 服务器工具 |
+| `mcp` | 启动按已保存清单注册，不连接；注册、注销、重载后用完整注册表同步向量。`find_tools` 的 `need` 等于工具名或插件名时直接挂上 | `mcp_{server}_{tool}`，插件名 `mcp_{server}` |
 | `default` | **子 Agent 专属**（`create_subagent` 调） | 文件读写、`execute_file`、`execute_shell_command`、`_get_current_date` |
 | `meta` | **不被向量检索**，由 gs_agent 按门控显式注入 | `find_tools`（见 §7.5） |
 
@@ -180,6 +199,10 @@ def get_registered_tools() -> Dict[str, Dict[str, ToolBase]]: ...  # 按分类
    0. **始终检索**，禁止因「列表已有专用工具」提前 return。已暴露且 covers/retrieval
       真正命中的专用工具并入分档回执（提醒直调），短 cover（不足 3 字）不算命中。
       **禁止**同域立刻 return（`n in hay or hay in n` 已删）；中文另用 ≥4 字窗口。
+      `need` 等于已注册工具名或插件名时，从注册表直接挂上，并跳过词面过滤。
+      工具名前缀只在全部命中属于同一插件、且 `need` 以该插件名开头时挂上。
+      含空白的句子不按标识符挂。短前缀打到多个插件时不挂。
+      向量检索报未启用时，已经按名字挂上的工具仍进入分档。
    1. 向量召族 + 节点匹配，代码分层后一组回执。exclusive 工具折叠成所属专用能力，不回灌主人格。
       折叠所属节点同样过对口检查。
    2. 通用节点（research / memory_curator / internal_reporter / scheduler）不得压过插件专用工具。
@@ -221,12 +244,10 @@ step2  RetrievableToolset 读集合 → get_weather 本步"出现"并可调用
 `prepare` 每个 step 对每个工具求值，返回 `None` 即本步对模型隐藏（schema 都不下发）。判定
 抛异常时**默认可见**。
 
-```python
-# 通用谓词集中在 buildin_tools/visibility.py，管理员专属工具共用 visible_to_admin
-# （execute_shell_command / install_skill 等，2026-07 抽出，勿再各自复制实现）：
-# - 后台/能力代理（无 ev）→ True 不隐藏，交 check_func 执行期兜底（避免误伤能力代理）
-# - 交互式用户 → 仅管理员（ev.user_pm == 0）可见
-```
+通用谓词集中在 `buildin_tools/visibility.py`，管理员专属工具共用 `visible_to_admin`（例如 `execute_shell_command`、`install_skill`）：
+- **后台与能力代理（无 ev）**：返回 `True` 不隐藏，由 `check_func` 执行期兜底。
+- **交互式用户**：仅管理员（`ev.user_pm == 0`）可见。
+
 
 | 机制 | 阶段 | 作用 |
 |------|------|------|
@@ -309,16 +330,20 @@ AI 调用时：
 
 ## 7.9 MCP 工具集成（`ai_core/mcp/`）
 
-启动时（`mcp/startup.py`）读 `data/ai_core/mcp_configs/*.json` 中 `enabled=true` 的配置 → 连
-MCP 服务器（fastmcp，stdio）→ `list_tools()` → 为每个工具动态建包装函数（解析 input_schema
-生成签名、注入 `RunContext[ToolContext]`）→ 注册到 `_TOOL_REGISTRY["mcp"]`（仅当
-`register_as_ai_tools=true`）。工具命名 `mcp_{server}_{tool}` 避免冲突。
+RAG 的 `sync_tools` 在 MCP 注册之前跑完。启动时 `register_all_mcp_tools` 读
+`enabled=true` 且已保存工具清单的配置，不调用 `list_tools`、不连接服务器，注册到
+`_TOOL_REGISTRY["mcp"]` 之后，用 `get_all_tools()` 的完整结果再同步一次向量库。
+控制台单独注册先摘掉该服务器的旧工具，再连接并 `list_tools`，最后在 `finally` 里同步一次。
+禁用、删除、注销走 `unregister_mcp_server`，摘掉后再同步一次。重新加载先清空 `mcp` 分类，
+再调用 `register_all_mcp_tools`；启用列表为空也同步，否则卸掉的 MCP 点会留到下次启动。
+工具名是 `mcp_{server}_{tool}`，插件名是 `mcp_{server}`。`find_tools` 的 `need` 等于工具名
+或该插件名时，向量库没有这个点也从注册表挂上。只把 MCP 工具传给 `sync_tools` 会删掉其它工具的向量。
 
 - **MCP 工具 ID 格式**：`{mcp_id} - {tool_name}`（如 `minimax - web_search`），用
   `parse_mcp_tool_id` / `format_mcp_tool_id` 解析组装。
 - **通用调用**：`mcp_tool_caller.call_mcp_tool(mcp_tool_id, arguments)` 不需注册为 AI 工具即可
   调；Web Search / Image Understand 走它。
-- **热重载**：`POST /api/ai/mcp/reload` 清掉已注册 MCP 工具、重读配置、重连重注册，无需重启。
+- **热重载**：`POST /api/ai/mcp/reload` 清掉已注册 MCP 工具、重读配置、按已保存清单重注册并同步向量库。不连接服务器。
 - **MCP Server**（`mcp/server.py`）：反向把 **`_TOOL_REGISTRY` 启动快照**对外暴露；默认挂载
   主服务 **`/api/mcp`**（Streamable HTTP，与 8765 同端口），或 stdio。鉴权：
   静态 key 与/或插件钩子（**框架不 import 任何插件**；二者均空时为开发用开放模式）。
@@ -423,22 +448,30 @@ grant / 自动提交审批），不依赖 LLM 自觉。详见
 
 **出图在途（2026-08-16）**：`create_subagent` 的 `agent_profile` 解析到 `render_agent` 时
 （只看 profile 字段），ToolCall 当下即 `silence_only`。失败且未 ack 则回滚。在途默认
-`<SILENCE>`。开场接任务应一句必须出站（**不按 12 字**，对齐人格 `speech_len_hard`；
-编排词/过程动词/长结构仍拦）；之后默认静默。清单/念白/第二执行者不占额度。
+`<SILENCE>`。开场句一句（**不按 12 字**，对齐人格 `speech_len_hard`；编排词/过程动词/
+长结构仍拦）由 `create_subagent` 代发，见下文「委派开场句」；之后默认静默。
+清单/念白/第二执行者不占额度。
 群聊折叠卡无 `inline_head`，长委派回执同样折成卡。
-**出站槽（2026-08-26）**：按本 run 是否含**函数** ToolCall 分槽。委派/出图等重工具首次至多一条
-TextPart（接任务应，仍过 `pre_send_gate` / `should_block`；**过不了闸不得占槽**）。点名/跟进/
-私聊/HTTP 且本响应含重工具：模型没写合格短应则发 `persona.json` 的 `task_ack`（空则不补）。
-轻工具同包若已是合格接任务应可出站。零工具/未点名不补。
-其后切工具静默，无 ToolCall 终局开口。hosted 搜索不当函数工具。
-交互主人格 `create_subagent(..., transient=true)` 会被忽略（lookup 白名单除外），改走看板后台。
+**一轮只说一句（2026-10-15）**：带**函数** ToolCall 的回复里，文字一律不由主循环发送，
+记 unsent，从 `new_messages` 尾部剥掉。工具结果回来后，无 ToolCall 的回复才开口。
+hosted 搜索不当函数工具。闲聊可以先 `search_cognition` 再答，用户只看到结果后的那一句。
+**委派开场句**：重任务例外，开工前先应一声。loop 在 CallToolsNode 用
+`agent_run/opening_line.arm_opening_line` 暂存同一次回复里的第一段文字（只在真人发起的
+交互主人格轮、本轮还没开口时）。`create_subagent` 派发成功、`kick_root` 之后调
+`release_opening_line`：过 `should_block`（silence_only 首句额度）与 `tool_gate_feedback`，
+通过才经 `send_chat_result` 发出，记进 `run_sent_texts`。槽被第一个调用取走，并列的第二个
+`create_subagent` 拿不到；校验被拒的派发不开口。回执 `format_deferred_subagent_ack` 写明
+「开场句已发：……，只输出 <SILENCE>」；没写或被闸拦时改为允许当前人格补一句，
+`PENDING_DELEGATION_HOLD` 换成 `PENDING_DELEGATION_OPENING`。下一次 ModelRequestNode 由
+`_absorb_opening_line` 记账（`main_channel_sends` / `wait_comfort_sent`）。
+框架不代写开场句：`persona.json` 的 `task_ack` 与 `ModelRetry` 打回重写都已删除。
+return 模式（网页对话 / 评测）只记账不经 bot 发送。轻工具（回想 / 网页检索）不开口。
+交互主人格 `create_subagent(..., transient=true)` 会被忽略（lookup 白名单除外），改走看板后台；
+transient 同步路径不发开场句。
 **委派并列（2026-09-25）**：同一次模型回复里的多个 `create_subagent` 由运行时一起开工。
 框架不会把一条任务自动拆成多次调用；模型没在这一次里并列发出的，deferred 回执之后
 同 run 再补会被挡住，等回灌再决定自己答还是 `render_agent`。
-**接任务应**：委派前若模型没写短句，且人格配置了 `task_ack`，发那一句再执行工具。
-空则不代说，把本批工具打回，由模型用当前人格写一句再调。
-HTTP SSE 的 `: ping` 不是接任务应。只有图、模型没写字时直接出 attachment，不补固定台词。
-unsent 从 `new_messages` 尾部剥掉。
+HTTP SSE 的 `: ping` 不是开场句。只有图、模型没写字时直接出 attachment，不补固定台词。
 
 **状态**：仅 `ToolContext.extra["output_gate"]` → 类型化 `GateBag`（会话重启即丢，无旧键）。
 
@@ -488,13 +521,14 @@ unsent 从 `new_messages` 尾部剥掉。
 > ⚠️ 这是**兜底网**；根因（`create_subagent` 双份播报 + 回执诱导偷懒）已在 §8 从源头修（回执改成
 > "请你转述给用户"、executor 对交互式派发静默），修好后本网极少触发。
 
-> 🖼️ **长 markdown 整篇出图**（2026-07-15 新增，配置 `render_long_markdown_as_image`，默认开）。
+> 🖼️ **长 markdown 整篇出图**（2026-07-15 新增，配置 `render_long_markdown_as_image`，默认关）。
 > 空行拆条本是人格"连发 2-3 条短消息"的能力，但 agent 的长研报 / 报告（多标题 + 表格 +
 > 分隔线）会被拆成**几十条刷屏**，且 IM 不渲染 markdown、满屏字面 `**` / `|` 极难看。
-> `send_chat_result` 在拆条前先判定：命中"结构化长 markdown"就用 `render_md_to_bytes` 把
-> **整篇**（用未剥 markdown 的 `md_source`，不是被 `_strip_persona_markdown` 毁过的 `clean_text`）
-> 渲染成一张图片下发，替代拆条；渲染失败**优雅降级**回拆条。判定**刻意保守**（`_should_render_markdown_image`）：
-> 须够长（`markdown_image_min_chars`，默认 210）+ 拆分后 ≥3 段 + 含明确结构信号——**表格 / ≥2 个
+> `send_chat_result` 在拆条前先判定：命中"结构化长 markdown"且当前人格启用了 `render_agent`
+> 时，把未剥 markdown 的 `md_source` 交给 `render_agent` 出一张信息卡；没启用、或没交出图片，
+> 才用 `render_md_to_bytes`。兜底图样式在 `markdown_dark.css`：近黑底、奶油色标题、金色小节，
+> 列表用横线分隔，不画左侧色条。两路都失败则**优雅降级**回拆条。判定**刻意保守**（`_should_render_markdown_image`）：
+> 须够长（`markdown_image_min_chars`，默认 400）+ 拆分后 ≥3 段 + 含明确结构信号——**表格 / ≥2 个
 > ATX 标题 / ≥2 个整行粗体小标题（`**一、xxx**`）/ 编号列表 ≥2 项 / 无序列表 ≥3 项 / 水平线且 ≥1 标题**。
 > （agent 研报常用 `**粗体小标题** + 编号建议` 而非 markdown 表格 / `#` 标题，故一并纳入——否则像
 > session ...644256 药明康德那条会被拆成 ~8 段。）**纯口语连发短句、单段短文、代码块**都不命中

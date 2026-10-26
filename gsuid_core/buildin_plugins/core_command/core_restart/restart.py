@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import asyncio
@@ -15,6 +16,7 @@ from gsuid_core.server import core_shutdown_execute
 from gsuid_core.version import __version__
 from gsuid_core.subscribe import gs_subscribe
 from gsuid_core.data_store import get_res_path
+from gsuid_core.supervisor import RESTART_EXIT_CODE, SUPERVISED_ENV_KEY, is_supervised
 from gsuid_core.startup_info import core_startup_info
 from gsuid_core.utils.database.models import CoreUser, Subscribe
 from gsuid_core.utils.plugins_update.utils import check_start_tool
@@ -35,10 +37,13 @@ _UV_RECURSION_ENV_KEYS = (
 )
 RESTART_GUARD_WINDOW_SECONDS = 60.0
 RESTART_GUARD_MAX_IN_WINDOW = 8
+# 留时间把 /api/system/restart 的响应写回去
+RESTART_EXIT_DELAY_SECONDS = 0.5
 
 
 def sanitize_restart_env(source_env: Mapping[str, str]) -> dict[str, str]:
-    drop = {key.upper() for key in _UV_RECURSION_ENV_KEYS}
+    # 守护标记也剥掉：自定义命令拉起的 core 要自己当父进程，不然下次重启就没人接
+    drop = {key.upper() for key in (*_UV_RECURSION_ENV_KEYS, SUPERVISED_ENV_KEY)}
     return {key: value for key, value in source_env.items() if key.upper() not in drop}
 
 
@@ -118,9 +123,23 @@ def _popen_restart_shell(cmdline: str) -> None:
     )
 
 
+def is_custom_restart_enabled() -> bool:
+    return bool(core_plugins_config.get_config("is_use_custom_restart_command").data)
+
+
+def _exit_for_restart() -> None:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # 关机钩子已经跑完，这里直接退出，和旧版被 taskkill / kill -9 等价
+    os._exit(RESTART_EXIT_CODE)
+
+
+def _schedule_restart_exit() -> None:
+    asyncio.get_running_loop().call_later(RESTART_EXIT_DELAY_SECONDS, _exit_for_restart)
+
+
 def get_restart_command() -> str:
-    is_use_custom_restart_command = core_plugins_config.get_config("is_use_custom_restart_command").data
-    if is_use_custom_restart_command:
+    if is_custom_restart_enabled():
         restart_command = core_plugins_config.get_config("restart_command").data
         logger.info(t("log.core.core_restart_custom_command_start", restart_command=restart_command))
         return restart_command
@@ -165,14 +184,12 @@ async def restart_genshinuid(
         )
         return
 
+    # 自定义重启命令（pm2 / systemctl 之类）由用户自己接管，仍走旧的杀进程再拉起
+    by_supervisor = is_supervised() and not is_custom_restart_enabled()
     pid = os.getpid()
-    restart_sh = await get_restart_sh()
-    await asyncio.to_thread(_write_restart_sh, restart_sh_path, restart_sh)
-
-    if platform.system() == "Linux":
-        # os.system(f'chmod +x {str(restart_sh_path)}')
-        # os.system(f'chmod +x {str(bot_start)}')
-        pass
+    if not by_supervisor:
+        restart_sh = await get_restart_sh()
+        await asyncio.to_thread(_write_restart_sh, restart_sh_path, restart_sh)
 
     now_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
 
@@ -186,45 +203,71 @@ async def restart_genshinuid(
 
     await core_shutdown_execute()
 
+    if by_supervisor:
+        logger.info(t("log.core.core_restart_by_supervisor"))
+        _schedule_restart_exit()
+        return
+
     command = get_restart_command()
     system = platform.system()
     _popen_restart_shell(build_restart_shell_command(system, pid, command))
 
 
-async def restart_message():
-    if update_log_path.exists():
-        update_log_path.unlink()
+_RESTART_MSG_LOCK: asyncio.Lock | None = None
+_RESTART_MSG_LOOP: asyncio.AbstractEventLoop | None = None
 
-    datas = await gs_subscribe.get_subscribe(
-        task_name="[早柚核心] Restart",
-    )
-    if datas:
+
+def _restart_msg_lock() -> asyncio.Lock:
+    """锁绑在当前事件循环上。测试里多次 asyncio.run 不能复用上一轮的锁。"""
+    global _RESTART_MSG_LOCK, _RESTART_MSG_LOOP
+    loop = asyncio.get_running_loop()
+    lock = _RESTART_MSG_LOCK
+    if lock is None or _RESTART_MSG_LOOP is not loop:
+        lock = asyncio.Lock()
+        _RESTART_MSG_LOCK = lock
+        _RESTART_MSG_LOOP = loop
+    return lock
+
+
+async def restart_message() -> None:
+    async with _restart_msg_lock():
+        if update_log_path.exists():
+            update_log_path.unlink()
+
+        datas = await gs_subscribe.get_subscribe(
+            task_name="[早柚核心] Restart",
+        )
+        if not datas:
+            return
+
         now_timestamp = time.time()
         now_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_timestamp))
-        data = datas[0]
-        # 推送给主人，按主人的语言偏好（用户自定义 > 全局）
-        lang = await CoreUser.get_user_lang(data.user_id)
-        duration_msg = ""
-        if core_startup_info.duration is not None:
-            duration_msg = t("\n耗时: {p0:.2f}s", lang=lang, p0=core_startup_info.duration)
-            if data.extra_message:
-                try:
-                    shutdown_timestamp = time.mktime(time.strptime(data.extra_message, "%Y-%m-%d %H:%M:%S"))
-                    restart_duration = now_timestamp - shutdown_timestamp
-                    duration_msg += f" / {restart_duration:.1f}s"
-                except ValueError:
-                    pass
-        await data.send(
-            t(
-                "🚀 重启完成!\n关机时间: {extra_message}\n重启时间: {now_time}{duration_msg}\n版本: {version}",
-                lang=lang,
-                extra_message=data.extra_message,
-                now_time=now_time,
-                duration_msg=duration_msg,
-                version=__version__,
-            ),
-            extra_metadata={"skip_ai_history": True},
-        )
-        await Subscribe.delete_row(task_name="[早柚核心] Restart")
-    else:
-        logger.warning(t("log.core.core_restart_subscription_found_start"))
+        for data in datas:
+            # 推送给主人，按主人的语言偏好（用户自定义 > 全局）
+            lang = await CoreUser.get_user_lang(data.user_id)
+            duration_msg = ""
+            if core_startup_info.duration is not None:
+                duration_msg = t("\n耗时: {p0:.2f}s", lang=lang, p0=core_startup_info.duration)
+                if data.extra_message:
+                    try:
+                        shutdown_timestamp = time.mktime(time.strptime(data.extra_message, "%Y-%m-%d %H:%M:%S"))
+                        restart_duration = now_timestamp - shutdown_timestamp
+                        duration_msg += f" / {restart_duration:.1f}s"
+                    except ValueError:
+                        pass
+            send_res = await data.send(
+                t(
+                    "🚀 重启完成!\n关机时间: {extra_message}\n重启时间: {now_time}{duration_msg}\n版本: {version}",
+                    lang=lang,
+                    extra_message=data.extra_message,
+                    now_time=now_time,
+                    duration_msg=duration_msg,
+                    version=__version__,
+                ),
+                extra_metadata={"skip_ai_history": True},
+            )
+            # 发送成功删除该条记录；目标 Bot 尚未连入时保留，等待其连入后再推。
+            if send_res != -1:
+                await Subscribe.delete_row(id=data.id)
+            else:
+                logger.warning(t("log.core.core_restart_subscription_found_start"))

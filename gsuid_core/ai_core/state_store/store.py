@@ -44,9 +44,7 @@ async def _ensure_table() -> None:
         from gsuid_core.utils.database.base_models import engine
 
         async with engine.begin() as conn:
-            # sqlmodel.pyi 未在 class 上声明 ``__table__``/``__tablename__`` 时为
-            # InstrumentedAttribute[Unknown]（数据库字段）, 不被 metadata.tables[str] 接收;
-            # 这里显式硬编码 SQL 表名（见 AGENTS.md §3.1.1 全小写表名）绕开 stub。
+            # 依 AGENTS.md §3.1.1 全小写表名规范，显式使用表名索引 metadata.tables。
             await conn.run_sync(
                 AIPersistentState.metadata.create_all,
                 tables=[AIPersistentState.metadata.tables["aipersistentstate"]],
@@ -79,7 +77,7 @@ async def _fetch(scope: str, state_key: str) -> Optional[AIPersistentState]:
 
         # 过期删除才占写闸门。没命中的读取不挡其它写。
         if record.expire_at is not None and record.expire_at < _now():
-            async with sqlite_gated_write():
+            async with sqlite_gated_write("AIPersistentState.expire_delete"):
                 await session.execute(delete(AIPersistentState).where(col(AIPersistentState.id) == record.id))
                 await session.commit()
             logger.debug(t("log.ai.state_expired_cleaned_scope", scope=scope, state_key=state_key))

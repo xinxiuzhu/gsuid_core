@@ -31,11 +31,13 @@ def test_sanitize_restart_env_drops_uv_recursion_keys() -> None:
         "UV_PYTHON": "3.12",
         "UV_RUN_RECURSION_DEPTH": "101",
         "UV_INTERNAL__RECURSION_DEPTH": "7",
+        "GSUID_CORE_SUPERVISED": "1",
         "SYSTEMROOT": r"C:\Windows",
     }
     cleaned = sanitize_restart_env(source)
     assert "UV_RUN_RECURSION_DEPTH" not in cleaned
     assert "UV_INTERNAL__RECURSION_DEPTH" not in cleaned
+    assert "GSUID_CORE_SUPERVISED" not in cleaned
     assert cleaned["PATH"] == "/usr/bin"
     assert cleaned["VIRTUAL_ENV"] == "/venv"
     assert cleaned["UV_PROJECT"] == "/proj"
@@ -131,6 +133,7 @@ def test_restart_popen_uses_sanitized_env_on_each_os(
 
     monkeypatch.setattr(restart_mod.subprocess, "Popen", capture.fake_popen)
     monkeypatch.setattr(restart_mod, "core_shutdown_execute", fake_shutdown)
+    monkeypatch.setattr(restart_mod, "is_supervised", lambda: False)
     monkeypatch.setattr(restart_mod, "get_restart_command", lambda: "uv run core")
     monkeypatch.setattr(restart_mod, "restart_sh_path", tmp_path / "gs_restart.sh")
     monkeypatch.setattr(restart_mod, "restart_guard_path", lambda: tmp_path / "guard.json")
@@ -167,6 +170,72 @@ def test_restart_popen_uses_sanitized_env_on_each_os(
         assert env["PATH"] == "/usr/bin"
 
 
+class _RestartPathProbe:
+    def __init__(self) -> None:
+        self.shutdown_calls = 0
+        self.exit_scheduled = 0
+
+    async def fake_shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+    def fake_schedule_exit(self) -> None:
+        self.exit_scheduled += 1
+
+
+def _patch_restart_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    supervised: bool,
+    custom_command: bool,
+) -> tuple[_PopenCapture, _RestartPathProbe]:
+    capture = _PopenCapture()
+    probe = _RestartPathProbe()
+    monkeypatch.setattr(restart_mod.subprocess, "Popen", capture.fake_popen)
+    monkeypatch.setattr(restart_mod, "core_shutdown_execute", probe.fake_shutdown)
+    monkeypatch.setattr(restart_mod, "_schedule_restart_exit", probe.fake_schedule_exit)
+    monkeypatch.setattr(restart_mod, "is_supervised", lambda: supervised)
+    monkeypatch.setattr(restart_mod, "is_custom_restart_enabled", lambda: custom_command)
+    monkeypatch.setattr(restart_mod, "get_restart_command", lambda: "pm2 restart gscore")
+    monkeypatch.setattr(restart_mod, "restart_sh_path", tmp_path / "gs_restart.sh")
+    monkeypatch.setattr(restart_mod, "restart_guard_path", lambda: tmp_path / "guard.json")
+    return capture, probe
+
+
+def test_restart_under_supervisor_exits_instead_of_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    capture, probe = _patch_restart_path(monkeypatch, tmp_path, supervised=True, custom_command=False)
+    asyncio.run(restart_genshinuid(event=None, is_send=False))
+    assert probe.shutdown_calls == 1
+    assert probe.exit_scheduled == 1
+    assert capture.called is False
+    assert not (tmp_path / "gs_restart.sh").exists()
+
+
+def test_restart_custom_command_keeps_kill_and_spawn_under_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    capture, probe = _patch_restart_path(monkeypatch, tmp_path, supervised=True, custom_command=True)
+    asyncio.run(restart_genshinuid(event=None, is_send=False))
+    assert probe.shutdown_calls == 1
+    assert probe.exit_scheduled == 0
+    assert capture.called is True
+    assert capture.cmd.endswith("pm2 restart gscore")
+
+
+def test_restart_without_supervisor_keeps_kill_and_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    capture, probe = _patch_restart_path(monkeypatch, tmp_path, supervised=False, custom_command=False)
+    asyncio.run(restart_genshinuid(event=None, is_send=False))
+    assert probe.exit_scheduled == 0
+    assert capture.called is True
+
+
 def test_restart_throttled_does_not_spawn(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     capture = _PopenCapture()
     monkeypatch.setattr(restart_mod.subprocess, "Popen", capture.fake_popen)
@@ -174,3 +243,125 @@ def test_restart_throttled_does_not_spawn(monkeypatch: pytest.MonkeyPatch, tmp_p
     monkeypatch.setattr(restart_mod, "record_restart_and_allow", lambda _path, _now: False)
     asyncio.run(restart_genshinuid(event=None, is_send=False))
     assert capture.called is False
+
+
+def test_restart_message_concurrent_calls_serialized_and_deduplicated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_restart_message_concurrent_calls_serialized_and_deduplicated(monkeypatch, tmp_path))
+
+
+async def _restart_message_concurrent_calls_serialized_and_deduplicated(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    sent_messages: list[str] = []
+    deleted_ids: list[int] = []
+    sub_store = [
+        SimpleNamespace(
+            id=101,
+            user_id="user_1",
+            extra_message="2026-10-10 06:32:21",
+        )
+    ]
+
+    async def fake_get_subscribe(task_name: str) -> list[object]:
+        assert task_name == "[早柚核心] Restart"
+        return list(sub_store)
+
+    async def fake_send(self: object, msg: str, extra_metadata: object = None) -> int:
+        await asyncio.sleep(0.01)
+        sent_messages.append(msg)
+        return 0
+
+    async def fake_delete_row(**kwargs: object) -> int:
+        deleted_id = kwargs.get("id")
+        if isinstance(deleted_id, int):
+            deleted_ids.append(deleted_id)
+            sub_store.clear()
+        return 1
+
+    async def fake_get_user_lang(user_id: str) -> str:
+        return "zh-cn"
+
+    monkeypatch.setattr(restart_mod, "update_log_path", tmp_path / "update_log.json")
+    monkeypatch.setattr(restart_mod.gs_subscribe, "get_subscribe", fake_get_subscribe)
+    monkeypatch.setattr(restart_mod.CoreUser, "get_user_lang", fake_get_user_lang)
+    monkeypatch.setattr(restart_mod.Subscribe, "delete_row", fake_delete_row)
+
+    item = sub_store[0]
+    setattr(item, "send", fake_send.__get__(item, type(item)))
+
+    await asyncio.gather(
+        restart_mod.restart_message(),
+        restart_mod.restart_message(),
+    )
+
+    assert len(sent_messages) == 1
+    assert deleted_ids == [101]
+
+
+def test_restart_message_retains_subscription_when_bot_offline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    asyncio.run(_restart_message_retains_subscription_when_bot_offline(monkeypatch, tmp_path))
+
+
+async def _restart_message_retains_subscription_when_bot_offline(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    deleted_ids: list[int] = []
+    item = SimpleNamespace(
+        id=202,
+        user_id="user_2",
+        extra_message="2026-10-10 06:32:21",
+    )
+
+    async def fake_get_subscribe(task_name: str) -> list[object]:
+        return [item]
+
+    async def fake_send_offline(self: object, msg: str, extra_metadata: object = None) -> int:
+        return -1
+
+    async def fake_delete_row(**kwargs: object) -> int:
+        deleted_id = kwargs.get("id")
+        if isinstance(deleted_id, int):
+            deleted_ids.append(deleted_id)
+        return 1
+
+    async def fake_get_user_lang(user_id: str) -> str:
+        return "zh-cn"
+
+    monkeypatch.setattr(restart_mod, "update_log_path", tmp_path / "update_log.json")
+    monkeypatch.setattr(restart_mod.gs_subscribe, "get_subscribe", fake_get_subscribe)
+    monkeypatch.setattr(restart_mod.CoreUser, "get_user_lang", fake_get_user_lang)
+    monkeypatch.setattr(restart_mod.Subscribe, "delete_row", fake_delete_row)
+    setattr(item, "send", fake_send_offline.__get__(item, type(item)))
+
+    await restart_mod.restart_message()
+
+    assert deleted_ids == []
+
+
+def test_subscribe_send_returns_negative_one_when_bot_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    asyncio.run(_subscribe_send_returns_negative_one_when_bot_missing(monkeypatch))
+
+
+async def _subscribe_send_returns_negative_one_when_bot_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    from gsuid_core.gss import gss
+    from gsuid_core.utils.database.models import Subscribe
+
+    monkeypatch.setattr(gss, "active_bot", {})
+    sub = Subscribe(
+        user_id="123",
+        bot_id="onebot",
+        WS_BOT_ID="missing_ws_bot",
+        task_name="test",
+        bot_self_id="bot1",
+        user_type="direct",
+    )
+    result = await sub.send("hello")
+    assert result == -1

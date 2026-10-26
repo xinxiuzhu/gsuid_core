@@ -67,17 +67,131 @@ def test_post_tool_contracts_split_persona_vs_capability() -> None:
     assert "render_html_to_image" not in fail_c or "禁止" in fail_c
 
 
-def test_delegation_rejects_other_speakers_history_topic() -> None:
-    from gsuid_core.ai_core.buildin_tools.subagent import delegation_grounded
+def test_captionless_inbound_image_is_recorded(monkeypatch) -> None:
+    from gsuid_core.models import Event
+    from gsuid_core.handler import _record_inbound_history
+    from gsuid_core.message_history.manager import HistoryManager
 
-    said = "帮忙比较一下样本甲组、样本乙组和样本丙组"
-    assert delegation_grounded("对比样本甲组、样本乙组、样本丙组的要点", said)
-    assert not delegation_grounded("分析样本丁组并给出方案", said)
-    assert not delegation_grounded("深度分析样本戊组", said)
-    assert delegation_grounded("甲组配置里，成员乙已经带了丙类部件", "甲组配置，成员乙已经带了丙类部件，成员丁带什么")
-    assert not delegation_grounded("随便查点别的", "救我")
-    assert not delegation_grounded("analyze the market", "help me with the report")
-    assert delegation_grounded("compare sample alpha", "please compare sample alpha today")
+    mgr = HistoryManager()
+    monkeypatch.setattr("gsuid_core.message_history.get_history_manager", lambda: mgr)
+    monkeypatch.setattr("gsuid_core.handler.get_history_manager", lambda: mgr)
+
+    image_ev = Event(
+        bot_id="onebot",
+        bot_self_id="self1",
+        user_type="group",
+        group_id="g9001",
+        user_id="u2",
+        WS_BOT_ID="ws1",
+        msg_id="img-1",
+    )
+    image_ev.image_id = "img_synth_who_01"
+    image_ev.raw_text = ""
+    _record_inbound_history(image_ev)
+
+    skip_ev = Event(
+        bot_id="onebot",
+        bot_self_id="self1",
+        user_type="group",
+        group_id="g9001",
+        user_id="u3",
+        WS_BOT_ID="ws1",
+        msg_id="skip-1",
+    )
+    skip_ev.raw_text = ""
+    _record_inbound_history(skip_ev)
+    assert mgr.get_history(skip_ev, limit=8)[-1].metadata["image_id"] == "img_synth_who_01"
+
+
+def test_correction_pass_repoints_host_tool_calls_to_parent() -> None:
+    """纠正成功后宿主指针指回并好的父级列表；失败则拨回，且不并入纠正轮的名字。"""
+    import asyncio
+
+    from pydantic_ai.usage import UsageLimits
+
+    from gsuid_core.ai_core.gs_agent import GsCoreAIAgent
+    from gsuid_core.ai_core.agent_run.state import RunOnceState
+    from gsuid_core.ai_core.control.corrections import numeric_recitation_directive
+
+    def _agent() -> GsCoreAIAgent:
+        agent = object.__new__(GsCoreAIAgent)
+        agent._last_attempt_delegated_render = False
+        agent._last_attempt_image_sent = False
+        agent._last_attempt_pending_async = False
+        agent._last_attempt_has_status_tool = False
+        return agent
+
+    def _parent() -> tuple[GsCoreAIAgent, RunOnceState]:
+        agent = _agent()
+        st = RunOnceState(
+            user_message="总结一下",
+            bot=None,
+            ev=None,
+            rag_context=None,
+            tools=[],
+            return_mode="return",
+            output_type=None,
+            intent=None,
+            has_active_task=False,
+            budget_gate=False,
+            suppress_intermediate_text=False,
+            fake_done_retry=False,
+            turn_graph=None,
+            cheap_gate=None,
+            is_framework_injection=False,
+        )
+        st.limits = UsageLimits(request_limit=20)
+        st.tool_call_list = ["search_cognition"]
+        agent._last_attempt_tool_calls = st.tool_call_list
+        return agent, st
+
+    agent, st = _parent()
+
+    async def _ok(*_args: object, **_kwargs: object) -> str:
+        agent._last_attempt_tool_calls = ["web_search"]
+        return "rewritten"
+
+    agent._execute_run_once = _ok
+    result = asyncio.run(agent._try_correction_pass(st, (numeric_recitation_directive(),)))
+    assert result == "rewritten"
+    assert st.tool_call_list == ["search_cognition", "web_search"]
+    assert agent._last_attempt_tool_calls is st.tool_call_list
+
+    agent, st = _parent()
+
+    async def _boom(*_args: object, **_kwargs: object) -> str:
+        agent._last_attempt_tool_calls = []
+        raise RuntimeError("provider down")
+
+    agent._execute_run_once = _boom
+    failed = asyncio.run(agent._try_correction_pass(st, (numeric_recitation_directive(),)))
+    assert failed is None
+    assert st.tool_call_list == ["search_cognition"]
+    assert agent._last_attempt_tool_calls is st.tool_call_list
+
+
+def test_production_delegation_does_not_inline_wait() -> None:
+    """群聊委派不得占主 session 锁等待子代理；结论只走框架回灌。"""
+    from gsuid_core.ai_core.buildin_tools.subagent import (
+        _KANBAN_TEST_WAIT_TIMEOUT_SEC,
+        _kanban_wait_sec,
+    )
+
+    assert _kanban_wait_sec("Chat") == 0.0
+    assert _kanban_wait_sec("Agent") == 0.0
+    assert _kanban_wait_sec("") == 0.0
+    assert _kanban_wait_sec("TEST") == _KANBAN_TEST_WAIT_TIMEOUT_SEC
+
+
+def test_post_tool_contract_does_not_rival_delegation_with_research() -> None:
+    """再搜不点名聚合节点，也不把换 query 写成下一步。"""
+    from gsuid_core.ai_core.capability_agents.delegation_contracts import POST_TOOL_OUTPUT_CONTRACT
+
+    assert "internal_reporter" not in POST_TOOL_OUTPUT_CONTRACT
+    assert "类目词" not in POST_TOOL_OUTPUT_CONTRACT
+    assert "换更具体的词" in POST_TOOL_OUTPUT_CONTRACT
+    assert "或换 query 再搜" not in POST_TOOL_OUTPUT_CONTRACT
+    assert "换描述再 find_tools" not in POST_TOOL_OUTPUT_CONTRACT
 
 
 def test_deferred_ack_closes_serial_followup() -> None:

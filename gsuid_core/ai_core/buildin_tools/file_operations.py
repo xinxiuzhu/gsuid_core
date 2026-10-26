@@ -22,9 +22,7 @@ from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.planning.workspace import ARTIFACT_ROOT, _is_inside
 
-# ---------------------------------------------------------------------------
-# 内部安全校验
-# ---------------------------------------------------------------------------
+# --- 内部安全校验 ---
 
 
 def _safe_resolve(base: Path, relative: str) -> Optional[Path]:
@@ -52,12 +50,10 @@ def _format_size(size_bytes: int) -> str:
         return f"{size_bytes / (1024 * 1024):.2f} MB"
 
 
-# ---------------------------------------------------------------------------
-# 工具实现
-# ---------------------------------------------------------------------------
+# --- 工具实现 ---
 
 
-@ai_tools(category="default", capability_domain="文件")
+@ai_tools(category="default", capability_domain="文件", code_callable=False)
 async def move_file(
     ctx: RunContext[ToolContext],
     source_path: str,
@@ -121,7 +117,7 @@ async def move_file(
         return f"错误：文件移动失败: {str(e)}"
 
 
-@ai_tools(category="default", capability_domain="文件")
+@ai_tools(category="default", capability_domain="文件", code_callable=False)
 async def copy_file(
     ctx: RunContext[ToolContext],
     source_path: str,
@@ -208,7 +204,7 @@ def _write_zip(safe_zip: Path, resolved_sources: List[Path]) -> int:
     return file_count
 
 
-@ai_tools(category="default", capability_domain="文件")
+@ai_tools(category="default", capability_domain="文件", code_callable=False)
 async def pack_to_zip(
     ctx: RunContext[ToolContext],
     source_paths: str,

@@ -1,22 +1,14 @@
-import os
 import sys
 import signal
 import asyncio
 import secrets
 import argparse
-import multiprocessing
 from typing import Dict
 from asyncio import CancelledError
 from pathlib import Path
 from dataclasses import dataclass
 
-import uvicorn
-from fastapi import Header, WebSocket, HTTPException, WebSocketDisconnect
-from msgspec import json as msgjson, to_builtins
-
-from gsuid_core.version import __version__
-from gsuid_core.shutdown import shutdown_event
-from gsuid_core.startup_info import core_startup_info
+from gsuid_core.supervisor import is_supervised, run_supervisor
 
 sys.path.append(str(Path(__file__).resolve().parent))
 sys.path.append(str(Path(__file__).resolve().parents[1]))
@@ -40,7 +32,16 @@ class IPStatus:
     ban_until: float = 0
 
 
-async def main():
+async def serve():
+    # 重依赖放到这里导入：守护父进程也会 import 本模块，但它不需要这些
+    import uvicorn
+    from fastapi import Header, WebSocket, HTTPException, WebSocketDisconnect
+    from msgspec import json as msgjson, to_builtins
+
+    from gsuid_core.version import __version__
+    from gsuid_core.shutdown import shutdown_event
+    from gsuid_core.startup_info import core_startup_info
+
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
@@ -69,15 +70,7 @@ async def main():
 
     from gsuid_core.i18n import t
     from gsuid_core.logger import logger
-    from gsuid_core.ai_core.configs.ai_config import ai_config
     from gsuid_core.utils.database.base_models import init_database
-
-    hf_endpoint: str = ai_config.get_config("hf_endpoint").data
-
-    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "60"
-    os.environ["HF_ENDPOINT"] = hf_endpoint
-
-    logger.info(t("log.core.hf_switch", hf_endpoint=hf_endpoint))
 
     await init_database()
 
@@ -91,7 +84,7 @@ async def main():
     from gsuid_core.bot import _Bot
     from gsuid_core.config import core_config
     from gsuid_core.models import MessageReceive
-    from gsuid_core.handler import _INBOUND_SLOTS, handle_event, run_inbound_event
+    from gsuid_core.handler import _INBOUND_SLOTS, handle_event, run_inbound_event, decode_inbound_frame
     from gsuid_core.security_manager import sec_manager
     from gsuid_core.utils.database.startup import (  # noqa: F401
         trans_adapter as ta,
@@ -160,7 +153,9 @@ async def main():
                         try:
                             # 使用 wait_for 添加超时，以便定期检查 shutdown_event
                             data = await asyncio.wait_for(websocket.receive_bytes(), timeout=1.0)
-                            msg = msgjson.decode(data, type=MessageReceive)
+                            msg = decode_inbound_frame(data, bot_id)
+                            if msg is None:
+                                continue
                             # 优先拦截 recall_message_id 回执，避免其进入正常消息管道
                             if bot.resolve_recall(msg):
                                 continue
@@ -180,7 +175,7 @@ async def main():
                 except CancelledError:
                     pass
                 finally:
-                    await gss.disconnect(bot_id)
+                    await gss.disconnect(bot_id, websocket)
 
             async def process():
                 try:
@@ -208,7 +203,7 @@ async def main():
                 if isinstance(_r, BaseException) and not isinstance(_r, CancelledError):
                     raise _r
         finally:
-            await gss.disconnect(bot_id)
+            await gss.disconnect(bot_id, websocket)
 
     if ENABLE_HTTP:
         _bot = _Bot("HTTP")
@@ -280,6 +275,8 @@ async def main():
 
     # AI 核心统计（仅在 AI 功能启用时显示）
     try:
+        from gsuid_core.ai_core.configs.ai_config import ai_config
+
         if ai_config.get_config("enable").data:
             from gsuid_core.ai_core.register import _TOOL_REGISTRY, get_all_tools
             from gsuid_core.ai_core.persona.resource import list_available_personas
@@ -309,10 +306,12 @@ async def main():
     await server.serve()
 
 
-# 仅主进程启动服务(spawn 子进程重 import 本模块时跳过)
-if multiprocessing.current_process().name == "MainProcess":
+def main() -> int:
+    """`core` 命令入口：没被守护时自己当守护父进程，被守护的子进程才真正起服务。"""
+    if not is_supervised():
+        return run_supervisor(sys.argv[1:])
     try:
-        asyncio.run(main())
+        asyncio.run(serve())
     except (ConnectionResetError, ConnectionAbortedError):
         # Windows ProactorEventLoop: 客户端异常断开时可能逃逸到顶层
         pass
@@ -320,3 +319,12 @@ if multiprocessing.current_process().name == "MainProcess":
         # Windows ProactorEventLoop 已知问题: 连接重置时 set_exception
         # 可能被调用在已终态的 Future 上，导致 InvalidStateError 逃逸
         pass
+    except KeyboardInterrupt:
+        # uvicorn 关完服务会把捕获的 SIGINT 重新抛出，这里收掉免得刷一屏 traceback
+        return 130
+    return 0
+
+
+# spawn 出来的子进程会以 __mp_main__ 重新 import 本模块，不能在 import 时启动服务
+if __name__ == "__main__":
+    sys.exit(main())

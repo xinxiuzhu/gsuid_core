@@ -51,13 +51,16 @@ active-users / trigger-distribution / intent-distribution / errors / heartbeat /
 
 ## 11.2 网页控制台（`gsuid_core/webconsole/`）
 
-Hub 静态资源由 `webconsole/static_serve.py::build_frontend_router` 挂在 `/app/`：
+Hub 静态资源由 `webconsole/static_serve.py::build_frontend_router` 挂在 `/app/`。
+`setup_frontend_b` 把 dist 放在 `FrontendDist` 上，每次请求再读路径：资源站 zip 覆盖
+`data/dist` 之后只改这个路径，不重挂路由。`index.html` 是 `no-cache`，刷新后拿到新 hash。
 
 - 带 hash 的 `assets/**`：`Cache-Control: public, max-age=31536000, immutable`
 - `index.html` / `version.json`：`no-cache`（禁止长期缓存 HTML，否则升级后会请求已删除的旧 hash）
 - 若存在 `.br` / `.gz` 且 `Accept-Encoding` 允许，按 Brotli 优先返回并设 `Content-Encoding` + `Vary: Accept-Encoding`
 - 缺失的 js/css/图片 **404**，不要 SPA 回落成 `index.html`（否则浏览器把 HTML 当 JS 解析）
 - `GZipMiddleware`（`app_life.py`）给未预压的文本响应做动态 gzip；已有 `Content-Encoding` 的预压文件不会再压
+- 跨域：`web_cors_middleware.py` 读核心配置 `web_cors_origins`（默认空）。只有名单里的 Origin 才回显 `Access-Control-Allow-Origin`（不用 `*`）并带 `Access-Control-Allow-Credentials: true`，同时应答带 `Access-Control-Request-Method` 的 OPTIONS 预检。控制台用自定义 API Host 指向另一台 Core 时要填**页面源**（如 `http://localhost:8080`），不是 API 地址。同源 `/app/` 和开发代理不需要这项。保存后下一次请求生效。
 
 前端构建（gsuid_hub `precompressDist`）负责写出 `.gz` / `.br`。只改 Vite 插件、不改本文件的协商逻辑，浏览器看不到压缩。
 

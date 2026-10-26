@@ -1,7 +1,7 @@
 """非法尖括号标签检测与文案（策略实现，编排见 ``output_gate``）。
 
 模型常自创 ``<bubble/>`` / ``<br>`` 等控制标记。框架协议标签仅：
-``<SILENCE>`` / ``<meme:…>``。
+``<SILENCE>`` / ``<meme:…>``。整段 ``<沉默>`` 当作 ``<SILENCE>`` 的别名剥掉。
 ``<br>`` / ``<report>`` **不是**协议——视为非法，须打回重写。
 多项资料出图走 ``create_subagent(render_agent)``，不靠尖括号标签。
 
@@ -15,15 +15,14 @@ from __future__ import annotations
 import re
 from typing import List, Sequence
 
+from gsuid_core.ai_core.control.lines import ANGLE_NUDGE_MARKER as NUDGE_MARKER
+
 # 同一 agent.run / 同 turn 内最多打回次数（第 3 次仍失败 → 熔断）
 MAX_RETRIES = 3
 
-# 注入到 ModelRequest / 工具 return 的锚点串，便于历史裁剪精确识别
-NUDGE_MARKER = "（系统校验：发送内容含非法尖括号标签"
-
 # 协议标签：检测前剥掉；``<br>`` / ``<report>`` 不在此列
 _MEME_TAG_RE = re.compile(r"`*<meme[：:]\s*[^>]+>`*", re.IGNORECASE)
-_SILENCE_TAG_RE = re.compile(r"</?SILENCE\s*/?>", re.IGNORECASE)
+_SILENCE_TAG_RE = re.compile(r"</?(?:SILENCE|沉默)\s*/?>", re.IGNORECASE)
 
 # 与 utils._normalize_html_linebreaks 同形：教学/代码回复里的标签勿当非法
 _CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)

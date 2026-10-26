@@ -58,6 +58,15 @@ class AgentHookPoint(str, Enum):
     ON_STABLE_CONTEXT = "H29"
 
 
+class HookDecision(str, Enum):
+    """控制码。只认显式返回值，异常一律不升级为 ABORT_RUN。"""
+
+    CONTINUE = "continue"
+    ABORT_RUN = "abort_run"
+    SILENCE = "silence"
+    VETO_TOOL = "veto_tool"
+
+
 class HookCapability(str, Enum):
     """能力票：点位声明允许哪些受控写操作，未授权调用抛 HookCapabilityError。"""
 
@@ -77,13 +86,14 @@ class HookCapability(str, Enum):
 
 @dataclass(frozen=True)
 class HookPointSpec:
-    """点位契约：内核锚点、能力票、默认超时、是否已接线。"""
+    """点位契约：内核锚点、能力票、默认超时、是否已接线、超时决断。"""
 
     point: AgentHookPoint
     anchor: str
     capabilities: FrozenSet[HookCapability]
     default_timeout_ms: int
     wired: bool
+    on_timeout_decision: HookDecision = HookDecision.CONTINUE
 
 
 def _spec(
@@ -92,8 +102,9 @@ def _spec(
     timeout_ms: int,
     *caps: HookCapability,
     wired: bool = True,
+    on_timeout_decision: HookDecision = HookDecision.CONTINUE,
 ) -> HookPointSpec:
-    return HookPointSpec(point, anchor, frozenset(caps), timeout_ms, wired)
+    return HookPointSpec(point, anchor, frozenset(caps), timeout_ms, wired, on_timeout_decision)
 
 
 _C = HookCapability
@@ -116,9 +127,10 @@ HOOK_POINT_SPECS: Dict[AgentHookPoint, HookPointSpec] = {
         _spec(
             AgentHookPoint.REACTIVE_GATE,
             "handle_ai.handle_ai_chat:soft_gate",
-            2000,
+            6000,
             _C.SET_SHOULD_SPEAK,
             _C.SILENCE,
+            on_timeout_decision=HookDecision.SILENCE,
         ),
         _spec(AgentHookPoint.RETRIEVE_CONTEXT, "handle_ai.handle_ai_chat:retrieve", 15000, _C.SET_BLOCK),
         _spec(
@@ -133,10 +145,7 @@ HOOK_POINT_SPECS: Dict[AgentHookPoint, HookPointSpec] = {
         _spec(AgentHookPoint.ASSEMBLE_TOOLS, "agent_run.tools:assemble", 2000, _C.MUTATE_TOOLS),
         _spec(AgentHookPoint.AFTER_ASSEMBLE_TOOLS, "agent_run.tools:after_assemble", 200, _C.MUTATE_TOOLS),
         _spec(AgentHookPoint.ON_STABLE_CONTEXT, "context_assembly.build_session_system_prompt", 500, _C.SET_BLOCK),
-        # ── 以下 19 个点位**契约已定、内核尚未开火**（wired=False）──────────────
-        # `anchor` 是将来该点位应该落在哪一行，不是「现在已经在那里了」。
-        # 标 True 会让插件按发布的表去挂钩子、拿到一个永远不执行的回调且无任何告警；
-        # `on_agent_hook` 现在会对未接线点位打 warning。接线时把 wired 改回 True。
+        # 契约已定但内核尚未启用的点位（wired=False），挂载时记录警告。
         _spec(AgentHookPoint.ON_AI_ERROR, "handle_ai.handle_ai_chat:except", 500, wired=False),
         _spec(AgentHookPoint.BEFORE_RUN, "agent_run.prepare:run_once_state", 200, _C.ABORT, wired=False),
         _spec(AgentHookPoint.AFTER_BUDGET, "agent_run.prepare:budget_passed", 200, wired=False),

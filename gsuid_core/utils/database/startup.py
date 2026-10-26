@@ -33,6 +33,7 @@ AI_DATABASE_MODEL_MODULES = (
     "gsuid_core.ai_core.memory.database.models",
     "gsuid_core.ai_core.memory.ingestion.hiergraph",
     "gsuid_core.ai_core.meme.database_model",
+    "gsuid_core.ai_core.meme.pack_model",
     "gsuid_core.ai_core.cognition.nodes",
     "gsuid_core.ai_core.memory.ingestion.tool_trace",
 )
@@ -123,9 +124,7 @@ exec_list = [
     "ALTER TABLE aiagenttask ADD COLUMN fire_count INTEGER DEFAULT 0;",
     # 子任务级 not_before：支持"等开盘 / 等下班"延后语义（2026-05-24 复盘新增）
     "ALTER TABLE aiagenttask ADD COLUMN not_before TIMESTAMP DEFAULT NULL;",
-    # 派活时的用户权限等级（与 Event.user_pm 对齐）。旧库默认 6=非管理员；主人
-    # （pm=0）派出的子代理重建 Event 后据此判定主人身份，pm 门控工具（plugin_dev）
-    # 才不会拒绝主人本人发起的任务。
+    # 任务派发时的权限等级（对齐 Event.user_pm），供子代理验证权限使用。
     "ALTER TABLE aiagenttask ADD COLUMN user_pm INTEGER DEFAULT 6;",
     # 旧任务（最早 C5 长任务）的 root_task_id 默认空——一次性把 root_task_id=id
     # 写回，让它们退化为"只有根节点的退化树"，统一进 Kanban 渲染。
@@ -147,6 +146,13 @@ exec_list = [
     "ALTER TABLE aitokenusagebytype ADD COLUMN cache_write_tokens INTEGER DEFAULT 0;",
     "ALTER TABLE aitokenusagebymodel ADD COLUMN cache_read_tokens INTEGER DEFAULT 0;",
     "ALTER TABLE aitokenusagebymodel ADD COLUMN cache_write_tokens INTEGER DEFAULT 0;",
+    # 延迟样本数：区间平均延迟要按样本数加权（每日样本量实测能差两个数量级），
+    # 没有它就只能拿每日均值取算术平均。老库这一列是 0，即不参与加权。
+    "ALTER TABLE aidailystatistics ADD COLUMN latency_sample_count INTEGER DEFAULT 0;",
+    # 统计模块两张按日聚合表的 date 索引：它们是本模块唯一没有唯一约束、也就没有
+    # 附带索引的按日表，BETWEEN + ORDER BY date 原来要全表扫再排一次。
+    "CREATE INDEX IF NOT EXISTS idx_aidailystatistics_date ON aidailystatistics (date);",
+    "CREATE INDEX IF NOT EXISTS idx_airagmissstatistics_date ON airagmissstatistics (date);",
     # 小时级性能统计表 aihourlyperformance 为全新表，由 SQLModel create_all 全量
     # 建表，无需逐列 ALTER；以下仅补齐"运行过开发期中间版本（缺均值采样列）"的库
     "ALTER TABLE aihourlyperformance ADD COLUMN ttft_sum_ms FLOAT DEFAULT 0.0;",
@@ -167,13 +173,18 @@ exec_list = [
     "ALTER TABLE userfavorability ADD COLUMN daily_loss INTEGER DEFAULT 0;",
     "ALTER TABLE userfavorability ADD COLUMN daily_ymd VARCHAR DEFAULT '';",
     "ALTER TABLE userfavorability ADD COLUMN last_positive_interact_at INTEGER DEFAULT 0;",
-    # 认知节点行级属主：只按 scope_key 过滤会把 owner 级 ACL 降成 group 级
-    # （同群成员能召回别人的任务结论 / 产物摘要）。旧行 owner 为空，
-    # 而 tool_output / artifact 两类在 AICogNode.search 里对空属主 fail-closed。
+    # 认知节点行级属主字段，防止群内成员越权召回他人任务摘要与产物。
     "ALTER TABLE aicognode ADD COLUMN owner_user_id VARCHAR DEFAULT '';",
     "CREATE INDEX IF NOT EXISTS ix_aicognode_owner_user_id ON aicognode (owner_user_id);",
     "ALTER TABLE aicognode ADD COLUMN canon VARCHAR DEFAULT '';",
     "CREATE INDEX IF NOT EXISTS ix_aicognode_canon ON aicognode (canon);",
+    # 知识分片：chunk 0 留原文，换切法才能重切。create_all 不给旧表补列。
+    "ALTER TABLE aiknowledgechunk ADD COLUMN origin TEXT DEFAULT '';",
+    "ALTER TABLE aiknowledgechunk ADD COLUMN chunker_id VARCHAR(32) DEFAULT '';",
+    "ALTER TABLE aimemerecord ADD COLUMN pending_pack_id VARCHAR(36) DEFAULT '';",
+    "ALTER TABLE aimemerecord ADD COLUMN assign_default_pack BOOLEAN DEFAULT 0;",
+    # 旧库的自主行动审计没有会话号。create_all 不给已有表补列。
+    "ALTER TABLE aiautonomyactivity ADD COLUMN session_id VARCHAR(256) DEFAULT '';",
 ]
 
 

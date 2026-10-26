@@ -2,6 +2,7 @@
 
 import os
 import json
+import time
 import uuid
 import asyncio
 import hashlib
@@ -12,6 +13,7 @@ from typing import Final, Union, Callable, Sequence, Awaitable
 from pathlib import Path
 
 import httpx
+from huggingface_hub import snapshot_download
 
 try:
     from fastembed import SparseTextEmbedding
@@ -19,11 +21,11 @@ except ImportError:
     SparseTextEmbedding = None  # type: ignore[assignment]
     # onnxruntime 缺少当前平台 wheel（如 macOS x86_64），fastembed 无法加载
 from qdrant_client import AsyncQdrantClient
-from huggingface_hub import constants as hf_constants, snapshot_download
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.data_store import AI_CORE_PATH
+from gsuid_core.ai_core.rag.qmodels import QdrantSession
 from gsuid_core.ai_core.rag.embedding import (
     EmbeddingProvider,
     get_embedding_provider,
@@ -54,12 +56,7 @@ TOOLS_COLLECTION_NAME: Final[str] = "bot_tools"
 KNOWLEDGE_COLLECTION_NAME: Final[str] = "knowledge"
 IMAGE_COLLECTION_NAME: Final[str] = "image"
 
-# ============== RAG批量参数 ==============
-# 远程 embedding / Qdrant upsert 使用较大批量减少网络和写入开销；
-# 本地 fastembed 也应使用适中批量：ONNX Runtime 对批量推理做了高度优化，逐条(=1)提交会让
-# 每条都付出一次完整的 Python↔执行器往返与算子启动开销，在维度迁移这类需要重嵌入数万~十几万条
-# 的场景下慢得无法接受(60558 实体 ×2 向量 + 118781 边)。批量 64 的短文本推理在 CPU 上仍是
-# 亚秒级，对单条会话同步几乎无感(min(64, n) 会退化为实际条数)，却能让批量重嵌入提速数十倍。
+# 远程接口采用较大批量降低请求频次；本地推理采用适中批量以充分利用算子并行。
 RAG_BATCH_SIZE: Final[int] = 300
 RAG_LOCAL_EMBED_BATCH_SIZE: Final[int] = 64
 RAG_REMOTE_EMBED_BATCH_SIZE: Final[int] = RAG_BATCH_SIZE
@@ -68,12 +65,11 @@ RAG_UPSERT_BATCH_SIZE: Final[int] = RAG_BATCH_SIZE
 
 # ============== 模型HF仓库映射 ==============
 def _get_embedding_hf_repo(model_name: str) -> str:
-    """根据embedding模型名称获取对应的HuggingFace仓库名
-
-    特别处理：只要文件名中包含 bge-small-zh-v1.5，就使用 Qdrant/bge-small-zh-v1.5
-    """
+    """根据embedding模型名称获取对应的HuggingFace仓库名"""
     if "bge-small-zh-v1.5" in model_name:
         return "Qdrant/bge-small-zh-v1.5"
+    if "bge-small-en-v1.5" in model_name:
+        return "qdrant/bge-small-en-v1.5-onnx-q"
     return model_name
 
 
@@ -93,11 +89,6 @@ def is_enable_ai() -> bool:
 
 def is_enable_rerank() -> bool:
     return ai_config.get_config("enable_rerank").data
-
-
-def _get_hf_endpoint() -> str:
-    """获取HuggingFace服务器地址"""
-    return ai_config.get_config("hf_endpoint").data
 
 
 def get_rag_embed_batch_size() -> int:
@@ -180,10 +171,15 @@ async def embed_texts_with_backoff(
     if bs <= 0:
         bs = 1
     results: list[Sequence[float] | None] = [None] * len(texts)
+    total = len(texts)
     index = 0
+    last_progress = time.monotonic()
+    if total >= 32:
+        logger.info(t("log.rag.embed_batch_progress", log_tag=log_tag, done=0, total=total))
     while index < len(texts):
         current_bs = min(bs, len(texts) - index)
         batch = texts[index : index + current_bs]
+        advanced = False
         try:
             vectors = await embed_fn(batch)
         except Exception as e:
@@ -199,31 +195,40 @@ async def embed_texts_with_backoff(
                     )
                 )
                 index += 1
-                continue
-            new_bs = max(current_bs // 2, 1)
-            logger.warning(
-                t(
-                    "log.rag.log_tag_remote_rejected_large",
-                    log_tag=log_tag,
-                    current_bs=current_bs,
-                    new_bs=new_bs,
-                    e=e,
+                advanced = True
+            else:
+                new_bs = max(current_bs // 2, 1)
+                logger.warning(
+                    t(
+                        "log.rag.log_tag_remote_rejected_large",
+                        log_tag=log_tag,
+                        current_bs=current_bs,
+                        new_bs=new_bs,
+                        e=e,
+                    )
                 )
-            )
-            _cached_embed_bs = new_bs
-            bs = new_bs
-            continue  # 当前批不前进, 用更小批重试同一窗口
-        if len(vectors) != len(batch):
-            raise RuntimeError(
-                t(
-                    "log.rag.log_tag_expected_actual",
-                    log_tag=log_tag,
-                    p0=len(batch),
-                    p1=len(vectors),
+                _cached_embed_bs = new_bs
+                bs = new_bs
+        else:
+            if len(vectors) != len(batch):
+                raise RuntimeError(
+                    t(
+                        "log.rag.log_tag_expected_actual",
+                        log_tag=log_tag,
+                        p0=len(batch),
+                        p1=len(vectors),
+                    )
                 )
-            )
-        results[index : index + current_bs] = vectors
-        index += current_bs
+            results[index : index + current_bs] = vectors
+            index += current_bs
+            advanced = True
+        if not advanced:
+            continue
+        now = time.monotonic()
+        finished = index >= total
+        if total >= 32 and (finished or now - last_progress >= 15.0):
+            logger.info(t("log.rag.embed_batch_progress", log_tag=log_tag, done=index, total=total))
+            last_progress = now
     return results
 
 
@@ -572,37 +577,12 @@ async def pre_download_models():
 
     logger.info(t("log.rag.resource_hub_download_falling"))
 
-    hf_endpoint = _get_hf_endpoint()
-    # 设置HF_ENDPOINT环境变量，并同步更新huggingface_hub.constants.ENDPOINT
-    # 因为huggingface_hub在模块导入时就缓存了ENDPOINT值，仅修改os.environ不会生效
-    old_endpoint = os.environ.get("HF_ENDPOINT")
-    old_hf_constant = getattr(hf_constants, "ENDPOINT", None)
-    os.environ["HF_ENDPOINT"] = hf_endpoint
-    hf_constants.ENDPOINT = hf_endpoint.rstrip("/")
-    logger.info(t("log.rag.huggingface_endpoint_set_hf", p0=hf_constants.ENDPOINT))
-
+    os.environ["HF_HUB_DOWNLOAD_TIMEOUT"] = "60"
     try:
-        # 下载Embedding模型。镜像缺文件时回退官方 Hub。
+        # 下载Embedding模型。已设置的 HF_ENDPOINT 由 huggingface_hub 自己读取。
         embed_repo = _get_embedding_hf_repo(model_name)
         logger.info(t("log.rag.pre_downloading_embedding_hf", EMBEDDING_HF_REPO=embed_repo))
-        endpoints: list[str] = []
-        for ep in (_get_hf_endpoint(), "https://huggingface.co"):
-            body = ep.strip().rstrip("/")
-            if body and body not in endpoints:
-                endpoints.append(body)
-        last_err: OSError | RuntimeError | ValueError | None = None
-        for ep in endpoints:
-            os.environ["HF_ENDPOINT"] = ep
-            hf_constants.ENDPOINT = ep
-            try:
-                await asyncio.to_thread(_prefetch_local_embedding_model, model_name)
-                last_err = None
-                break
-            except (OSError, RuntimeError, ValueError) as e:
-                last_err = e
-                logger.warning(t("log.rag.pre_download_attempt_load", e=e))
-        if last_err is not None:
-            raise last_err
+        await asyncio.to_thread(_prefetch_local_embedding_model, model_name)
         logger.info(t("log.rag.embedding_pre_download"))
 
         # 下载Sparse模型
@@ -624,14 +604,6 @@ async def pre_download_models():
             logger.info(t("log.rag.reranker_pre_download"))
     except Exception as e:
         logger.warning(t("log.rag.pre_download_attempt_load", e=e))
-    finally:
-        # 恢复原来的HF_ENDPOINT和huggingface_hub常量
-        if old_endpoint is not None:
-            os.environ["HF_ENDPOINT"] = old_endpoint
-        elif "HF_ENDPOINT" in os.environ:
-            del os.environ["HF_ENDPOINT"]
-        if old_hf_constant is not None:
-            hf_constants.ENDPOINT = old_hf_constant
 
 
 class _EmbeddingModelWrapper:
@@ -662,6 +634,13 @@ class _EmbeddingModelWrapper:
         results = await self._provider.embed(texts)
         return iter(results)
 
+    async def aembed_query(self, text: str) -> list[float]:
+        """在线检索的单条查询嵌入。
+
+        批量池默认单 worker，后台切块索引会占满它；查询走单条池，不排在索引后面。
+        """
+        return await self._provider.embed_single(text)
+
     @property
     def provider(self) -> EmbeddingProvider:
         """获取底层 EmbeddingProvider 实例"""
@@ -670,14 +649,11 @@ class _EmbeddingModelWrapper:
 
 embedding_model: "Union[_EmbeddingModelWrapper, None]" = None
 embedding_provider: "Union[EmbeddingProvider, None]" = None
-client: "Union[AsyncQdrantClient, None]" = None
+client: QdrantSession | None = None
 # 全局 Sparse Embedding 模型（懒加载，线程安全）
 _sparse_model = None
 _sparse_model_lock = threading.Lock()
-# Embedding/Qdrant 初始化锁：init_embedding_model 会经 asyncio.to_thread 在多个线程并发触发
-# （RAG init_all、sync_knowledge 懒加载、init_memory_system）。check-then-act 若无锁，
-# 两个线程会同时构造 AsyncQdrantClient，触发本地 Qdrant 文件锁冲突：
-# "Storage folder ... is already accessed by another instance of Qdrant client"。
+# 客户端初始化锁：避免多线程并发构造 AsyncQdrantClient 产生本地文件锁冲突。
 _client_init_lock = threading.Lock()
 
 
@@ -697,6 +673,8 @@ def _get_sparse_model():
             # 双重检查锁定
             if _sparse_model is None:
                 try:
+                    from fastembed import SparseTextEmbedding
+
                     _sparse_model = SparseTextEmbedding(
                         model_name="Qdrant/bm25",
                         cache_dir=str(MODELS_CACHE),
@@ -719,9 +697,7 @@ def init_embedding_model():
     if client is not None:
         return
 
-    # 加锁 + 双重检查：本函数可能经 asyncio.to_thread 在多个线程并发触发，
-    # 没有锁时 check-then-act 会让两个线程同时构造 AsyncQdrantClient，导致本地
-    # Qdrant 文件锁冲突。锁内只做一次真正的初始化，保证全局只有一个 client 实例。
+    # 线程锁与双重检查：防止并发调用导致 Qdrant 客户端重复构造。
     with _client_init_lock:
         if client is not None:
             return
@@ -730,6 +706,15 @@ def init_embedding_model():
         provider = get_embedding_provider()
         embedding_provider = provider
         embedding_model = _EmbeddingModelWrapper(provider)
+        from gsuid_core.ai_core.rag.chunking import embed_char_budget
+
+        logger.info(
+            t(
+                "log.rag.embedding_input_budget",
+                tokens=provider.max_input_tokens,
+                budget=embed_char_budget(provider.max_input_tokens),
+            )
+        )
         # 经 qdrant_provider 抽象层按配置构造本地/远程客户端，切换由抽象层内部统一处理
         client = build_qdrant_client()
 

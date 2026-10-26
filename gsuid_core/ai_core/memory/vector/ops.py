@@ -10,7 +10,11 @@ import asyncio
 from typing import TYPE_CHECKING, Optional, TypedDict, cast
 from concurrent.futures import ThreadPoolExecutor
 
-from qdrant_client.models import (
+from gsuid_core.i18n import t
+from gsuid_core.logger import logger
+from gsuid_core.ai_core.rag.base import _get_sparse_model, embed_texts_with_backoff
+from gsuid_core.ai_core.rag.hybrid import hybrid_query
+from gsuid_core.ai_core.rag.qmodels import (
     Range,
     Filter,
     Vector,
@@ -21,11 +25,6 @@ from qdrant_client.models import (
     SparseVector,
     FieldCondition,
 )
-
-from gsuid_core.i18n import t
-from gsuid_core.logger import logger
-from gsuid_core.ai_core.rag.base import _get_sparse_model, embed_texts_with_backoff
-from gsuid_core.ai_core.rag.hybrid import hybrid_query
 
 from .collections import (
     MEMORY_EDGES_COLLECTION,
@@ -53,9 +52,7 @@ class CandidatePoint(TypedDict):
     scope_key: str
 
 
-# Qdrant 写入互斥锁：仅保护 upsert 写入操作，防止并发破坏向量索引长度同步。
-# 读取操作（_hybrid_search / search_*）不需要此锁，Qdrant 本身支持并发读。
-# 按 Collection 分锁，避免 Episode 写入阻塞 Entity/Edge 写入。
+# Qdrant 写入互斥锁：按集合隔离保护 upsert 操作，防止并发破坏索引长度同步。
 _QDRANT_LOCKS: dict[str, asyncio.Lock] = {
     MEMORY_EPISODES_COLLECTION: asyncio.Lock(),
     MEMORY_ENTITIES_COLLECTION: asyncio.Lock(),
@@ -67,11 +64,7 @@ _QDRANT_LOCKS: dict[str, asyncio.Lock] = {
 # 注意：max_workers=4 仅用于单条文本的 embedding，避免无界线程耗尽资源
 _EMBED_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mem_embed")
 
-# 批量 Embedding 专用单线程执行器：
-# FastEmbed 底层使用 ONNX Runtime，自带高度优化的多线程池（Rayon），
-# 会自动打满所有 CPU 核心。如果用多线程 Python 线程池包装批量调用，
-# 会导致线程过度订阅（Thread Oversubscription：4 Python 线程 × 16 CPU 核 = 64 竞争线程），
-# 反而比单线程更慢。因此批量调用使用 max_workers=1，确保 ONNX 独占 CPU 资源。
+# 批量 Embedding 执行器：ONNX Runtime 自带多线程，此处单工作线程避免线程争用。
 _EMBED_BATCH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="mem_embed_batch")
 
 # Sparse Embedding 降级计数器，用于监控降级频率
@@ -388,10 +381,7 @@ async def upsert_entity_vector(
         summary_vector = name_vector
     sparse_vector = await _sparse_embed_async(name)
 
-    # 2. 锁内写入 (防止并发破坏索引长度同步)
-    # 构建 named vectors：name_dense + summary_dense + sparse
-    # 值类型标注为 Qdrant 的 Vector（dense=list / sparse=SparseVector 均其成员），
-    # 精确对齐 VectorStruct 的命名向量分支，无需 type: ignore。
+    # 构建 named vectors（dense 与 sparse），在集合锁保护下写入 Qdrant。
     vector_data: dict[str, Vector] = {
         "name_dense": name_vector,
         "summary_dense": summary_vector,
@@ -655,9 +645,8 @@ async def _hybrid_search_edges(
     """搜索 Edge，并批量回填 source_name / target_name"""
     results = await _hybrid_search_impl(MEMORY_EDGES_COLLECTION, query, scope_keys, top_k)
 
-    # Qdrant payload 字段可能因迁移 / 手工 patch 缺失（即便正常路径全字段写入）。
-    # 按 AGENTS.md §1.4 显式用 `in` + isinstance 守卫后直接访问，不使用 .get / getattr 兜底，
-    # 也不使用 `dict[k] if k in d else default` 这类 .get 的同义改写。
+    # Qdrant payload 字段可能因迁移或 patch 缺失。
+    # 依 §1.4 使用 in 与 isinstance 守卫直接访问。
     entity_ids: set[str] = set()
     for r in results:
         if "source_entity_id" in r and isinstance(r["source_entity_id"], str):
@@ -779,16 +768,12 @@ async def _hybrid_search_impl(
         else:
             raw_must = scope_filter.must
             must: list[Condition] = []
-            if isinstance(raw_must, list):
-                must.extend(c for c in raw_must if c is not None)
-            elif raw_must is not None:
-                must.append(raw_must)
+            if raw_must is not None:
+                must.extend(raw_must)
             scope_filter = Filter(must=must + extra_conds)
 
-    # 余弦门**只能**下推到 dense 分支（hybrid_query 的 dense_score_threshold）：混合检索时
-    # query_points 返回的是 RRF 名次分（~1/(60+rank)≈0.016），再用余弦阈值后筛会误杀全部命中
-    # （sparse 活跃时记忆召回恒空）。与 knowledge.py 一致——融合分不做余弦硬筛，相关性精排交给
-    # 上层 dual_route 的 Reranker（见 rag/hybrid.py 模块文档）。
+    # 余弦门仅下推至 dense 分支；混合检索 RRF 名次分不能作余弦硬筛。
+    # 融合精排交由上层 dual_route 的 Reranker 处理。
     points = await hybrid_query(
         collection_name,
         query_dense,
@@ -961,17 +946,20 @@ async def get_entities_by_ids(entity_ids: list[str], scope_keys: list[str]) -> l
         if payload is None:
             continue
         # 过滤不在指定 scope_keys 中的 entity
-        entity_scope_key = payload.get("scope_key", "")
-        if entity_scope_key not in scope_keys:
+        entity_scope_key = payload["scope_key"] if "scope_key" in payload else ""
+        if not isinstance(entity_scope_key, str) or entity_scope_key not in scope_keys:
             continue
 
-        tag = payload.get("tag", [])
+        tag = payload["tag"] if "tag" in payload else []
+        tag_text = ",".join(item for item in tag if isinstance(item, str)) if isinstance(tag, list) else ""
+        name = payload["name"] if "name" in payload else ""
+        summary = payload["summary"] if "summary" in payload else ""
         entities.append(
             {
                 "id": str(r.id),
-                "name": payload.get("name", ""),
-                "summary": payload.get("summary", ""),
-                "entity_type": ",".join(tag) if isinstance(tag, list) else str(tag),
+                "name": name if isinstance(name, str) else "",
+                "summary": summary if isinstance(summary, str) else "",
+                "entity_type": tag_text,
                 "layer": 0,
                 "score": 0.0,  # One-hop 邻居无相关性分数
             }
@@ -980,10 +968,8 @@ async def get_entities_by_ids(entity_ids: list[str], scope_keys: list[str]) -> l
     return entities
 
 
-# ─────────────────────────────────────────────
 # RF-Mem 双过程检索：熟悉度探针 + 回忆环用向量操作
 # 设计：plans/rf_mem_dual_process_retrieval_assessment_20260614.md
-# ─────────────────────────────────────────────
 
 
 async def embed_query(text: str) -> list[float]:
@@ -1074,11 +1060,9 @@ async def dense_search_episodes_with_vectors(
         return []
 
     scope_filter = _scope_filter(scope_keys)
-    # 去重：把已见 Episode 作为 must_not HasId 叠加到 scope 过滤上（回忆环 seen 集很小，安全封顶）。
-    # 即便 scope_filter 为 None（未来可能出现"空 scope 全量检索 + 去重"的调用）也保证去重生效，
-    # 不让 must_not 因缺 scope 条件而静默失效。
+    # 将已见 Episode 作为 must_not HasId 叠加到过滤条件，保证空 scope 时依然生效。
     if exclude_ids:
-        from qdrant_client.models import HasIdCondition, ExtendedPointId
+        from gsuid_core.ai_core.rag.qmodels import HasIdCondition, ExtendedPointId
 
         # str id 是合法的 ExtendedPointId，但 qdrant stub 中 list 不变性令直传报错；
         # must_not 的输出元素类型(含 tuple)亦宽于其入参所需的 List[Condition]——均用 cast 收口。
@@ -1111,23 +1095,25 @@ async def dense_search_episodes_with_vectors(
         if isinstance(p.vector, dict) and "dense" in p.vector and isinstance(p.vector["dense"], list):
             # dense 恒为一维；过滤出数值元素，排除多向量分支以对齐 list[float]
             vec = [float(x) for x in p.vector["dense"] if isinstance(x, (int, float))]
-        payload = p.payload or {}
+        payload = p.payload if p.payload is not None else {}
+        content = payload["content"] if "content" in payload else ""
+        scope_key = payload["scope_key"] if "scope_key" in payload else ""
+        raw_ts = payload["valid_at_ts"] if "valid_at_ts" in payload else None
+        valid_at = float(raw_ts) if isinstance(raw_ts, (int, float)) and not isinstance(raw_ts, bool) else None
         out.append(
             {
                 "id": str(p.id),
                 "vector": vec,
                 "score": p.score,
-                "content": payload["content"] if "content" in payload else "",
-                "valid_at_ts": payload["valid_at_ts"] if "valid_at_ts" in payload else None,
-                "scope_key": payload["scope_key"] if "scope_key" in payload else "",
+                "content": content if isinstance(content, str) else "",
+                "valid_at_ts": valid_at,
+                "scope_key": scope_key if isinstance(scope_key, str) else "",
             }
         )
     return out
 
 
-# ─────────────────────────────────────────────
-# 生命周期裁剪 / 对账用向量操作（§3.2①、§2）
-# ─────────────────────────────────────────────
+# --- 生命周期裁剪 / 对账用向量操作（§3.2①、§2） ---
 
 
 async def demote_episodes_to_cold(episode_ids: list[str]) -> list[str]:
@@ -1139,9 +1125,8 @@ async def demote_episodes_to_cold(episode_ids: list[str]) -> list[str]:
     返回**已成功从热集合删除**的 Episode id 列表——调用方据此回写 SQL is_archived，
     确保"标记为冷"与"已退出热集合"严格一致；删除失败的批次保持热态，下次维护重试。
     """
-    from qdrant_client.http.models import PointIdsList
-
     from gsuid_core.ai_core.rag.base import client
+    from gsuid_core.ai_core.rag.qmodels import PointIdsList
 
     if client is None or not episode_ids:
         return []
@@ -1216,9 +1201,8 @@ async def scroll_point_ids(collection_name: str, batch_size: int = 500):
 
 async def delete_points_by_ids(collection_name: str, point_ids: list[str]) -> int:
     """按 id 从指定 Collection 删除一批 point。返回请求删除的数量（失败返回 0）。"""
-    from qdrant_client.http.models import PointIdsList
-
     from gsuid_core.ai_core.rag.base import client
+    from gsuid_core.ai_core.rag.qmodels import PointIdsList
 
     if client is None or not point_ids:
         return 0

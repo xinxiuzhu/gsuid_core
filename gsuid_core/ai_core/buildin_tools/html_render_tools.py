@@ -9,11 +9,14 @@ import json
 import base64
 import asyncio
 import datetime
-from typing import Any, Tuple, Literal, Optional
+from typing import TYPE_CHECKING, Any, Tuple, Literal, Optional
 from pathlib import Path
 
 import httpx
 from pydantic_ai import RunContext
+
+if TYPE_CHECKING:
+    from PIL.Image import Image as PILImage
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
@@ -22,6 +25,7 @@ from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.utils.html_render import im_templates, render_md_to_bytes, render_html_to_bytes
 from gsuid_core.utils.resource_manager import RM
+from gsuid_core.ai_core.buildin_tools.render_kit import PHOTO_LAYOUTS, page_layout, inject_render_kit
 
 # 嵌图上限：防 agent 把数 MB 原图塞进 HTML 撑爆上下文
 _EMBED_MAX_BYTES = 450_000
@@ -29,12 +33,14 @@ _EMBED_HTTP_TIMEOUT = 12.0
 _EMBED_USER_AGENT = "GsCore-HTMLEmbed/1.0 (+local-render)"
 # 单次 HTML 自动嵌图：并发与数量上限（通用，不按业务域特判）
 _AUTO_EMBED_MAX_IMAGES = 32
-_AUTO_EMBED_MAX_SIDE = 512
+# 840 逻辑宽 × 2 倍像素比，满宽头图要 1680px 才不糊；嵌入图最长边仍是 1280
+_AUTO_EMBED_MAX_SIDE = 1280
 _AUTO_EMBED_CONCURRENCY = 6
 # Iconify 按需单图标（约 1KB），替代本地 100MB 图标包
 _ICONIFY_SVG_URL = "https://api.iconify.design/{prefix}/{name}.svg"
 _ICON_SOURCE_RE = re.compile(
-    r"^icon:(?P<prefix>[a-z0-9-]+)/(?P<name>[a-z0-9-]+)$",
+    r"^icon:(?P<prefix>[a-z0-9-]+)/(?P<name>[a-z0-9-]+)"
+    r"(?:\?color=(?:#|%23)?(?P<color>[0-9a-f]{3}|[0-9a-f]{6}))?$",
     re.IGNORECASE,
 )
 # HTML <img src="...">（属性顺序任意）
@@ -52,9 +58,7 @@ _TRANSPARENT_1PX_PNG = (
     "data:image/png;base64,"
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
-# Takumi 引擎卫生 CSS：无主题、无业务域；修常见引擎坑
-# 注意：不在此强制 body 背景色（避免盖掉 agent 浅色主题）；透明 PNG 由
-# ``_ensure_opaque_image_bytes`` 在出图后合成实色底。
+# Takumi 引擎基础 CSS，不强制 body 背景色以避免覆盖浅色主题。
 _TAKUMI_ENGINE_HYGIENE_CSS = """
 /* engine hygiene — not a visual theme */
 img{max-width:100%;height:auto;}
@@ -76,15 +80,16 @@ img{max-width:100%;height:auto;}
 
 # IM 出图逻辑宽上限（CSS 像素）。再宽 QQ 气泡按宽缩小后正文会糊。
 _LOGICAL_WIDTH_MAX = 1000
+_LOGICAL_WIDTH_DEFAULT = 840
 
 
 def _clamp_logical_width(max_width: int) -> int:
     try:
         w = int(max_width)
     except (TypeError, ValueError):
-        return 900
+        return _LOGICAL_WIDTH_DEFAULT
     if w < 1:
-        return 900
+        return _LOGICAL_WIDTH_DEFAULT
     return min(w, _LOGICAL_WIDTH_MAX)
 
 
@@ -118,15 +123,14 @@ body{{
 }}
 h1{{font-size:26px;font-weight:700;color:#fff;margin:0 0 6px;line-height:1.25;}}
 h2{{
-  font-size:15px;font-weight:630;color:#e9eef7;margin:22px 0 12px;
-  border-left:4px solid #5b9dd9;padding-left:10px;
+  font-size:16px;font-weight:630;color:#e9eef7;margin:22px 0 12px;
 }}
 .meta{{font-size:12px;color:#6b7890;margin-bottom:16px;letter-spacing:0.02em;}}
 .grid,.mgrid{{display:flex;gap:12px;margin:8px 0 4px;}}
 .metric{{
   width:220px;background:linear-gradient(160deg,#1a2740,#131d30);
-  border:1px solid rgba(91,157,217,0.14);border-radius:16px;
-  padding:16px 14px;border-top:3px solid #5b9dd9;
+  border:1px solid rgba(91,157,217,0.18);border-radius:16px;
+  padding:16px 14px;
   box-shadow:0 4px 18px rgba(0,0,0,0.32);
 }}
 .metric .lab,.lab{{font-size:11px;color:#6b7890;font-weight:700;letter-spacing:0.08em;}}
@@ -292,10 +296,11 @@ def _rewrite_html_tables(html: str) -> str:
 
 
 def _prepare_free_html(html_content: str) -> str:
-    """自由 HTML 预处理：不套设计壳；table 改写；注入引擎卫生 CSS（无主题）。"""
+    """自由 HTML 预处理：不套设计壳；用到 ``gs-`` 类时前置组件库；table 改写；引擎卫生 CSS。"""
     html = html_content.strip()
     if not html:
         return html
+    html = inject_render_kit(html)
     html = _rewrite_html_tables(html)
     from gsuid_core.utils.html_render.svg_chart_rewrite import rewrite_svg_charts_for_takumi
 
@@ -374,6 +379,17 @@ def _ensure_opaque_image_bytes(
     return buf.getvalue()
 
 
+def _render_emit_key(ctx: RunContext[ToolContext], task_id: str) -> str:
+    # 群会话 id 人人共享，不能当去重键；无 task 时用本轮 turn_id。
+    if task_id:
+        return task_id
+    extra = ctx.deps.extra
+    turn = extra["turn_id"] if "turn_id" in extra else ""
+    if isinstance(turn, str) and turn:
+        return f"turn:{turn}"
+    return ""
+
+
 def _mark_render_emitted(task_id: str) -> None:
     if not task_id:
         return
@@ -392,8 +408,13 @@ async def _try_send_image(ctx: RunContext[ToolContext], image_bytes: bytes) -> b
     bot = ctx.deps.bot
     if bot is None:
         return False
+    from gsuid_core.ai_core.agent_run.support import turn_reply_metadata
+
     try:
-        await bot.send(MessageSegment.image(image_bytes))
+        await bot.send(
+            MessageSegment.image(image_bytes),
+            extra_metadata=turn_reply_metadata(ctx.deps.ev),
+        )
         return True
     except Exception as e:
         logger.debug(t("log.htmlrender.auto_send_fallback", e=e))
@@ -472,8 +493,9 @@ async def _finish_image(ctx: RunContext[ToolContext], image_bytes: bytes) -> str
 
     plan = get_plan_context()
     task_id = plan.task_id if plan is not None else ""
+    emit_key = _render_emit_key(ctx, task_id)
 
-    if task_id and task_id in _RENDER_EMITTED_TASKS:
+    if emit_key and emit_key in _RENDER_EMITTED_TASKS:
         return (
             "⚠️ 本任务已成功出过图，本次未再产出。"
             "请把全部区块合并进**一张**完整 HTML，只调用一次 render_html_to_image；"
@@ -483,8 +505,8 @@ async def _finish_image(ctx: RunContext[ToolContext], image_bytes: bytes) -> str
     # 能力代理 / 子 Agent：禁止直发；优先落盘 image artifact 供主人格发送
     if not ctx.deps.allow_user_outbound:
         handle = await _register_image_artifact(image_bytes)
-        _mark_render_emitted(task_id)
         if handle:
+            _mark_render_emitted(emit_key)
             return _RENDER_OK_HANDLE.format(
                 kb=len(image_bytes) // 1024,
                 handle_part=f"，句柄 `{handle}`",
@@ -493,13 +515,14 @@ async def _finish_image(ctx: RunContext[ToolContext], image_bytes: bytes) -> str
         return image_bytes
 
     if await _try_send_image(ctx, image_bytes):
-        _mark_render_emitted(task_id)
+        _mark_render_emitted(emit_key)
         # 主人格直发时仍尽量登记 artifact，便于追溯
         await _register_image_artifact(image_bytes)
         return _RENDER_OK_SENT.format(kb=len(image_bytes) // 1024)
-    _mark_render_emitted(task_id)
     handle = await _register_image_artifact(image_bytes)
     if handle:
+        # 直发失败但已有句柄，仍算本轮已产出。
+        _mark_render_emitted(emit_key)
         return _RENDER_OK_HANDLE.format(
             kb=len(image_bytes) // 1024,
             handle_part=f"，句柄 `{handle}`",
@@ -717,7 +740,7 @@ def _build_card_html(card_type: str, title: str, meta: str, payload: dict[str, A
     raise ValueError(f"未知 card_type: {card_type}，可选: {', '.join(sorted(_CARD_TYPES))}")
 
 
-@ai_tools(category="media", capability_domain="资料出图")
+@ai_tools(category="media", capability_domain="资料出图", code_callable=False)
 async def render_card(
     ctx: RunContext[ToolContext],
     card_type: Literal[
@@ -806,38 +829,43 @@ def _bytes_to_data_uri(data: bytes, mime: Optional[str] = None) -> str:
     return f"data:{m};base64,{base64.b64encode(data).decode('ascii')}"
 
 
+def has_transparency(im: "PILImage") -> bool:
+    if im.mode in ("RGBA", "LA"):
+        lo = im.getchannel("A").getextrema()[0]
+        return isinstance(lo, (int, float)) and lo < 255
+    return im.mode == "P" and "transparency" in im.info
+
+
 def _shrink_raster_if_needed(data: bytes, *, max_side: int, max_bytes: int) -> bytes:
-    """过大位图缩边 + 再编码；SVG 原样返回。失败则返回原 bytes。"""
-    mime = _sniff_image_mime(data)
-    if mime == "image/svg+xml":
+    """过大位图缩边 + 再编码（不透明图出 JPEG）；SVG 原样返回。解码失败返回原 bytes。"""
+    if _sniff_image_mime(data) == "image/svg+xml":
         return data
-    if len(data) <= max_bytes and max_side <= 0:
-        return data
+    from io import BytesIO
+
+    from PIL import Image, ImageOps, UnidentifiedImageError
+
+    # 只兜外部图片解码失败（损坏字节 / 超大图）
     try:
-        from io import BytesIO
-
-        from PIL import Image
-
         im = Image.open(BytesIO(data))
         im.load()
-        if max_side > 0 and max(im.size) > max_side:
-            im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
-        buf = BytesIO()
-        out_fmt = "PNG" if im.mode in ("RGBA", "P") or mime == "image/png" else "JPEG"
-        if out_fmt == "JPEG" and im.mode in ("RGBA", "P"):
-            im = im.convert("RGB")
-        save_kw: dict[str, Any] = {"optimize": True}
-        if out_fmt == "JPEG":
-            save_kw["quality"] = 85
-        im.save(buf, format=out_fmt, **save_kw)
-        out = buf.getvalue()
-        # 仍超限则更激进缩边
-        if len(out) > max_bytes and max_side > 128:
-            return _shrink_raster_if_needed(out, max_side=max(128, max_side // 2), max_bytes=max_bytes)
-        return out
-    except Exception as e:
+    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError) as e:
         logger.debug(t("log.ai.embed_image_for_html_shrink_skip", e=e))
         return data
+    side_ok = max_side <= 0 or max(im.size) <= max_side
+    if side_ok and len(data) <= max_bytes:
+        return data
+    im = ImageOps.exif_transpose(im)
+    if not side_ok:
+        im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    buf = BytesIO()
+    if has_transparency(im):
+        im.save(buf, format="PNG", optimize=True)
+    else:
+        im.convert("RGB").save(buf, format="JPEG", quality=85, optimize=True)
+    out = buf.getvalue()
+    if len(out) > max_bytes and max_side > 128:
+        return _shrink_raster_if_needed(out, max_side=max(128, max_side // 2), max_bytes=max_bytes)
+    return out
 
 
 async def _download_url_bytes(url: str) -> Tuple[Optional[bytes], Optional[str]]:
@@ -870,6 +898,14 @@ async def _download_url_bytes(url: str) -> Tuple[Optional[bytes], Optional[str]]
     return data, None
 
 
+def _iconify_url(prefix: str, name: str, color: Optional[str]) -> str:
+    """``<img>`` 里的 SVG 不吃 CSS color，着色只能让 Iconify 出图时填。"""
+    url = _ICONIFY_SVG_URL.format(prefix=prefix, name=name)
+    if color:
+        url += f"?color=%23{color.lower()}"
+    return url
+
+
 async def _resolve_embed_source_bytes(
     source: str,
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
@@ -892,7 +928,7 @@ async def _resolve_embed_source_bytes(
     if m is not None:
         prefix = m.group("prefix").lower()
         name = m.group("name").lower()
-        url = _ICONIFY_SVG_URL.format(prefix=prefix, name=name)
+        url = _iconify_url(prefix, name, m.group("color"))
         data, err = await _download_url_bytes(url)
         if err is not None or data is None:
             return None, None, f"图标拉取失败 ({prefix}/{name}): {err or '空响应'}"
@@ -1017,103 +1053,111 @@ async def _auto_embed_html_images(html: str) -> str:
     return out
 
 
+_PHOTO_HANDLE_RE = re.compile(r"""src\s*=\s*["']img_""", re.IGNORECASE)
+
+
+def embed_photo_block_reason(html: str, *, embed_on: bool, searched: bool, found: bool) -> str | None:
+    """嵌入配图开启且版式需要照片时，没搜过或搜到了却没写进 HTML，就拒绝渲染。
+
+    没声明 ``layout-*`` 按需要照片处理。
+    """
+    if not embed_on or _PHOTO_HANDLE_RE.search(html):
+        return None
+    layout = page_layout(html)
+    if layout is not None and layout not in PHOTO_LAYOUTS:
+        return None
+    undeclared = (
+        "gs-page 上没有声明 layout-*：先按内容选一个版式。数据看板 / 排行 / 对比 / 时间线 / 简报不强制照片。"
+        if layout is None
+        else ""
+    )
+    if not searched:
+        return (
+            f"{undeclared}layout-{layout or 'feature'} 需要照片，还没有拉图。"
+            "先调一次 find_images（主题图 + 每个主要对象一个词），把返回的 img_ 句柄写进 HTML 再渲染。"
+            "task 里写图源缺失、官方图拉不到，仍然要搜。"
+        )
+    if found:
+        return (
+            f"{undeclared}find_images 已经返回了 img_ 句柄，HTML 里一张都没用。"
+            "把句柄写进照片槽位（gs-hero / gs-split-media / gs-cover / gs-thumb）后再渲染。"
+        )
+    return None
+
+
 # 与 card/md 同属 media：主人格不保底；由 render_agent 白名单持有
-@ai_tools(category="media", capability_domain="资料出图")
+@ai_tools(category="media", capability_domain="资料出图", code_callable=False)
 async def render_html_to_image(
     ctx: RunContext[ToolContext],
     html_content: str,
     image_format: Literal["png", "jpeg"] = "png",
-    max_width: int = 900,
+    max_width: int = 840,
 ) -> str | bytes:
-    """将自定义 HTML 渲染为高清图片并自动发送。**render_agent 出图主工具**。
+    """将 HTML 渲染为手机竖屏长图并自动发送。**render_agent 出图主工具**。
 
     主人格应 ``create_subagent(agent_profile="render_agent", task=...)`` 委派，勿自行堆 HTML。
-    **自由创作，无固定业务模板。** 按内容自写 HTML + CSS，不要套固定「指标卡 + 横条」。
-    系统**不会**再自动套暗色设计壳。
+    整份事实包只渲**一张**：多区块写在同一 HTML 里，不要连调本工具。
 
-    ## 写法
-    - 推荐完整文档：``<!DOCTYPE html><html><head><style>...</style></head><body>...</body></html>``
-    - 也可只写片段 + 内联 ``<style>``；视口宽 = max_width（**上限 1000**，再大会被夹），高度随内容自适应
-    - **IM 字号**：正文 ≥16px，辅助 ≥13px，badge ≥13px；禁止 10–12px 当正文。QQ 会按气泡宽度缩小整图。
-    - **整页不透明背景**（必写）：先选**暗色或浅色**主题，再写 page/text 成套 color；
-      禁止透明/缺省底（会出透明 PNG）。``#0f172a`` 只是暗色示例，不是唯一合法值。
-      - 暗色例：``html,body{{background:#0f172a;color:#e2e8f0;}}`` 且 h1/标题显式浅色
-      - 浅色例：``html,body{{background:#f4f6fa;color:#1a2332;}}`` 且标题深色
-    - **默认整份事实包只渲一张**：多区块写在同一 HTML 里，不要连调本工具多次
-    - 中文字体用 ``"MiSans","PingFang SC","Microsoft YaHei",sans-serif``
-    - 布局优先 flex / 基础 grid；可用原生 ``<table>``（引擎侧自动改写为 flex 网格）
-    - 多项对比/列表/面板：用表格或自写卡片均可，禁止把长数据念成台词
-    - **对比度（暗色必看）**：深色页底时，h1/h2/.title/.headline/**正文** **必须显式**浅色
-      （如 ``#edf4ff`` / ``#e2e8f0``）；禁止只写字号不写颜色、禁止暗底深字/默认黑；
-      卡片用略亮的不透明 surface，勿靠全透明层。浅色主题则主文字须足够深。
-      **字重（MiSans VF，轴 150–700）**：正文 330/400，小节/badge 520，标题 630，超大数字 700。
-      写 ``800``/``900`` 会被夹到 700，不会更粗。也可用 ``font-variation-settings:"wght" 330``。
-    - **颜色语义**：同一页一套语义色（如 ↑/↓ 各一色）。暗底上强调色用偏亮的绿/红/金；
-      浅底上用略深的语义色。**class 优先级**：``.item .value.up`` 须能盖过 ``.item .value``，
-      禁止基类 ``color`` 盖掉修饰 class；状态色优先单 class
-    - **短标签**（chip/badge）：用 flex 把字居中进色块（卫生 CSS 只防竖排，不改 display/padding）：
-      ``.badge{display:flex;align-items:center;justify-content:center;padding:4px 10px;line-height:1;font-size:13px;}``
-      父行居中用 ``.row{display:flex;justify-content:center;gap:8px}``。
-      不要靠 ``vertical-align:middle``；不要 ``box-sizing:border-box`` + 极窄 padding（字会探出色块）。
-    - **表格拆列**：价格与涨跌、数量与单位不要写在同一 ``td``（如 ``13.79亿+19.75%`` 拆两列）。
-    - **图表**：≥3 个可比数值先 ``render_chart_spec`` 拿 SVG 再嵌；禁止纯 CSS 色条冒充图。
-      多实体对比传 ``series``（每实体一个 name）+ 图例；有正负含义才 ``signed``。
-      禁止把身份写进单柱 label，禁止用升/降色区分系列。
-      引擎会把 SVG ``<text>`` 提升为 HTML 覆盖层，手写 SVG 同样适用。
-    - **插图 / 图标（一次写完即可）**：直接在 HTML 里写，**系统渲染前自动嵌成 data URI**，
-      无需另调工具：
-      - ``<img src="https://...">`` 外链图
-      - ``<img src="icon:mdi/chart-line">`` 按需矢量图标（~1KB，非本地图标包）
-      - ``<img src="img_xxx">`` / ``res_xxx`` 资源池图
-      - CSS ``background-image:url(https://...|icon:...|img_...)`` 同样自动嵌
-      - 已是 ``data:image/...`` 的原样保留
-      禁止用色块汉字冒充 logo；少用 emoji 当图标，需要图就写 ``<img>``。
+    ## 组件库（推荐）
+    外层写 ``<div class="gs-page layout-xxx theme-xxx">``，版式按内容形态选：
+    feature / gallery / magazine（需要照片）、dashboard / ranking / compare / timeline / brief
+    （照片可选）。用 ``gs-`` 组件拼版（hero / band / split / stat-hero / section / card / cover /
+    media / grid / tile / rank / compare / quote / steps / kpis / timeline / kv / tip / footer）；
+    用到 ``gs-`` 类时系统自动注入组件 CSS，自写 ``<style>`` 可覆盖。
+    主题：paper / ocean / forest / sunset / sakura / violet / slate / ink（ink 为暗色）。
 
-    ## 表格硬约束（引擎无 CSS table 模型，改写后是 div）
-    - **禁原生 rowspan/colspan**：请展平为单层表（重复行）或用
-      ``im_templates.comparison_card`` / ``board_card``；改写器仅近似占位。
-    - **禁 ``td.xxx`` / ``th.xxx`` 选择器**：改写后节点是 ``div.md-table-cell``，
-      请写 ``.xxx`` 或内联 ``style="text-align:right"``。
-    - **数值列**：``4.33x`` / ``~16.5x`` / ``±`` 等单位请用内联 ``style="text-align:right"``
-      或 class ``right``（不要依赖仅匹配 ``td`` 的选择器）。
-    - **窄列 CJK**：默认可逐字断行；短标签靠卫生 CSS；普通格请 ``word-break:keep-all``，
-      禁止手写 ``农<br>业<br>种<br>植`` 式竖排。
-    - **字号**：正文 ≥16px，辅助 / badge ≥13px；勿用 10–12px 全文。
+    ## 图片
+    - 嵌入配图开启且版式需要照片（feature / gallery / magazine，或没声明版式）时，必须先
+      ``find_images``，再把返回的 ``img_`` 写进 HTML，否则拒绝渲染。搜过且一张都没有，才允许改用图标。
+    - 其余版式照片可选：数据看板的主图是图表，排行 / 对比可放 logo 或缩略图。
+    - 嵌入配图关闭时不要调 ``find_images``。
+    - 照片必须放进带圆角的容器（``gs-hero`` / ``gs-split-media`` / ``gs-cover`` / ``gs-thumb`` /
+      ``gs-avatar``），
+      img 是容器第一个子元素。Takumi 只在容器有 border-radius 时裁切；
+      **禁止**用 ``background-image`` 放照片，**禁止**给裸 ``<img>`` 写 margin / 固定高度。
+    - 图标：``<img src="icon:mdi/map-marker?color=1d6fb8">``（Iconify，颜色要写在 src 里）。
 
-    ## 示例（token 占位，禁止照抄色值；下列两份骨架互不同构）::
-
-        /* A. 双栏简报（浅色纸感）—— page/surface/text/title 自己填，勿抄 #0f172a */
-        <!DOCTYPE html><html><head><meta charset="utf-8"><style>
-        html,body{font-family:"MiSans","Microsoft YaHei",sans-serif;padding:24px;
-          background:<page>;color:<text>;}
-        h1{font-size:22px;margin:0 0 12px;color:<title>;font-weight:630;}
-        .layout{display:flex;gap:16px;align-items:flex-start;}
-        .col-k{width:240px;flex:none;} .col-e{flex:1;}
-        .card{background:<surface>;border-radius:12px;padding:12px;
-          box-shadow:0 1px 4px rgba(0,0,0,0.08);border-top:3px solid <accent>;}
-        .badge{display:flex;align-items:center;justify-content:center;
-          padding:3px 10px;line-height:1;border-radius:999px;font-weight:520;}
-        table{width:100%;} th,td{padding:8px 10px;text-align:left;}
-        .right{text-align:right;} .up{color:<up>;}
-        </style></head><body>
-        <h1>结论句</h1>
-        <div class="layout"><div class="col-k"><div class="card">KPI…</div></div>
-        <div class="col-e"><div class="card">表/论据…（价格、涨跌分两列）</div></div></div>
-        </body></html>
-
-        /* B. 对比棚 / 时间轴脊：每实体一列色带，或中间轴+左右卡；不要再套编号竖卡 */
+    ## 硬约束
+    - 逻辑宽默认 840，上限 1000。高度随内容，整图高宽比不超过 3.8。
+    - 字号：正文 18–20px，辅助 ≥15px，标题 ≥36px；禁止 14px 以下的正文。
+    - 整页不透明底；明暗 token 自洽（暗底浅字 / 浅底深字），定义 background 必须同级写 color。
+    - 字重 MiSans VF 轴 150–700：正文 400，小节 520，标题 630，大数字 700；800/900 无效。
+    - 无 JS / float / 列表符号 / 伪元素排版；布局用 flex 或基础 grid。
+    - Mermaid 用 class="mermaid" 或 language-mermaid。服务向 mermaid.ink 取 SVG 再出图，
+      不要在页面里引 mermaid.js。服务不可用时只有该块变成黑底红字，整页仍出图。
+    - ``<table>`` 会被改写成 flex 行：禁 rowspan/colspan、禁 ``td.xxx`` 选择器；价格与涨跌拆两列。
+    - ≥3 个可比数值先 ``render_chart_spec`` 拿 SVG 再嵌；多实体传 ``series`` + 图例。
 
     Args:
         ctx: 工具执行上下文
-        html_content: 完整 HTML 或带样式的片段（按内容自由设计）
+        html_content: 完整 HTML 文档或带 ``<style>`` 的片段
         image_format: 默认 png
-        max_width: 默认 900，硬上限 1000（IM 可读；再宽 QQ 缩小后糊）
+        max_width: 逻辑宽，默认 840，硬上限 1000
 
     Returns:
         文本确认，或 bot 不可用时的图片 bytes
     """
     if not html_content or not html_content.strip():
         return "渲染失败：HTML内容不能为空"
+
+    from gsuid_core.ai_core.configs.ai_config import render_embed_images_enabled
+
+    searched = False
+    found = False
+    deps = ctx.deps
+    if isinstance(deps, ToolContext):
+        if "find_images_ran" in deps.extra:
+            searched = deps.extra["find_images_ran"] is True
+        if "find_images_found" in deps.extra:
+            found = deps.extra["find_images_found"] is True
+    blocked = embed_photo_block_reason(
+        html_content,
+        embed_on=render_embed_images_enabled(),
+        searched=searched,
+        found=found,
+    )
+    if blocked:
+        return blocked
 
     try:
         # 先自动嵌图（外链/icon/资源），再 table 改写与引擎卫生 CSS
@@ -1141,7 +1185,7 @@ async def render_html_to_image(
         )
 
 
-@ai_tools(category="media", capability_domain="资料出图")
+@ai_tools(category="media", capability_domain="资料出图", code_callable=False)
 async def render_markdown_to_image(
     ctx: RunContext[ToolContext],
     title: str,
@@ -1153,6 +1197,7 @@ async def render_markdown_to_image(
 
     需要自定义布局、指标卡、时间线时优先 ``render_html_to_image``（``render_agent``）。
     ≥3 条数据点时必须出图；角色台词只留一两句引导。
+    mermaid 代码块会向 mermaid.ink 取 SVG 再出图。服务不可用时该块变成黑底红字，其余照常出图。
 
     Args:
         ctx: 工具执行上下文

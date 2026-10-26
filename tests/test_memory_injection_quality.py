@@ -39,9 +39,7 @@ def _episode(content: str, valid_at: str = "2026-07-15T14:34:00", eid: str = "ep
     return Episode(id=eid, content=content, valid_at=valid_at, scope_key="group:1", embedding=[])
 
 
-# ─────────────────────────────────────────────
-# §6 残句拦截判据
-# ─────────────────────────────────────────────
+# --- §6 残句拦截判据 ---
 
 
 def test_to_prompt_text_facts_include_statement_and_event_time() -> None:
@@ -148,9 +146,7 @@ def test_injection_drops_dangling_facts() -> None:
     assert "紫菜包饭" in text
 
 
-# ─────────────────────────────────────────────
-# §7 第三方隐私拦截
-# ─────────────────────────────────────────────
+# --- §7 第三方隐私拦截 ---
 
 
 def test_third_party_sensitive_fact_dropped() -> None:
@@ -204,9 +200,7 @@ def test_deployer_extra_sensitive_terms(monkeypatch: pytest.MonkeyPatch) -> None
     assert "高考分数" in allowed
 
 
-# ─────────────────────────────────────────────
-# §8 untrusted 包装
-# ─────────────────────────────────────────────
+# --- §8 untrusted 包装 ---
 
 
 def test_recall_wrapped_preferences_not() -> None:
@@ -251,9 +245,7 @@ def test_no_recall_no_wrapper() -> None:
     assert "回复保持简短" in text
 
 
-# ─────────────────────────────────────────────
-# §9 偏好三段式 + 仲裁语
-# ─────────────────────────────────────────────
+# --- §9 偏好三段式 + 仲裁语 ---
 
 
 def test_preference_header_has_arbitration() -> None:
@@ -281,9 +273,7 @@ def test_preference_prompt_teaches_three_part_rule() -> None:
     assert "原话" in PREFERENCE_EXTRACTION_SYSTEM
 
 
-# ─────────────────────────────────────────────
-# §25(4) 条数硬上限
-# ─────────────────────────────────────────────
+# --- §25(4) 条数硬上限 ---
 
 
 def test_fact_lines_hard_cap() -> None:
@@ -1705,3 +1695,40 @@ def test_to_prompt_text_count_query_keeps_latest_not_old_tail() -> None:
     )
     assert "157 commits" in text
     assert "150 commits" not in text
+
+
+def test_self_recent_window_follows_the_supplied_clock() -> None:
+    """近 2h 的 SELF 续聊按本轮时钟算。墙钟会把回放当时还没发生的话塞进近期桶。"""
+    from datetime import datetime, timedelta
+
+    clock = datetime(2024, 6, 1, 12, 0, 0)
+    wall = datetime.now()
+    filler = Episode(
+        id="old",
+        content="user: " + ("甲" * 500),
+        valid_at="2024-05-01 09:00:00",
+        scope_key="self:bot",
+        embedding=[],
+    )
+    scarf = Episode(
+        id="scarf",
+        content="user: 时钟内的绿色围巾",
+        valid_at="2024-06-01 11:00:00",
+        scope_key="self:bot",
+        embedding=[],
+    )
+    coat = Episode(
+        id="coat",
+        content="user: 专名蓝色外套待取",
+        valid_at=(wall - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S"),
+        scope_key="self:bot",
+        embedding=[],
+    )
+    mem = MemoryContext(episodes=[filler, scarf, coat])
+    query = "外套放哪了"
+    played = mem.to_prompt_text(max_chars=4000, query=query, now=clock)
+    assert "绿色围巾" in played
+    assert "蓝色外套" not in played
+    live = mem.to_prompt_text(max_chars=4000, query=query, now=wall)
+    assert "蓝色外套" in live
+    assert "绿色围巾" not in live

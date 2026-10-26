@@ -3,6 +3,7 @@ import re
 import json
 import base64
 import asyncio
+import contextvars
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -12,6 +13,7 @@ from typing import (
     Tuple,
     Union,
     Literal,
+    Mapping,
     Callable,
     Optional,
     Protocol,
@@ -61,8 +63,22 @@ MEME_TAG_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# 模型输出的沉默/控制标记：命中时跳过发送，对话层保持静默
-# 所有需要过滤这些标记的地方都应引用此常量，避免散落多处维护不一致
+# 表情没有字数，按 7 个字计，间隔是 1 秒。
+MEME_PAUSE_CHARS = 7
+
+
+def bubble_pause(char_count: int) -> float:
+    """两条出站消息的间隔。字数 / 7 秒，最短 0.5，最长 3。"""
+    return min(max(char_count / 7, 0.5), 3.0)
+
+
+async def pause_before_meme() -> None:
+    """表情包发出前等待，和文字气泡用同一条间隔。"""
+    await asyncio.sleep(bubble_pause(MEME_PAUSE_CHARS))
+
+
+# 模型输出的沉默/控制标记：命中时跳过发送。散落多处应引用此常量。
+# 集合只放带括号的 CJK 别名：裸「沉默」做子串会误伤「我选择沉默」。
 SILENCE_MARKERS: frozenset[str] = frozenset(
     {
         "<SILENCE>",
@@ -70,21 +86,24 @@ SILENCE_MARKERS: frozenset[str] = frozenset(
         "SILENCE",
         "<end_turn>",
         "<no_tool_call>",
+        "<沉默>",
+        "[沉默]",
     }
 )
 
 # 协议标签（开/闭/自闭合）。代码块内字面量不剥，避免教学回复被当成沉默。
+# 模型常把 <SILENCE> 写成 CJK「<沉默>」；不认会当正文发出并盖掉本轮已写好的答复。
 _PROTOCOL_TAG_RE = re.compile(
-    r"<\s*/?\s*(?:silence|end_turn|no_tool_call)\s*/?\s*>"
-    r"|\[\s*silence\s*\]",
+    r"<\s*/?\s*(?:silence|end_turn|no_tool_call|沉默)\s*/?\s*>"
+    r"|\[\s*(?:silence|沉默)\s*\]",
     re.IGNORECASE,
 )
 _PROTOCOL_CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
 _BARE_SILENCE_RE = re.compile(r"^\s*silence\s*$", re.IGNORECASE)
 _PROTOCOL_EMPTYISH_RE = re.compile(r"^[\s\-–—.,，。！？!?、；;：:\u3000·•…]*$")
-# 截断残片：ILENCE> / SILENCE> / <SILENCE（完整标签仍走协议剥离）
+# 截断残片：ILENCE> / SILENCE> / <SILENCE / 沉默> / <沉默。裸「沉默」是可见台词。
 _SILENCE_FRAGMENT_RE = re.compile(
-    r"^\s*(?:ilence>|silence>?|<silence/?)\s*$",
+    r"^\s*(?:ilence>|silence>?|<silence/?|沉默>|<沉默/?)\s*$",
     re.IGNORECASE,
 )
 
@@ -126,10 +145,11 @@ def is_silence_marker(text: str) -> bool:
     return _PROTOCOL_EMPTYISH_RE.match(leftover) is not None
 
 
-_PROTOCOL_TAG_NAMES: tuple[str, ...] = ("silence", "end_turn", "no_tool_call")
+_PROTOCOL_TAG_NAMES: tuple[str, ...] = ("silence", "end_turn", "no_tool_call", "沉默")
 _PROTOCOL_COMPLETE_COMPACT: tuple[str, ...] = (
     *(form for name in _PROTOCOL_TAG_NAMES for form in (f"<{name}>", f"<{name}/>", f"</{name}>", f"</{name}/>")),
     "[silence]",
+    "[沉默]",
 )
 
 
@@ -368,10 +388,20 @@ def _markdown_dark_css_path() -> str:
     return str(Path(__file__).resolve().parent.parent / "utils" / "html_render" / "markdown_dark.css")
 
 
+class _LeakedHandleSender(Protocol):
+    async def send(
+        self,
+        message: Union[Message, List[Message], str, bytes, List[str]],
+        *,
+        extra_metadata: Optional[Mapping[str, object]] = None,
+    ) -> Optional[List[str]]: ...
+
+
 async def _resolve_and_deliver_leaked_handles(
     text: str,
-    bot: Bot,
-    extra_metadata: Optional[Dict[str, Any]] = None,
+    bot: _LeakedHandleSender,
+    extra_metadata: Optional[Mapping[str, object]] = None,
+    ev: Event | None = None,
 ) -> str:
     """处理泄漏进正文的资源句柄：尽量把它**指向的真实资源交付出去**，而不是简单删掉句柄
     留下"详细的放那里面了 …… 自己看吧"这种指向空气的破碎引用——那样对用户反而更莫名其妙
@@ -409,21 +439,56 @@ async def _resolve_and_deliver_leaked_handles(
     for h in handles:
         try:
             if h.startswith("res_"):
+                from gsuid_core.ai_core.outbound import (
+                    lookup_res_owner,
+                    speaker_may_take_res,
+                    release_image_delivery,
+                    note_run_image_delivered,
+                    try_claim_image_delivery,
+                )
                 from gsuid_core.ai_core.planning.models import AIAgentArtifact
 
                 art = await AIAgentArtifact.get_by_id(h)
                 if art is None:
                     continue
+                speaker = str(ev.user_id) if ev is not None and ev.user_id else ""
+                looked = await lookup_res_owner(h)
+                if not speaker_may_take_res(looked, speaker):
+                    logger.warning(
+                        i18n_t(
+                            "log.ai.delivery_owner_mismatch",
+                            res_id=h,
+                            owner=looked.owner_user_id,
+                            target=speaker,
+                        )
+                    )
+                    continue
                 if art.payload_path and (art.mime or "").startswith("image/"):
+                    # 先确认是这张图、再占位；发送失败要释放，避免 7 天内无法重发。
                     image_data = await asyncio.to_thread(_read_image_artifact_bytes, art.payload_path)
-                    if image_data is not None:
+                    if image_data is None:
+                        continue
+                    sid = str(ev.session_id) if ev is not None and ev.session_id else ""
+                    claim = await try_claim_image_delivery(ev, h, session_id=sid)
+                    if claim.refuse is not None:
+                        continue
+                    try:
                         await bot.send(MessageSegment.image(image_data), extra_metadata=extra_metadata)
-                        logger.info(i18n_t("log.ai.send_leaked_handle_was_resolved", h=h))
+                    except Exception as send_err:
+                        logger.debug(i18n_t("log.ai.send_leaked_handle_could_not", h=h, e=send_err))
+                        if claim.occupied:
+                            await release_image_delivery(ev, h)
+                        continue
+                    note_run_image_delivered()
+                    logger.info(i18n_t("log.ai.send_leaked_handle_was_resolved", h=h))
                 elif art.payload_inline and art.payload_inline.strip():
                     inline_texts.append(art.payload_inline.strip())
                 # 非图片落盘文件：不当图片发（会坏），仅抹句柄
             elif h.startswith("img_"):
+                from gsuid_core.ai_core.outbound import note_run_image_delivered
+
                 await bot.send(MessageSegment.image(await RM.get(h)), extra_metadata=extra_metadata)
+                note_run_image_delivered()
                 logger.info(i18n_t("log.ai.send_leaked_handle_was_resolved", h=h))
             # aud_/vid_：极少见于泄漏，仅抹句柄不补发（避免过度耦合）
         except Exception as e:
@@ -803,11 +868,11 @@ async def prepare_content_payload(
     relationship_desc = _build_relationship_description(nickname, str(ev.user_id))
     current_turn_header = f"{relationship_desc}\n"
 
-    # @状态：只在被@时才注入（潜在-01: 修正 is_at_me → is_tome）。
-    # 标注文案唯一定义在 interaction_scaffold（C-3 寻址门按字面匹配它，别在此写字面量）
-    from gsuid_core.ai_core.interaction_scaffold import (
+    # 寻址记号和「--- 消息 ---」的定义在 control/lines.py。
+    from gsuid_core.ai_core.control.lines import (
         DIRECT_MARKER,
         AT_OTHER_MARKER,
+        MSG_SECTION_HEAD,
         QUOTE_TOME_MARKER,
     )
 
@@ -816,7 +881,7 @@ async def prepare_content_payload(
         # 引用 bot 仍是 is_tome，但不要写成「直接找你」逼模型必回。
         current_turn_header += f"{QUOTE_TOME_MARKER if quoted_tome else DIRECT_MARKER}\n"
 
-    current_turn_header += "--- 消息 ---\n"
+    current_turn_header += MSG_SECTION_HEAD
 
     text = current_turn_header
     guard_flags = GuardFlags()
@@ -832,8 +897,10 @@ async def prepare_content_payload(
             body, guard_flags = annotate_untrusted_message_ex(body)
         text += body
 
-    if ev.reply:
-        text += f"\n--- 引用消息 ---\n{ev.reply}\n"
+    is_pure_image_quote = bool((ev.reply_id or quoted_tome) and not ev.reply and ev.image_id_list)
+    if ev.reply or is_pure_image_quote:
+        reply_body = ev.reply if ev.reply else "[引用图片消息]"
+        text += f"\n--- 引用消息 ---\n{reply_body}\n"
         from gsuid_core.ai_core.outbound import resolve_quote
 
         hit = await resolve_quote(ev)
@@ -843,6 +910,8 @@ async def prepare_content_payload(
 
     own = await ownership_hint(ev)
     if own:
+        if not text.endswith("\n"):
+            text += "\n"
         text += f"{own}\n"
 
     if ev.node is not None:
@@ -856,14 +925,20 @@ async def prepare_content_payload(
     # 预处理, 将用户发送的文本/AT/图片ID/音频ID等信息整合到一个字符串中, 方便AI处理
     if ev.image_id_list:
         if lazy_image_read:
-            # 惰性模式：只给图片ID + 一行调用指引，图片本体留在 RM，需要看时再 read_image
-            text += "\n--- 用户发送了图片(未展开, 需要查看内容时调用 read_image(图片ID)) ---"
+            if is_pure_image_quote:
+                text += "\n--- 被引用消息中的图片(未展开, 仅在需要查看原图细节时调用 read_image(图片ID)) ---"
+            else:
+                # 惰性模式：只给图片ID + 一行调用指引，图片本体留在 RM，需要看时再 read_image
+                text += "\n--- 用户发送了图片(未展开, 需要查看内容时调用 read_image(图片ID)) ---"
             for i in ev.image_id_list:
                 text += f"\n图片ID: {i}"
             text += "\n"
         else:
             for i in ev.image_id_list:
-                text += f"\n--- 用户上传图片ID: {i} ---\n"
+                if is_pure_image_quote:
+                    text += f"\n--- 被引用消息图片ID: {i} ---\n"
+                else:
+                    text += f"\n--- 用户上传图片ID: {i} ---\n"
 
     if hasattr(ev, "audio_id") and ev.audio_id:
         text += f"\n--- 用户上传音频ID: {ev.audio_id} ---\n"
@@ -1300,13 +1375,126 @@ def _extract_legacy_report_blocks(text: str) -> Tuple[str, List[Tuple[str, str]]
 # 旧名别名（测试 / 外部若仍 import）
 _extract_report_blocks = _extract_legacy_report_blocks
 
+# 呈现层正在跑 render_agent 时再进来会套娃，退回 markdown 图。
+_PRESENT_RENDER_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("present_render_depth", default=0)
+
+
+def _present_render_task(md: str) -> str:
+    return (
+        "把下面这份已经写好的正文排成一张手机竖屏信息卡。\n"
+        "事实只许来自正文：禁止改数字、专名、剂量、结论和警示句，禁止补写正文里没有的内容。\n"
+        "禁止调用 render_markdown_to_image。只用 gs-page 写一份 HTML，只调用一次 render_html_to_image。\n"
+        "出图后的返回值必须带上图片 res_ 句柄，摘要最多一句。\n\n"
+        f"正文：\n{md}"
+    )
+
+
+def _persona_allows_render_agent(ev: Event | None) -> bool:
+    if ev is None:
+        return False
+    from gsuid_core.ai_core.persona.settings import persona_name_from_event
+    from gsuid_core.ai_core.agent_node.registry import persona_allows_capability_agent
+
+    return persona_allows_capability_agent(persona_name_from_event(ev), "render_agent")
+
+
+async def _send_registered_image(
+    handle: str,
+    bot: Bot,
+    ev: Event,
+    extra_metadata: Optional[Mapping[str, object]],
+) -> bool:
+    """把本轮 render_agent 刚登记的图片发出去。临时任务没有发起人记录，不走跨用户归属校验。"""
+    from gsuid_core.ai_core.outbound import (
+        release_image_delivery,
+        note_run_image_delivered,
+        try_claim_image_delivery,
+    )
+    from gsuid_core.ai_core.planning.models import AIAgentArtifact
+
+    art = await AIAgentArtifact.get_by_id(handle)
+    if art is None or not art.payload_path or not art.mime.startswith("image/"):
+        return False
+    image_data = await asyncio.to_thread(_read_image_artifact_bytes, art.payload_path)
+    if image_data is None:
+        return False
+    sid = str(ev.session_id) if ev.session_id else ""
+    claim = await try_claim_image_delivery(ev, handle, session_id=sid)
+    if claim.refuse is not None:
+        return True
+    try:
+        await bot.send(MessageSegment.image(image_data), extra_metadata=extra_metadata)
+    except Exception as send_err:
+        # 平台发送失败：释放占位，让下一次还能发这张图。
+        logger.warning(i18n_t("log.ai.send_chat_result_render_agent_fail", e=send_err))
+        if claim.occupied:
+            await release_image_delivery(ev, handle)
+        return False
+    note_run_image_delivered()
+    logger.info(i18n_t("log.ai.send_chat_result_render_agent_image", p0=len(image_data)))
+    return True
+
+
+async def _try_present_via_render_agent(
+    md: str,
+    bot: Bot,
+    ev: Event | None,
+    extra_metadata: Optional[Mapping[str, object]] = None,
+) -> bool:
+    """长正文先交给 render_agent。成功发出图片返回 True。"""
+    if ev is None or _PRESENT_RENDER_DEPTH.get() > 0 or not _persona_allows_render_agent(ev):
+        return False
+    import time
+    import hashlib
+
+    from gsuid_core.ai_core.capability_agents.runner import (
+        CAPABILITY_AGENT_ERROR_PREFIX,
+        run_capability_agent,
+    )
+
+    token = _PRESENT_RENDER_DEPTH.set(_PRESENT_RENDER_DEPTH.get() + 1)
+    raw = ""
+    # 外部模型失败不能吞掉这条消息，调用方再走 markdown 图。
+    try:
+        suffix = hashlib.md5(f"{time.time_ns()}:{len(md)}".encode()).hexdigest()[:10]
+        raw = await run_capability_agent(
+            profile_id="render_agent",
+            task=_present_render_task(md),
+            ev=ev,
+            bot=bot,
+            session_id_suffix=f"present_{suffix}",
+        )
+    except Exception as e:
+        logger.warning(i18n_t("log.ai.send_chat_result_render_agent_fail", e=e))
+        raw = ""
+    finally:
+        _PRESENT_RENDER_DEPTH.reset(token)
+    if not raw:
+        return False
+    if raw.startswith(CAPABILITY_AGENT_ERROR_PREFIX):
+        logger.warning(i18n_t("log.ai.send_chat_result_render_agent_fail", e=raw[:180]))
+        return False
+    sent = False
+    seen: list[str] = []
+    for match in _RESOURCE_HANDLE_RE.finditer(raw):
+        handle = match.group(0).strip("`")
+        if not handle.startswith("res_") or handle in seen:
+            continue
+        seen.append(handle)
+        if await _send_registered_image(handle, bot, ev, extra_metadata):
+            sent = True
+    if not sent:
+        logger.info(i18n_t("log.ai.send_chat_result_render_agent_miss"))
+    return sent
+
 
 async def _send_report_images(
     reports: List[Tuple[str, str]],
     bot: Bot,
-    extra_metadata: Optional[Dict[str, Any]] = None,
+    extra_metadata: Optional[Mapping[str, object]] = None,
+    ev: Event | None = None,
 ) -> None:
-    """制品通道出图：结构化块 / 遗留 report body → markdown 资料图。
+    """制品通道出图：结构化块 / 遗留 report body → 信息卡，失败再退 markdown 图。
 
     主路径应已由 ``render_agent`` 出图；此处是呈现层兜底。
     """
@@ -1317,6 +1505,8 @@ async def _send_report_images(
     css_path = await asyncio.to_thread(_markdown_dark_css_path)
     for title, body in reports:
         md = f"# {title}\n\n{body}" if title else body
+        if await _try_present_via_render_agent(md, bot, ev, extra_metadata):
+            continue
         md = f"{md}{_report_footer()}"
         try:
             image_bytes = await render_md_to_bytes(
@@ -1337,7 +1527,7 @@ async def _send_report_images(
 async def _try_render_markdown_image(
     md: str,
     bot: Bot,
-    extra_metadata: Optional[Dict[str, Any]] = None,
+    extra_metadata: Optional[Mapping[str, object]] = None,
 ) -> bool:
     """把整篇 markdown 渲染成一张图片下发。
 
@@ -1457,7 +1647,7 @@ async def send_chat_result(
     bot: Bot,
     text: str,
     ev: Event | None = None,
-    extra_metadata: Optional[Dict[str, Any]] = None,
+    extra_metadata: Optional[Mapping[str, object]] = None,
     ooc_check: bool = True,
     at_user_id: str | None = None,
     mention_names: Optional[Dict[str, str]] = None,
@@ -1474,6 +1664,11 @@ async def send_chat_result(
     """
     if not text:
         return
+
+    meta: dict[str, object] = dict(extra_metadata) if extra_metadata else {}
+    if "speech_channel" not in meta:
+        meta["speech_channel"] = "persona"
+    extra_metadata = meta
 
     # 过滤模型输出的特殊控制标记（如 <end_turn>），避免发送给用户
     _trimmed = text.strip()
@@ -1499,7 +1694,7 @@ async def send_chat_result(
     text = _strip_special_control_tokens(text)
     # 泄漏进正文的资源句柄（res_/img_ 等）：尽量补发所指资源、否则抹除（详见函数）。
     # 放在拆条/出图之前，让文本与出图两条路径都拿到干净正文。
-    text = await _resolve_and_deliver_leaked_handles(text, bot, extra_metadata)
+    text = await _resolve_and_deliver_leaked_handles(text, bot, extra_metadata, ev=ev)
     # 两通道分离（§1）：数据形态进制品图，剩余才是角色台词。不认包装格式名。
     text, report_blocks = _split_speech_and_artifacts(text)
 
@@ -1524,6 +1719,9 @@ async def send_chat_result(
 
     # <br> 漏网已在 sanitize 落成换行；再统一其它 HTML 换行写法
     text = _normalize_html_linebreaks(text)
+    from gsuid_core.ai_core.outbound import rewrite_cq_at
+
+    text = rewrite_cq_at(text)
     _names = mention_names_from_event(ev)
     if mention_names:
         _names.update(mention_names)
@@ -1586,7 +1784,7 @@ async def send_chat_result(
     async def _send_trailing_artifacts() -> None:
         # 所有出口共用的尾声：先补发资料图，再发表情包——新增返回路径不得绕过（评审修复 G5）
         if report_blocks:
-            await _send_report_images(report_blocks, bot, extra_metadata)
+            await _send_report_images(report_blocks, bot, extra_metadata, ev)
         if meme_tags and ev is not None:
             await _send_meme_from_tag(meme_tags[0].strip(), bot, ev)
 
@@ -1598,9 +1796,12 @@ async def send_chat_result(
         await _send_trailing_artifacts()
         return
 
-    # 长 markdown 整篇出图（防拆条刷屏，2026-07-15）：用未剥离的 md_source 渲染，失败降级回拆条。
-    # OOC 兜底命中时（clean_text 已换成短兜底文本）不出图。判据/开关见 _should_render_markdown_image。
+    # 长 markdown 整篇出图：先 render_agent，没图再 render_md_to_bytes，仍失败则拆条。
+    # OOC 兜底命中时不出图。判据/开关见 _should_render_markdown_image。
     if not _ooc_replaced and _should_render_markdown_image(md_source):
+        if await _try_present_via_render_agent(md_source, bot, ev, extra_metadata):
+            await _send_trailing_artifacts()
+            return
         if await _try_render_markdown_image(md_source, bot, extra_metadata):
             await _send_trailing_artifacts()
             return
@@ -1639,9 +1840,7 @@ async def send_chat_result(
         # 计算纯文本长度
         plain_text = re.sub(r"@\d+", "", block)
 
-        # 模拟打字延迟
-        delay = min(max(len(plain_text) / 7, 0.5), 3.0)
-        await asyncio.sleep(delay)
+        await asyncio.sleep(bubble_pause(len(plain_text)))
 
         await bot.send(segments, extra_metadata=extra_metadata)
         if _audit is not None:
@@ -1651,27 +1850,42 @@ async def send_chat_result(
     await _send_trailing_artifacts()
 
 
-async def _send_meme_from_tag(mood: str, bot: Bot, ev: Event) -> None:
-    """解析 meme 标记并发送对应表情包"""
-    from gsuid_core.ai_core.meme.config import meme_config
+def _split_meme_tag(tag: str) -> tuple[str, str]:
+    """第一个词是情绪，其余是场景。空格、中文逗号、英文逗号都能拆。"""
+    text = tag.strip().replace("，", " ").replace(",", " ")
+    mood, _, scene = text.partition(" ")
+    return mood.strip(), scene.strip()
 
-    if not meme_config.get_config("meme_enable").data:
+
+async def _send_meme_from_tag(tag: str, bot: Bot, ev: Event) -> None:
+    """解析 meme 标记并发送对应表情包"""
+    from gsuid_core.ai_core.outbound import (
+        format_meme_placeholder,
+        set_outbound_image_label,
+        reset_outbound_image_label,
+    )
+    from gsuid_core.ai_core.persona.config import persona_allows_meme_reply
+    from gsuid_core.ai_core.buildin_tools.meme_tools import _get_persona_for_event
+
+    persona = _get_persona_for_event(ev)
+    if not persona_allows_meme_reply(persona):
         return
 
+    mood, scene = _split_meme_tag(tag)
+    label_token: contextvars.Token | None = None
     try:
         from gsuid_core.ai_core.meme.library import _read_file, get_memes_base_path
         from gsuid_core.ai_core.meme.selector import pick
         from gsuid_core.ai_core.meme.database_model import AiMemeRecord
-        from gsuid_core.ai_core.buildin_tools.meme_tools import _get_persona_for_event
 
-        persona = _get_persona_for_event(ev)
-        record, _reason = await pick(
+        record, reason = await pick(
             mood=mood,
-            scene="",
+            scene=scene,
             persona=persona,
             session_id=ev.session_id,
         )
         if record is None:
+            logger.debug(i18n_t("log.ai.meme_tag_skip", reason=reason, mood=mood, scene=scene))
             return
 
         file_path = get_memes_base_path() / record.file_path
@@ -1681,11 +1895,18 @@ async def _send_meme_from_tag(mood: str, bot: Bot, ev: Event) -> None:
 
         image_data = await _read_file(file_path)
         img_b64 = await convert_img(image_data)
-        await bot.send(MessageSegment.image(img_b64))
+        from gsuid_core.ai_core.agent_run.support import turn_reply_metadata
+
+        label_token = set_outbound_image_label(format_meme_placeholder(mood))
+        await pause_before_meme()
+        await bot.send(MessageSegment.image(img_b64), extra_metadata=turn_reply_metadata(ev))
         await AiMemeRecord.record_usage(record.meme_id, ev.group_id or "")
         logger.info(i18n_t("log.ai.meme_tag_triggered_mood", p0=record.meme_id, mood=mood))
     except Exception as e:
         logger.debug(i18n_t("log.ai.meme_tag_fail", e=e))
+    finally:
+        if label_token is not None:
+            reset_outbound_image_label(label_token)
 
 
 def _parse_at_segments(text: str) -> list[Message]:
@@ -1698,6 +1919,9 @@ def _parse_at_segments(text: str) -> list[Message]:
     - 示例输入："好哦 @100000001 你来看"
     - 示例输出：[Text("好哦 "), At(100000001), Text(" 你来看")]
     """
+    from gsuid_core.ai_core.outbound import rewrite_cq_at
+
+    text = rewrite_cq_at(text)
     # 匹配 @数字，前后允许空格（空格属于分隔符，不计入文本内容）
     pattern = re.compile(r"\s*@(\d+)\s*")
     segments: list[Message] = []
@@ -1709,9 +1933,7 @@ def _parse_at_segments(text: str) -> list[Message]:
         if before:
             segments.append(MessageSegment.text(before))
 
-        # @ 片段
-        user_id = match.group(1)
-        segments.append(MessageSegment.at(user_id))
+        segments.append(MessageSegment.at(match.group(1)))
 
         last_end = match.end()
 
@@ -2052,9 +2274,7 @@ def _strip_remote_images_from_history(history: List[ModelMessage]) -> int:
     return removed
 
 
-# §25(5) 工具返回入史上限：本轮模型已消费过完整返回，持久历史里只需可引用的摘要。
-# web_search 等大返回原文滚进历史是 run 内 token 近似 O(N²) 的来源。
-# 入史截断：能力代理轮内看完整返回；入史可略长以免追问丢字段
+# 工具返回存入历史长度上限：轮内消费完整返回，持久化历史保存摘要以节约 token。
 _TOOL_RETURN_HISTORY_MAX = 12_000
 _TOOL_RETURN_HEAD = 9_000
 _TOOL_RETURN_TAIL = 1_500
@@ -2106,7 +2326,7 @@ def _truncate_tool_returns_in_history(messages: List[ModelMessage]) -> int:
         if not isinstance(msg, ModelRequest):
             continue
         for part in msg.parts:
-            # v2.0 新增 ToolSearchReturnPart 等 part 类型， 那些的 content 不容许赋值 str。type(part) is
+            # 仅处理内容为 str 的 ToolReturnPart。
             if type(part) is not ToolReturnPart or not isinstance(part.content, str):
                 continue
             content = part.content

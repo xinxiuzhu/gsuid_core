@@ -2,7 +2,8 @@
 
 复用既有评测底座 `eval/common/http_client.call_chat_with_history` 驱动 `/api/chat_with_history`
 （继承其鉴权头/超时/错误约定，与 BEAM 官方 ladder / longmemeval 一致）。区别在于：记忆评测只看返回的
-**文本** `data`，而 agent 评测要的是**工具轨迹**——只能从 session_log 捞（该端点当前不返回轨迹）。
+**文本** `data`，而 agent 评测要的是**工具轨迹**——优先从 session_log 捞；端点也会返回
+``tool_calls``（仅工具名），扫不到日志时用它填 HTTP-only Trace，避免 ``must_call_any`` 空打。
 
 轨迹关联（自动择优）：
   A. 端点若按 README「3 行增强」返回 `session_id`（并在 run 结束 flush 会话）→ 精确、秒级。
@@ -22,7 +23,7 @@ from pathlib import Path
 
 import httpx
 
-from eval.agent.harness import Trace, parse_session_log, pick_user_visible, trace_awaits_delivery
+from eval.agent.harness import Trace, ToolCall, parse_session_log, pick_user_visible, trace_awaits_delivery
 from eval.common.http_client import call_chat_with_history
 
 # 与 interaction_scaffold 说话人前缀同形，避免 runner 去 import 生产脚手架。
@@ -280,10 +281,9 @@ async def run_once(
     if doc is None:  # B 模式兜底（阻塞轮询放线程池，避免卡事件循环）
         doc = await asyncio.to_thread(_scan_log_by_user, uid, since, wait)
     if doc is None:
-        # 拿不到轨迹但拿到了文本 data：退化成"纯文本 Trace"，让 final_* / judge 类断言仍可判，
-        # 只有工具类断言会因无轨迹而失败（比整条判 error 更能反映真实回复）。
+        # 拿不到日志但拿到了文本：退化成 HTTP-only Trace。端点 tool_calls 是工具名列表。
         if delivered:
-            return Trace(final_text=delivered, returned_text=delivered, latency=latency)
+            return _http_text_trace(resp, delivered, latency)
         return Trace(error="session_log_not_found（建议按 README 让端点返回 session_id/trace）", latency=latency)
     tr = parse_session_log(doc, skip_runs=skip)
     tr.latency = latency
@@ -297,9 +297,7 @@ async def run_case(client: httpx.AsyncClient, base_url: str, case: dict, k: int,
     return [await run_once(client, base_url, case, i, wait) for i in range(k)]
 
 
-# ───────────────────────── 批量 B 模式（快得多） ─────────────────────────
-# session_log 空闲≥60s 才落盘；逐条各等一次 ≈1min/run。批量：并发 fire 全部 run
-# → 只等一次 flush → 按唯一 user_id 扫盘。每 run user_id 唯一，session 文件不冲突。
+# 批量执行模式：并发执行全部运行并统一刷新日志，按唯一 user_id 检索会话文件。
 
 
 def _case_group_id(case: dict, run_tag: str = "") -> Optional[str]:
@@ -337,10 +335,8 @@ async def _fire_run(client, base_url, case, run_idx, sem, timeout) -> dict:
     enable_tools = case["enable_tools"] if "enable_tools" in case else True
     group_id = _case_group_id(case, run_tag=uid)
     async with sem:
-        # setup（可选）：跨轮 modify/cancel 类用例需要**真实的既有任务**才能被"定位并修改"。
-        # 合成 history 里写"已设好"却从未真调工具落库 → 评测里根本无任务可改（假失败）。
-        # 这里先按 setup 里的消息真跑一遍（同 uid，工具落 DB），主消息再借状态池定位到它，
-        # 与生产"先建后改"完全一致。setup 结果不参与打分。
+        # setup：跨轮修改与取消用例预先执行以落库真实任务，供主用例借状态池定位。
+        # 执行结果不参与评分。
         for setup_msg in _setup_messages(case):
             await call_chat_with_history(
                 client,
@@ -369,9 +365,7 @@ async def _fire_run(client, base_url, case, run_idx, sem, timeout) -> dict:
             )
         else:
             history = case.get("history", [])
-        # ⚠️ latency 从**拿到并发槽后**起算——端点同步阻塞到 agent 跑完，这段才是单次 agent
-        # 运行的真实耗时（供 max_latency 抓死循环/挂起）。若从 queued 起算会把"等信号量排队"
-        # 的时间算进去（426 run / concurrency 3 时队尾能等几分钟），令 max_latency 全线误判。
+        # 耗时自获取并发槽后开始计算，排除排队时间以准确评估单次 agent 运行延迟。
         call_start = time.time()
         resp = await call_chat_with_history(
             client,
@@ -439,8 +433,7 @@ def _trace_from_fired(f: dict, doc) -> Trace:
     if resp.get("error"):
         return Trace(error=f"api:{resp.get('error')}", latency=f["latency"])
     if delivered:
-        # 拿到交付文本但没扫到轨迹：退化成纯文本 Trace（final_*/judge 可判；工具类断言必失败）
-        return Trace(final_text=delivered, returned_text=delivered, latency=f["latency"])
+        return _http_text_trace(resp, delivered, f["latency"])
     return Trace(error="session_log_not_found", latency=f["latency"])
 
 
@@ -553,11 +546,31 @@ async def run_suite_batch(
     return {cid: [t for _, t in sorted(runs)] for cid, runs in per_case.items()}
 
 
+def _tool_calls_from_http(resp: dict) -> list[ToolCall]:
+    raw = resp.get("tool_calls") if isinstance(resp, dict) else None
+    if not isinstance(raw, list):
+        return []
+    out: list[ToolCall] = []
+    for item in raw:
+        if isinstance(item, str) and item.strip():
+            out.append(ToolCall(name=item.strip(), args={}, raw_args=""))
+    return out
+
+
+def _http_text_trace(resp: dict, delivered: str, latency: float) -> Trace:
+    return Trace(
+        final_text=delivered,
+        returned_text=delivered,
+        latency=latency,
+        tool_calls=_tool_calls_from_http(resp),
+    )
+
+
 def _is_eval_silence_or_ack(tr: Trace) -> bool:
     """短应/沉默：回灌尚未变成终局结论。"""
     text = (tr.content_text or "").strip()
     if not text:
         return True
-    if text in {"<SILENCE>", "[SILENCE]", "SILENCE"}:
+    if text in {"<SILENCE>", "[SILENCE]", "SILENCE", "<沉默>", "[沉默]"}:
         return True
     return len(text) <= 40

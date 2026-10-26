@@ -147,6 +147,33 @@ class OutboundAudit(BaseIDModel, table=True):
 
     @classmethod
     @with_session
+    async def recent_image_for_group(
+        cls,
+        session: AsyncSession,
+        *,
+        group_id: str,
+        max_age_sec: int = 1800,
+    ) -> Optional["OutboundAudit"]:
+        gid = (group_id or "").strip()
+        if not gid:
+            return None
+        cutoff = int(time.time()) - max(1, int(max_age_sec))
+        stmt = (
+            select(cls)
+            .where(
+                and_(
+                    col(cls.group_id) == gid,
+                    col(cls.image_handles) != "",
+                    col(cls.ts) >= cutoff,
+                )
+            )
+            .order_by(col(cls.ts).desc())
+            .limit(1)
+        )
+        return (await session.execute(stmt)).scalar_one_or_none()
+
+    @classmethod
+    @with_session
     async def search_recent(
         cls,
         session: AsyncSession,
@@ -210,7 +237,7 @@ class DeliveryLedger(BaseIDModel, table=True):
             if existing is not None:
                 return DeliveryHit(ts=int(existing.ts), session_id=existing.session_id or "")
             # 已存在只读。插入才占写闸门，冲突靠唯一约束收回。
-            async with sqlite_gated_write():
+            async with sqlite_gated_write("DeliveryLedger.check_and_claim"):
                 session.add(
                     cls(
                         group_id=gid[:80],

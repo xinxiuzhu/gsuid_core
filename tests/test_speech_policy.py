@@ -273,11 +273,12 @@ def test_process_meta_and_empty_handoff_gates() -> None:
 def test_wall_clock_pipeline_branch() -> None:
     close = wall_clock_nudge_for(need_render_pipeline=False)
     pipe = wall_clock_nudge_for(need_render_pipeline=True)
-    assert "不要再发起新的工具调用" in close or "不要再发起任何新的工具调用" in close
-    assert "render_agent" in pipe
-    assert "SILENCE" in pipe
-    # 有事实包时必须硬开 render 例外
-    assert ("禁止" in pipe and "停工具" in pipe) or ("硬例外" in pipe)
+    assert "不要再发起新的工具调用" in close
+    assert "render_agent" not in close
+    assert "可以委派 render_agent" in pipe
+    assert "也可以不出图" in pipe
+    assert "硬例外" not in pipe
+    assert "必须立刻" not in pipe
     blocked = wall_clock_nudge_for(need_render_pipeline=True, allow_render=False)
     assert "render_agent" not in blocked
     assert "不要再发起新的工具调用" in blocked
@@ -389,7 +390,6 @@ def test_ack_plus_find_tools_is_not_terminal() -> None:
     assert batch_still_working(["send_message_by_ai", "find_tools"])
     assert batch_still_working(["find_tools"])
     assert not batch_still_working(["send_message_by_ai"])
-    assert not batch_still_working(["send_meme"])
 
 
 def test_wait_comfort_does_not_mark_delivered() -> None:
@@ -420,121 +420,25 @@ def test_wait_templates_are_legal_inflight_exit() -> None:
     assert not looks_like_inflight_quota_speech("唔…图还在渲…呼，再眯一小会儿就好")
 
 
-def test_task_ack_is_required_not_optional() -> None:
+def test_send_message_text_counts_as_opening() -> None:
     from pathlib import Path
 
     from pydantic_ai.messages import ToolCallPart
 
-    from gsuid_core.ai_core.agent_run.loop import (
-        task_ack_phrase,
-        needs_task_ack_turn,
-        send_message_call_has_visible_text,
-    )
-    from gsuid_core.ai_core.agent_run.speech_policy import looks_like_task_accept_speech
+    from gsuid_core.ai_core.agent_run.loop import send_message_call_has_visible_text
 
     root = Path(__file__).resolve().parent.parent
-    speech = (root / "gsuid_core/ai_core/agent_run/speech_policy.py").read_text(encoding="utf-8")
     prompts = (root / "gsuid_core/ai_core/persona/prompts.py").read_text(encoding="utf-8")
-    sub = (root / "gsuid_core/ai_core/buildin_tools/subagent.py").read_text(encoding="utf-8")
     web = (root / "gsuid_core/ai_core/buildin_tools/web_search.py").read_text(encoding="utf-8")
-    assert "重任务接任务必须短应" in speech
-    assert "轻查询不先应" in speech
     assert "或直接干活" not in prompts
     assert "自己组合查询词" in web
-    assert "短应走正文或" not in sub
-    assert needs_task_ack_turn(
-        create_by="Chat",
-        is_subagent=False,
-        is_framework=False,
-        is_status_inquiry=False,
-        is_group=True,
-        call_to_self=True,
-        followup_detected=False,
-        is_http=False,
-    )
-    assert needs_task_ack_turn(
-        create_by="Chat",
-        is_subagent=False,
-        is_framework=False,
-        is_status_inquiry=False,
-        is_group=False,
-        call_to_self=False,
-        followup_detected=False,
-        is_http=False,
-    )
-    assert needs_task_ack_turn(
-        create_by="Chat",
-        is_subagent=False,
-        is_framework=False,
-        is_status_inquiry=False,
-        is_group=True,
-        call_to_self=False,
-        followup_detected=False,
-        is_http=True,
-    )
-    assert not needs_task_ack_turn(
-        create_by="Chat",
-        is_subagent=False,
-        is_framework=False,
-        is_status_inquiry=False,
-        is_group=True,
-        call_to_self=False,
-        followup_detected=False,
-        is_http=False,
-    )
-    assert not needs_task_ack_turn(
-        create_by="CapabilityAgent",
-        is_subagent=True,
-        is_framework=False,
-        is_status_inquiry=False,
-        is_group=True,
-        call_to_self=True,
-        followup_detected=False,
-        is_http=False,
-    )
-    assert task_ack_phrase(None) == ""
-    from gsuid_core.ai_core.agent_run.loop import needs_create_subagent_ack
-
-    assert "早柚" not in task_ack_phrase(None)
-    assert "唔" not in task_ack_phrase(None)
-    assert needs_create_subagent_ack(
-        create_by="Chat",
-        is_subagent=False,
-        is_framework=False,
-        is_status_inquiry=False,
-    )
-    assert not needs_create_subagent_ack(
-        create_by="Chat",
-        is_subagent=False,
-        is_framework=True,
-        is_status_inquiry=False,
-    )
-    loop_src = (root / "gsuid_core/ai_core/agent_run/loop.py").read_text(encoding="utf-8")
-    assert "知道了，稍等" not in loop_src
-    assert "收到。" not in loop_src
-    assert "ModelRetry" in loop_src
-    assert looks_like_task_accept_speech("收到。")
     silent = ToolCallPart(tool_name="create_subagent", args="{}")
     spoken = ToolCallPart(tool_name="send_message_by_ai", args='{"text": "好，我去查。"}')
     assert not send_message_call_has_visible_text([silent])
     assert send_message_call_has_visible_text([spoken])
 
 
-def test_first_ack_with_tools_keeps_accept_speech() -> None:
-    from gsuid_core.ai_core.agent_run.loop import tools_warrant_task_ack, decide_text_outbound_slot
-
-    assert tools_warrant_task_ack(["create_subagent"])
-    assert tools_warrant_task_ack(["web_search_tool", "create_subagent"])
-    assert not tools_warrant_task_ack(["web_search_tool"])
-    assert not tools_warrant_task_ack(["search_cognition", "find_tools"])
-    assert decide_text_outbound_slot(has_fn_tool=True, accept_slot_used=False, heavy_ack=True) == "send_accept"
-    assert decide_text_outbound_slot(has_fn_tool=True, accept_slot_used=True, heavy_ack=True) == "unsent"
-    assert (
-        decide_text_outbound_slot(has_fn_tool=True, accept_slot_used=False, heavy_ack=False, light_accept=True)
-        == "send_accept"
-    )
-    assert decide_text_outbound_slot(has_fn_tool=True, accept_slot_used=False, heavy_ack=False) == "unsent"
-    assert decide_text_outbound_slot(has_fn_tool=False, accept_slot_used=False, heavy_ack=False) == "send_final"
+def test_no_second_line_after_opening_while_delegation_runs() -> None:
     blk, why = should_block_user_visible_text(
         "silence_only",
         "…等数据回来再继续…",
@@ -781,3 +685,32 @@ def test_short_title_is_not_a_master_title_hit() -> None:
     assert not title_mentioned("主", "交给主人判断")
     assert not title_mentioned("lord", "landlord said hello")
     assert title_mentioned("主人", "交给主人判断")
+
+
+def test_task_accept_speech_allows_action_and_speech_lines() -> None:
+    from gsuid_core.ai_core.agent_run.speech_policy import looks_like_task_accept_speech
+
+    two_lines = "（叹气叹到一半，认命地把手按在剑柄上）\n\n……遇上你，我这十年的修行都白修了。……等着，别催。"
+    assert looks_like_task_accept_speech(two_lines)
+
+    three_lines = "第一行动作\n\n第二行发言\n\n第三行补充"
+    assert not looks_like_task_accept_speech(three_lines)
+    two_facts = "北京今天 18 度，有雨。\n\n上海今天 22 度，多云。"
+    assert not looks_like_task_accept_speech(two_facts)
+
+
+def test_looks_like_illustration_request() -> None:
+    from gsuid_core.ai_core.buildin_tools.subagent import looks_like_illustration_request
+
+    assert looks_like_illustration_request("画一张角色卡提希娅（小卡）的二次元插画")
+    assert looks_like_illustration_request("画个白丝小卡的立绘")
+    assert looks_like_illustration_request("把我的立绘发出来")
+    assert not looks_like_illustration_request("将本轮已查到的要点做成一张信息图")
+    assert not looks_like_illustration_request("把对比数据表渲成 HTML 卡片")
+    assert not looks_like_illustration_request("画一张对比图")
+    assert not looks_like_illustration_request("画一个流程图")
+    assert not looks_like_illustration_request("帮我画个架构图")
+    assert not looks_like_illustration_request("把用户头像做成资料卡")
+    assert not looks_like_illustration_request("draw a bar chart")
+    assert not looks_like_illustration_request("redraw the metrics")
+    assert not looks_like_illustration_request("withdraw the old chart")

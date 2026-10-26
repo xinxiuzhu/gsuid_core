@@ -79,7 +79,7 @@ class BatchObserveTurn(BaseModel):
     timestamp: Optional[str] = Field(
         default=None,
         max_length=64,
-        description="可选时间戳（ISO8601 / Unix 数字），用于回填 BEAM-10M 等时序探针",
+        description="可选时间戳（ISO8601 / Unix 数字），用于回填历史对话的时序",
     )
 
 
@@ -454,7 +454,7 @@ async def batch_observe(
     """批量摄入多轮对话到记忆观测队列。
 
     与 ``/api/chat_with_history`` 的差别：仅摄入，不创建 Agent、不调用 LLM、
-    不污染 ChatSession；适合 BEAM-10M / LongMemEval 等大批量回灌场景。
+    不污染 ChatSession；适合历史语料的大批量回灌场景。
 
     鉴权：默认 404，需开启 ``GSUID_LOCAL_TEST_MODE=1``（可选 ``GSUID_LOCAL_TEST_TOKEN``）。
     与 ``/api/chat_with_history`` 共用同一守卫，避免生产环境被裸调。
@@ -536,8 +536,7 @@ async def batch_observe(
                 )
             observed += 1
 
-        # 同步批量写入（SQL 一次提交 + 向量分块 batch embed）：返回时 Episode 已落 DB + Qdrant， 故 flush 语义天然满足。
-        # write_episodes=False 时（§14：对已摄入 Episode 的 scope 只补
+        # 批量写入 Episode 到数据库与向量库。
         if items and req.write_episodes:
             await AIMemEpisode.create_episodes_bulk(scope_key, items)
 
@@ -2101,9 +2100,8 @@ async def delete_scope_memory(
 
             # 删除 Qdrant 向量（按 scope_key 过滤）
             try:
-                from qdrant_client.models import Filter, MatchValue, FieldCondition
-
                 from gsuid_core.ai_core.rag.base import client
+                from gsuid_core.ai_core.rag.qmodels import Filter, MatchValue, FieldCondition
                 from gsuid_core.ai_core.memory.vector.collections import (
                     MEMORY_EDGES_COLLECTION,
                     MEMORY_ENTITIES_COLLECTION,

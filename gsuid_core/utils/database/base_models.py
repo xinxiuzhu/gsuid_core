@@ -171,12 +171,12 @@ def _writer_is_core(func: Callable[..., object]) -> bool:
 
 
 @contextlib.asynccontextmanager
-async def sqlite_gated_write() -> AsyncIterator[None]:
+async def sqlite_gated_write(label: str = "sqlite_gated_write") -> AsyncIterator[None]:
     """SQLite 占住单写者闸门。其它后端不加这把锁。"""
     if _db_type != "sqlite":
         yield
         return
-    async with sqlite_write_gate.hold(core=True):
+    async with sqlite_write_gate.hold(core=True, label=label):
         yield
 
 
@@ -535,7 +535,10 @@ def _session_wrapper(
     func: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]],
     *,
     read_only: bool,
+    budget_s: float | None = None,
 ) -> Callable[Concatenate[T, P], Awaitable[R]]:
+    write_budget = _WRITE_BUDGET_S if budget_s is None else budget_s
+
     @wraps(func)
     async def wrapper(self: T, *args: P.args, **kwargs: P.kwargs) -> R:
         operation = func.__qualname__
@@ -584,7 +587,7 @@ def _session_wrapper(
                 name=f"db-write:{operation}",
             )
             try:
-                done, _pending = await asyncio.wait({task}, timeout=_WRITE_BUDGET_S)
+                done, _pending = await asyncio.wait({task}, timeout=write_budget)
             except asyncio.CancelledError:
                 await _stop_write_task(task, lease)
                 raise
@@ -598,7 +601,7 @@ def _session_wrapper(
                 return task.result()
             message = i18n_t(
                 "log.database.write_timeout",
-                budget=_budget_label(_WRITE_BUDGET_S),
+                budget=_budget_label(write_budget),
                 operation=operation,
             )
             logger.error(message)
@@ -614,7 +617,7 @@ def _session_wrapper(
                         return await _run_in_session(None)
                 return await _run_in_session(None)
             if _db_type == "sqlite":
-                async with sqlite_write_gate.hold(core=_writer_is_core(func)):
+                async with sqlite_write_gate.hold(core=_writer_is_core(func), label=operation):
                     return await _budgeted_write()
             return await _run_in_session(None)
 
@@ -657,6 +660,22 @@ def with_session(
     return decorate(func)
 
 
+def with_session_budget(
+    budget_s: float,
+) -> Callable[
+    [Callable[Concatenate[T, AsyncSession, P], Awaitable[R]]],
+    Callable[Concatenate[T, P], Awaitable[R]],
+]:
+    """给已知会写很多行的核心快照加长写预算。默认 10s 仍约束普通 @with_session。"""
+
+    def deco(
+        func: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]],
+    ) -> Callable[Concatenate[T, P], Awaitable[R]]:
+        return _session_wrapper(func, read_only=False, budget_s=budget_s)
+
+    return deco
+
+
 def with_read_session(
     func: Callable[Concatenate[T, AsyncSession, P], Awaitable[R]],
 ) -> Callable[Concatenate[T, P], Awaitable[R]]:
@@ -685,9 +704,7 @@ async def get_all_table_ddl(engine: AsyncEngine) -> Dict[str, str]:
         # 2. 遍历表对象，生成 DDL
         # 注意：生成 SQL 字符串的操作可以在异步上下文中安全进行，因为内存里已经有了 metadata
         for table_name, table in metadata.tables.items():
-            # 使用 CreateTable 构造器将 Table 对象编译成 SQL 字符串
-            # compile 即使在 async engine 下也需要传入 engine 或 dialect
-            # 这里我们利用 engine.dialect 进行编译
+            # 使用 CreateTable 配合 dialect 将 Table 对象编译成 SQL 字符串。
             create_sql = str(CreateTable(table).compile(dialect=engine.dialect))
 
             ddl_map[table_name] = create_sql.strip()
@@ -1163,9 +1180,7 @@ class BaseBotIDModel(BaseIDModel):
 class BaseModel(BaseBotIDModel):
     user_id: str = Field(title="账号")
 
-    ################################
-    # 基本的增删改查 #
-    ################################
+    # 基本增删改查
 
     @classmethod
     @with_read_session
@@ -1351,9 +1366,7 @@ class BaseModel(BaseBotIDModel):
 class Bind(BaseModel):
     group_id: Optional[str] = Field(title="群号")
 
-    ################################
-    # 额外的扩展方法 #
-    ################################
+    # 扩展方法
     @classmethod
     async def get_uid_list_by_game(
         cls: Type[T_Bind],
@@ -2071,9 +2084,7 @@ class User(BaseModel):
         if await cls.user_exists(uid, game_name) and await cls.cookie_validate(uid, game_name):
             return await cls.get_user_cookie_by_uid(uid, game_name)
 
-        # 自动刷新缓存
-        # await self.delete_error_cache()
-        # 获得缓存库Ck
+        # 优先使用缓存库 Cookie
         if cache_model is not None:
             cache_data = await cache_model.select_cache_cookie(uid, game_name)
             if cache_data is not None:

@@ -3,6 +3,9 @@ import asyncio
 from copy import deepcopy
 from uuid import uuid4
 from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+
+from msgspec import DecodeError, ValidationError, json as msgjson
 
 from gsuid_core.sv import SL, SV
 from gsuid_core.bot import Bot, _Bot
@@ -20,25 +23,65 @@ from gsuid_core.models import (
     normalize_node_items,
 )
 from gsuid_core.server import on_core_shutdown
-from gsuid_core.trigger import Trigger
-from gsuid_core.global_val import get_platform_val
+from gsuid_core.trigger import Trigger, dispatch_sort_key
+from gsuid_core.global_val import get_platform_val, mark_command_dirty
+from gsuid_core.ai_core.hooks import AgentHookPoint, AgentHookContext, fire_hooks, should_fire
 from gsuid_core.trigger_index import get_trigger_index
 from gsuid_core.utils.cooldown import cooldown_tracker
+from gsuid_core.message_history import get_history_manager
 from gsuid_core.utils.database.models import CoreUser, CoreGroup, Subscribe
+from gsuid_core.ai_core.persona.config import persona_config_manager
 from gsuid_core.utils.resource_manager import RM
+from gsuid_core.ai_core.followup_window import (
+    note_hard_trigger,
+    in_followup_window,
+    merge_followup_burst,
+)
+from gsuid_core.utils.image.image_tools import normalize_image_for_history
 from gsuid_core.ai_core.configs.ai_config import ai_config
 from gsuid_core.utils.plugins_config.gs_config import (
     sp_config,
     log_config,
 )
+from gsuid_core.utils.database.global_val_models import DataType
+from gsuid_core.buildin_plugins.core_command.core_ai_control.state import is_scope_banned
 
-# 注意：handle_ai / history / memory / statistics 等 AI 重模块改为在
-# handle_event 内按需懒加载，避免 import handler 时同步拉起 AI ML 栈而阻塞启动。
+
+@dataclass
+class _SoftDebounceItem:
+    ws: _Bot
+    event: Event
+    events: list[Event]
+    enqueue_ts: float
+    trigger_type: str
+    task: asyncio.Task[None] | None = None
+
+
+_soft_debounce_map: dict[str, _SoftDebounceItem] = {}
+
+# handle_ai、command_aside.runner、statistics、startup 仍在函数内导入。
+# 它们会拉起 Agent 运行时；提到这里会让 import handler 在启动前加载这套栈。
 
 # 读循环不 await 这条。预算要长于写闸门排队，好让超时先变成失败而不是取消到一半。
 _INBOUND_BUDGET_S = 30.0
 _INBOUND_SLOT_WAIT_S = 1.0
 _INBOUND_SLOTS = 32
+
+
+def decode_inbound_frame(data: bytes, bot_id: str) -> MessageReceive | None:
+    # 适配器帧不可信。解码失败只跳过这一帧，避免整条连接被 ASGI 堆栈拆掉。
+    try:
+        return msgjson.decode(data, type=MessageReceive)
+    except (DecodeError, ValidationError) as exc:
+        logger.warning(
+            t(
+                "log.core.ws_inbound_frame_skipped",
+                bot_id=bot_id,
+                reason=str(exc),
+                size=len(data),
+            )
+        )
+        return None
 
 
 def _consume_inbound(task: asyncio.Task[object]) -> None:
@@ -363,6 +406,68 @@ async def handle_meta_event(ws: _Bot, msg: MessageReceive) -> None:
             break
 
 
+def _record_inbound_history(event: Event) -> None:
+    """入站写入 HistoryManager。无配文纯图也记，后面的轮次才能看见上一张。"""
+    has_text = bool(event.raw_text and event.raw_text.strip())
+    has_image = bool(event.image_id or event.image_id_list)
+    if not (has_text or event.at_list or has_image):
+        return
+
+    user_name = None
+    if event.sender and "nickname" in event.sender:
+        user_name = event.sender["nickname"]
+    user_avatar = None
+    if event.sender and "avatar" in event.sender:
+        user_avatar = event.sender["avatar"]
+
+    metadata: dict[str, object] = {
+        "msg_id": event.msg_id,
+        "bot_id": event.bot_id,
+        "user_type": event.user_type,
+    }
+    if event.image_id_list:
+        metadata["image_id_list"] = event.image_id_list
+    elif event.image_id:
+        metadata["image_id"] = event.image_id
+
+    # 提取图片直链或资源接口路由
+    inbound_images: list[str] = []
+    if event.image_list:
+        for idx, img in enumerate(event.image_list):
+            if img:
+                try:
+                    res_id = event.image_id_list[idx] if idx < len(event.image_id_list) else event.image_id
+                    norm = normalize_image_for_history(img, res_id)
+                    if norm:
+                        inbound_images.append(norm)
+                except Exception:
+                    pass
+    elif event.image:
+        try:
+            norm = normalize_image_for_history(event.image, event.image_id)
+            if norm:
+                inbound_images.append(norm)
+        except Exception:
+            pass
+
+    if inbound_images:
+        metadata["images"] = inbound_images
+
+    if event.at_list:
+        metadata["at_list"] = event.at_list
+    if event.file:
+        metadata["file_id"] = event.file
+
+    get_history_manager().add_message(
+        event=event,
+        role="user",
+        content=event.raw_text.strip(),
+        user_name=user_name if isinstance(user_name, str) else None,
+        user_avatar=user_avatar if isinstance(user_avatar, str) else None,
+        metadata=metadata,
+    )
+
+
 async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
     if not IS_HANDDLE:
         return
@@ -386,15 +491,11 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
     if show_receive:
         logger.info(t("log.handler.event_received"), event_payload=event)
 
-    from gsuid_core.buildin_plugins.core_command.core_ai_control.state import is_scope_banned
-
     ai_scope_banned = is_scope_banned(event.session_id)
 
     # ====== H00 入站观察扇出（记忆 / 表情 / 图片记忆）======
     # 只观察，**不挡**命令/AI 分流；要拦 AI 走 H01。失败 fail-open。
     if enable_ai and not ai_scope_banned:
-        from gsuid_core.ai_core.hooks import AgentHookPoint, AgentHookContext, fire_hooks, should_fire
-
         if should_fire(AgentHookPoint.ON_INBOUND):
             inbound_ctx = AgentHookContext(
                 point=AgentHookPoint.ON_INBOUND,
@@ -405,61 +506,11 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
             )
             ws._add_bg_task(asyncio.create_task(fire_hooks(AgentHookPoint.ON_INBOUND, inbound_ctx)))
 
-    # A-3 修复：图片观察不能被文本门控包住——纯图片消息（无文字）也要能进图片摄入，
-    # 否则「高价值图片走独立队列异步转述」对纯图片消息形同死代码。图片观察现在在 H00
-    # 套件里按 event 自己判，这里只留历史入库的文本门控。
-    _has_text = bool(event.raw_text and event.raw_text.strip())
-
-    # 纯 @ 消息（at 段无文字）也须入历史：否则 @ 目标从历史里凭空消失，
-    # AI/Heartbeat 会把紧随其后的「醒了吗」误认为在叫自己（生产实测误判）。
-    if _has_text or event.at_list:
-        # 获取用户昵称
-        user_name = None
-        if event.sender and "nickname" in event.sender:
-            user_name = event.sender["nickname"]
-
-        # 获取用户头像URL
-        user_avatar = None
-        if event.sender and "avatar" in event.sender:
-            user_avatar = event.sender["avatar"]
-
-        # 构建元数据
-        from typing import Any, Dict
-
-        metadata: Dict[str, Any] = {
-            "msg_id": event.msg_id,
-            "bot_id": event.bot_id,
-            "user_type": event.user_type,
-        }
-
-        # 添加图片ID列表
-        if event.image_id_list:
-            metadata["image_id_list"] = event.image_id_list
-        elif event.image_id:
-            metadata["image_id"] = event.image_id
-
-        # 添加@列表
-        if event.at_list:
-            metadata["at_list"] = event.at_list
-
-        # 添加文件信息
-        if event.file:
-            metadata["file_id"] = event.file
-
-        from gsuid_core.message_history import get_history_manager
-
-        get_history_manager().add_message(
-            event=event,
-            role="user",
-            content=event.raw_text.strip(),
-            user_name=user_name,
-            user_avatar=user_avatar,
-            metadata=metadata,
-        )
+    # 图片观察在 H00 按 event 自己判。历史入库：正文、纯 @、无配文纯图都记。
+    _record_inbound_history(event)
 
     # 记忆 / 表情 / 图片记忆的入站观察已迁至 H00（``kits/memory``、``kits/meme``）：
     # 关 memory 槽就该不观察，观察与检索不该分处两地各判一次开关。
-    # ============================================
 
     if event.user_pm == 0:
         _schedule_owner_subscribe(event)
@@ -525,10 +576,7 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
             if event.raw_text.strip().startswith(start):
                 event.raw_text = event.raw_text.replace(start, "", 1)
                 is_start = True
-                # N-3 修复：命中首个前缀即停。原先 for 无 break，多前缀配置下
-                # （如 command_start=["#","/"]）"#/帮助"会被连剥两层前缀（→"帮助"）。
-                # break 后 for...else 的 else 不再执行（仅在无 break 完成时执行），
-                # 故"命中即放行、不返回"的门控语义不变，只是保证最多剥一层前缀。
+                # 命中首个前缀即中断，避免多前缀配置下被连续剥除。
                 break
         else:
             if not is_start:
@@ -589,9 +637,10 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
                     logger.warning(t("log.handler.at_bot_shield"))
                     return
 
+        # 同优先级：类型更具体的先跑，同类型再按命令字从长到短
         sorted_event = sorted(
             command_triggers.items(),
-            key=lambda x: (not x[0].prefix, x[1]),
+            key=lambda x: dispatch_sort_key(x[0], x[1]),
         )
 
         for trigger, _ in sorted_event:
@@ -612,7 +661,9 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
             )
             logger.info(t("log.handler.cmd_triggered"), command=message)
 
-            coro = trigger.func(bot, message)
+            from gsuid_core.ai_core.command_aside.runner import command_with_aside
+
+            coro = command_with_aside(trigger.func(bot, message), bot, _event, trigger)
             func_name = getattr(coro, "__qualname__", str(coro))
             trace_ctx = TraceContext(
                 trace_id=_event.task_id,
@@ -663,9 +714,6 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
         if ai_white_list and not (user_in_white_list or group_in_white_list):
             return
 
-        # 根据当前 session 获取对应的 persona 配置
-        from gsuid_core.ai_core.persona.config import persona_config_manager
-
         # 使用 Event.session_id 属性获取标准格式的 session_id
         session_id = event.session_id
         persona_name = persona_config_manager.get_persona_for_session(session_id)
@@ -680,11 +728,7 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
         keywords = persona_config.get_config("keywords").data
 
         if "提及应答" in ai_mode:
-            # 检查是否应该响应：@机器人 或者 包含关键词
-            # A-4 修复：trigger_type 在此处一次性定型——is_tome（被@/私聊）记为
-            # "mention"，命中关键词记为 "keyword"。原代码在下方无条件重置为
-            # "mention" 才上报，导致所有"关键词触发"在统计里都被记成 mention，
-            # trigger_distribution.keyword 永远趋近 0。
+            # 确定响应与触发类型：is_tome 记为 mention，关键词命中记为 keyword。
             should_respond = event.is_tome
             trigger_type = "mention" if should_respond else ""
             if not should_respond and keywords:
@@ -694,26 +738,26 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
                 if should_respond:
                     trigger_type = "keyword"
 
-            # 免唤醒续聊窗口：硬触发（@/关键词/私聊）登记窗口起点；未硬触发时，
-            # 若该用户处于窗口内、且这条是群聊里没 @ 别人的普通发言，则按"软触发"放行。
-            # 软触发消息会在 handle_ai 里先过一道沉默门，与 AI 无关则不打扰（见 §问题三）。
+            # 免唤醒续聊窗口：硬触发登记起点，窗口期内的普通发言作为软触发放行。
             soft_triggered = False
-            from gsuid_core.ai_core.followup_window import note_hard_trigger, in_followup_window
-            from gsuid_core.ai_core.configs.ai_config import ai_config as _ai_cfg
-
-            _fw = _ai_cfg.get_config("follow_up_window").data
-            _fmax = _ai_cfg.get_config("follow_up_max_total").data
+            _fw = ai_config.get_config("follow_up_window").data
+            _fmax = ai_config.get_config("follow_up_max_total").data
+            _fmax_rep = (
+                ai_config.get_config("follow_up_max_replies").data if "follow_up_max_replies" in ai_config.config else 2
+            )
             if should_respond:
+                k = f"{session_id}::{event.user_id}"
+                pending = _soft_debounce_map.pop(k, None)
+                if pending is not None and pending.task is not None and not pending.task.done():
+                    pending.task.cancel()
                 note_hard_trigger(session_id, event.user_id, _fw, _fmax)
             elif _fw and event.group_id and not event.at_list:
-                if in_followup_window(session_id, event.user_id, _fw, _fmax):
+                if in_followup_window(session_id, event.user_id, _fw, _fmax, max_replies=_fmax_rep):
                     should_respond = True
                     soft_triggered = True
                     trigger_type = "followup"
 
             if not should_respond:
-                from gsuid_core.config import core_config
-
                 msg_text = event.raw_text or ""
                 aliases = core_config.get_config("framework_aliases")
                 alias_list = [str(a) for a in aliases] if isinstance(aliases, list) else []
@@ -734,6 +778,56 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
                     logger.info(t("log.handler.ai_initializing"))
                 else:
                     logger.warning(t("log.handler.ai_init_incomplete"))
+                return
+
+            _debounce = (
+                float(ai_config.get_config("follow_up_debounce_seconds").data)
+                if "follow_up_debounce_seconds" in ai_config.config
+                else 0.0
+            )
+            if soft_triggered and _debounce > 0:
+                k = f"{session_id}::{event.user_id}"
+                existing = _soft_debounce_map[k] if k in _soft_debounce_map else None
+                if existing is not None:
+                    if existing.task is not None and not existing.task.done():
+                        existing.task.cancel()
+                    existing.events.append(event)
+                    existing.event = event
+                else:
+                    existing = _SoftDebounceItem(
+                        ws=ws,
+                        event=event,
+                        events=[event],
+                        enqueue_ts=time.time(),
+                        trigger_type=trigger_type,
+                    )
+                    _soft_debounce_map[k] = existing
+
+                async def _flush_debounce(debounce_key: str, wait_s: float) -> None:
+                    try:
+                        await asyncio.sleep(wait_s)
+                    except asyncio.CancelledError:
+                        return
+                    item = _soft_debounce_map.pop(debounce_key, None)
+                    if item is None:
+                        return
+                    merged = merge_followup_burst(item.events)
+                    if merged is None:
+                        return
+                    statistics_manager.record_trigger(trigger_type=item.trigger_type or "followup")
+                    task_ctx = TaskContext(
+                        coro=handle_ai_chat(
+                            Bot(item.ws, merged),
+                            merged,
+                            enqueue_ts=item.enqueue_ts,
+                            soft_triggered=True,
+                        ),
+                        name="handle_ai_chat",
+                        priority=merged.user_pm,
+                    )
+                    item.ws.queue.put_nowait(task_ctx)
+
+                existing.task = asyncio.create_task(_flush_debounce(k, _debounce))
                 return
 
             # 记录触发方式统计（trigger_type 已在上方按 mention/keyword 定型，
@@ -881,6 +975,14 @@ async def count_data(event: Event, trigger: Trigger):
             local_val["user"][event.user_id][trigger.keyword] += 1
 
         local_val["user_count"] = len(local_val["user"])
+
+    bot_id = event.real_bot_id
+    bot_self_id = event.bot_self_id
+    if bot_id is not None and bot_self_id is not None:
+        if event.group_id:
+            mark_command_dirty(bot_id, bot_self_id, DataType.GROUP, event.group_id, trigger.keyword)
+        if event.user_id:
+            mark_command_dirty(bot_id, bot_self_id, DataType.USER, event.user_id, trigger.keyword)
 
 
 async def _check_command(

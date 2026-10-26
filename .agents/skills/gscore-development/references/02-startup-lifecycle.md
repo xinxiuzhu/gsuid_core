@@ -8,25 +8,36 @@
 ## 2.1 启动入口 `core.py::main()`
 
 ```
-python -m gsuid_core → asyncio.run(main())
+uv run core / python -m gsuid_core.core → core.main()
+  ├─ 环境里没有 GSUID_CORE_SUPERVISED=1 → 当守护父进程（supervisor.py），拉起下面的子进程
+  └─ 子进程（带 GSUID_CORE_SUPERVISED=1）→ asyncio.run(serve())
 ```
 
-`main()` 同步阶段（在 `await server.serve()` 之前，全部阻塞顺序执行）：
+**两个进程**：父进程只用标准库，不加载 uvicorn 和插件。它一直是终端的前台任务，所以
+Ctrl+C 能同时送到父子两个进程。重启时，`restart_genshinuid` 先跑完关机钩子，
+再让子进程以 `RESTART_EXIT_CODE`（51）退出。父进程等 1 秒后用同样的参数再拉起一个子进程。
+其他退出码由父进程原样透传，父进程随后退出。开了「使用自定义重启命令」时，
+`restart_genshinuid` 仍走旧路径：杀掉当前进程，再执行 `restart_command`。
+
+信号：Windows 的 Ctrl+C / Ctrl+Break 由控制台直接发给父子两个进程，父进程不转发。
+POSIX 上父进程把 SIGTERM 转发给子进程。父进程只转发第二次起的 SIGINT，因为终端已经把
+第一次发给了同进程组的子进程，再转一次会被 uvicorn 当成强制退出，跳过关机钩子。
+
+`serve()` 同步阶段（在 `await server.serve()` 之前，全部阻塞顺序执行）：
 
 1. 解析 CLI 参数 `--dev` / `--port` / `--host`
-2. 切换 HuggingFace 镜像源（`os.environ["HF_ENDPOINT"]`）
-3. `await init_database()` —— 建 SQLite + 初始化基础表
-4. `await load_gss(args.dev)` —— 加载所有插件 + 触发模块级 `@sv` / `@ai_tools` 装饰器
-5. `import gsuid_core.ai_core.startup` —— **注册唯一** `init_ai_core` 钩子（仅注册不执行）
-6. 构造 FastAPI app（启动/关闭 hook 在 `app_life.lifespan` 里跑）
-7. 注册 `@app.websocket("/ws/{bot_id}")` + 可选 `@app.post("/api/send_msg")`
-8. 装 SIGINT/SIGTERM 信号处理（Windows 无 `add_signal_handler`，依赖 uvicorn）
-9. `uvicorn.Server(config).serve()` —— 由 lifespan 在内部跑启动 hook
+2. `await init_database()` —— 建 SQLite + 初始化基础表
+3. `await load_gss(args.dev)` —— 加载所有插件 + 触发模块级 `@sv` / `@ai_tools` 装饰器
+4. `import gsuid_core.ai_core.startup` —— **注册唯一** `init_ai_core` 钩子（仅注册不执行）
+5. 构造 FastAPI app（启动/关闭 hook 在 `app_life.lifespan` 里跑）
+6. 注册 `@app.websocket("/ws/{bot_id}")` + 可选 `@app.post("/api/send_msg")`
+7. 装 SIGINT/SIGTERM 信号处理（Windows 无 `add_signal_handler`，依赖 uvicorn）
+8. `uvicorn.Server(config).serve()` —— 由 lifespan 在内部跑启动 hook
 
-> **Windows 事件循环策略**：`core.py` **不设置**任何事件循环策略——它 `asyncio.run(main())`
+> **Windows 事件循环策略**：`core.py` **不设置**任何事件循环策略——它 `asyncio.run(serve())`
 > 并在内部 `await server.serve()`，而 uvicorn 的 loop factory 只在 `Server.run()` 里生效。
 > 所以 Windows 上是 Python 默认的 **`ProactorEventLoop`**，`asyncio.create_subprocess_exec`
-> **可用**。Proactor 关 socket 的 `InvalidStateError` 由 `core.py:291-297` 顶层 `except` 兜底。
+> **可用**。Proactor 关 socket 的 `InvalidStateError` 由 `core.py::main()` 里的 `except` 兜底。
 > （2026-08-14 更正：此前写「切到 `WindowsSelectorEventLoopPolicy` 故不支持子进程」已过期，
 > 详见 [§12.3](./12-developer-pitfalls.md)。）
 
@@ -132,6 +143,10 @@ AI 子系统**不再各自** `@on_core_start`，而是由 `ai_core/startup.py` �
 `create_core_tables` 同样跳过 AI 表创建。**因此关闭 AI 时不会建任何 AI SQLite 表，也不起
 任何 AI 后台任务**。
 
+`load_plugins` 在 import 插件前会装 `heavy_import_gate`：AI 关闭时 `onnxruntime` /
+`fastembed` 变成占位模块（真正调用才报 `HeavyImportBlocked`）。**`playwright` 不进闸**——
+插件命令出图（浏览器渲染）与 AI 总开关无关。
+
 `handle_ai.py` 里 `enable_ai` 改为**函数内动态读取**（`ai_config.get_config("enable").data`），
 不是模块级常量——用户在 WebConsole 切总开关后**无需重启**即生效。
 
@@ -168,7 +183,11 @@ HTTP Agent 路由在 `app_life` 构造 app 时按总开关决定是否 `include_
 2. `asyncio.create_task(check_speed())` —— 后台测速选镜像源
 3. `asyncio.create_task(core_start_execute())` —— **后台异步**跑全部 `@on_core_start`
    （`_start_rm_cleanup` + `init_ai_core`）
-4. `asyncio.create_task(_bgsetup_frontend_b())` —— 后台准备网页控制台前端
+4. `asyncio.create_task(_bgsetup_frontend_b())` —— 后台准备网页控制台前端。
+   先按 `version.json` 挂载 `data/dist` 与 `gsuid_core/webconsole/dist` 里较新的一份
+   （版本相同用包内 dist）。挂上之后再读资源站 `WebConsole/`，只下载文件名版本最高的
+   zip（如 `v0.4.1.zip`）。云端版本高于 `data/dist` 时解压覆盖该目录，随后的 `/app`
+   请求改读两份里较新的那份。下载失败时继续用已挂上的本地目录。
 5. `await start_scheduler()` —— 启动 APScheduler
 6. `asyncio.create_task(clean_trace_collector())` —— 后台回收僵死追踪
    （旧的 `clean_log()` 已废除：日志缓冲改由条数 + 字符数上限在 append 时淘汰，

@@ -8,8 +8,9 @@
 - ``create_subagent(task=...)``（空 agent_profile）：模型路径拒绝，须填花名册
   node_id。内核 ``summarize_long_input``（无 ctx）仍走通用 Plan-and-Solve。
 - ``create_subagent(task=..., agent_profile=...)``（默认 transient=False）：
-  **自动转为创建一棵单子任务的 Kanban 叶子根树**——同步等待该子任务跑完，把
-  代理返回值 + artifact 句柄拼成回执串返回给主人格。这条路径之所以走 Kanban：
+  **自动转为创建一棵单子任务的 Kanban 叶子根树**。生产路径派完即走，结论由
+  ``_wake_main_agent_for_delivery`` 回灌主人格。只有 ``create_by=="TEST"``
+  会同步等到子任务终态，再把代理返回值 + artifact 句柄拼成回执。这条路径之所以走 Kanban：
     * 产物（PNG / 文件 / 报告）有 Kanban root_task_id 锚点，看板树视图能直接
       看到；点开任务即可在详情里看全部 artifact + workspace 文件。
     * 主人格事后用 `artifact_get_recent` 能自然找回该次执行的最近产物。
@@ -24,13 +25,12 @@
 
 import re
 import asyncio
-from typing import Optional
+from typing import Callable, Optional
 
 from pydantic_ai import RunContext
 
 from gsuid_core.i18n import t as i18n_t
 from gsuid_core.logger import logger
-from gsuid_core.models import Event
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.rag.tools import search_tools
@@ -80,6 +80,31 @@ _ARTIFACT_REGISTERED_RE = re.compile(
     r"(已登记\s*artifact|artifact[_\s-]?put|事实包已登记|登记为\s*\*?`?res_)",
     re.IGNORECASE,
 )
+# 信息卡 / 图表。命中则不是插画，哪怕句子里带「画」或「立绘」。
+_DATA_VISUAL_RE = re.compile(
+    r"(?:HTML|html|事实包|数据表|对比表|对比图|指标卡|信息图|图表|流程图|架构图|资料卡|"
+    r"柱状图|折线图|饼图|思维导图|\bres_|chart|metrics|dashboard)",
+    re.IGNORECASE,
+)
+_ILLUSTRATION_STRONG_RE = re.compile(
+    r"(?:二次元|插画|立绘|全身立图|全身图|动漫图|同人图|同人画|壁纸|素描|生图|anime\s+style|illustration|wallpaper)",
+    re.IGNORECASE,
+)
+# draw / portrait 要整词，避免 withdraw、redraw 误伤。
+_ILLUSTRATION_DRAW_RE = re.compile(
+    r"(?:画一张|画一个|画个|绘图|(?<![A-Za-z])draw(?![A-Za-z])|(?<![A-Za-z])portrait(?![A-Za-z]))",
+    re.IGNORECASE,
+)
+
+
+def looks_like_illustration_request(task: str) -> bool:
+    """是否让 render_agent 画插画/立绘/生图。图表、资料卡、流程图不算。"""
+    body = (task or "").strip()
+    if not body or _DATA_VISUAL_RE.search(body):
+        return False
+    if _ILLUSTRATION_STRONG_RE.search(body):
+        return True
+    return _ILLUSTRATION_DRAW_RE.search(body) is not None
 
 
 def looks_like_incomplete_subagent_delivery(text: str) -> bool:
@@ -197,8 +222,38 @@ def _get_subagent_semaphore() -> asyncio.Semaphore:
 
 
 # create_subagent(agent_profile=...) 转 Kanban：生产立刻 deferred 回灌，不占会话锁。
-# TEST/评测仍同步等待，因评测 HTTP 等不到回灌。
+# create_by 为 TEST 时同步等待，因为该入口等不到回灌。
 _KANBAN_TEST_WAIT_TIMEOUT_SEC = 90.0
+
+
+def _kanban_wait_sec(parent_create_by: str) -> float:
+    """生产派完即走，由执行体回灌；create_by 为 TEST 时同步等到终态。"""
+    if parent_create_by == "TEST":
+        return _KANBAN_TEST_WAIT_TIMEOUT_SEC
+    return 0.0
+
+
+def _inline_claim_verdict(claimed: bool, ordinal: int) -> Optional[str]:
+    """抢到投递权返回 None；没抢到就静默，避免和执行体各交一次。"""
+    if claimed:
+        return None
+    return f"✅ 任务#{ordinal} 刚好完成，但交付已被框架接手。请只输出 <SILENCE>，勿向用户说话、勿重复 create_subagent。"
+
+
+class _InlineClaimGate:
+    """同一次等待只认领一次。已经认领成功后，不得再因第二次失败改口静默。"""
+
+    def __init__(self) -> None:
+        self.claimed = False
+
+    def take(self, claim: Callable[[], bool], ordinal: int) -> Optional[str]:
+        if self.claimed:
+            return None
+        verdict = _inline_claim_verdict(claim(), ordinal)
+        if verdict is None:
+            self.claimed = True
+        return verdict
+
 
 # 纯 lookup 默认同步 ad-hoc（transient），不建看板卡。
 # 外部检索默认 Kanban：超时可回灌，取消不会把事实包扔掉。
@@ -229,6 +284,7 @@ def _caller_persona_name(ctx: RunContext[ToolContext] | None) -> str:
     category="common",
     capability_domain="长期任务编排",
     timeout=500.0,
+    code_callable=False,
 )
 async def create_subagent(
     ctx: RunContext[ToolContext],
@@ -253,7 +309,7 @@ async def create_subagent(
     - 检索综合：目标 + 范围；交付须含条目/数字/**来源**/**时点**。
     - 出图：粘贴完整事实包（或 res_ 句柄）+ 可选版式偏好；写明**禁止再检索**。
     - 禁止把「漂亮出图」派给 research；禁止主人格自己写 HTML 调 render_*。
-    - 接任务应走主通道 TextPart（或框架兜底）；本工具回执不对用户播报过程。
+    - 开场句和本工具写在同一次回复里，派发成功后框架替你发出；没写就看回执再说。
     - 多个互不依赖的对象：同一次回复并列多次调用，各写各的 task；不要等上一个回执再派下一个。
     - 下一步要看本次结果才能选（自己答 / render_agent）：只派当前这步，等回灌。
       不要提前派 render，也不要在等待时逐个补派。
@@ -383,21 +439,27 @@ async def _create_subagent_impl(
             return blocked
         _extra = ctx.deps.extra
         _wake = _extra["delivery_wake"] if "delivery_wake" in _extra else False
-        if _wake is True and pid != "render_agent":
-            if persona_allows_capability_agent(_pn, "render_agent"):
-                return (
-                    '⚠️ 本轮是任务交付回灌，只可 create_subagent(agent_profile="render_agent") 出图，'
-                    "或 send_message_by_ai 发送已有的图。不要新开查询。"
-                )
-            return "⚠️ 本轮是任务交付回灌。当前人格未启用出图代理，请直接用已有事实作答，不要新开查询。"
-        _follow = _extra["turn_followup"] is True if "turn_followup" in _extra else False
-        if pid != "render_agent" and not _follow and ctx.deps.ev is not None:
-            _ground = turn_ground_source(ctx.deps.ev)
-            if _ground and not delegation_grounded(task, _ground):
-                return (
-                    "⚠️ 这个任务对不上本轮说话人的原话。"
-                    "群历史里别人的话题不能派成他的任务；只处理他这一句，或引用里点名的内容。"
-                )
+        if _wake is True:
+            from gsuid_core.ai_core.planning.kanban_executor import delivery_wake_blocks_new_delegate
+
+            _ev = ctx.deps.ev
+            _sid = str(_ev.session_id) if _ev is not None and _ev.session_id else ""
+            _has_img = _extra["delivery_has_image"] is True if "delivery_has_image" in _extra else False
+            if _has_img or delivery_wake_blocks_new_delegate(_sid):
+                return "⚠️ 本帧只许 send_message_by_ai 发给发起人，禁止再委派。"
+            if pid != "render_agent":
+                if persona_allows_capability_agent(_pn, "render_agent"):
+                    return (
+                        '⚠️ 本轮是任务交付回灌，只可 create_subagent(agent_profile="render_agent") 出图，'
+                        "或 send_message_by_ai 发送已有的图。不要新开查询。"
+                    )
+                return "⚠️ 本轮是任务交付回灌。当前人格未启用出图代理，请直接用已有事实作答，不要新开查询。"
+        if pid == "render_agent" and looks_like_illustration_request(task):
+            return (
+                "⚠️ render_agent 只把事实包、表格和对比结论渲成 HTML 信息卡或图表，"
+                "不画二次元插画、人物立绘或 Diffusion 生图。"
+                "角色已有的立绘走 self_info；部署了别的生图工具就改调那个工具，不要派给 render_agent。"
+            )
         use_transient = pid in _TRANSIENT_DEFAULT_PROFILES
         if not use_transient and transient and not ctx.deps.allow_user_outbound:
             use_transient = True
@@ -591,8 +653,7 @@ async def _dispatch_transient_capability_agent(
 
     logger.info(i18n_t("log.ai.subagent_transient_mode_direct", pid=pid, p0=repr(task[:60])))
     try:
-        # runner._ensure_adhoc_workspace contextmanager 会在无 plan_ctx 时建临时 ad-hoc workspace；
-        # 这里直接调 run_capability_agent，让 runner 自己处理。
+        # 无 plan_ctx 时 runner 自动创建临时 workspace。
         raw_result = await run_capability_agent(
             profile_id=pid,
             task=task,
@@ -652,149 +713,14 @@ async def _dispatch_transient_capability_agent(
     return f"{prefix_note}\n\n{raw_result}{note}"
 
 
-_TURN_GLUE = frozenset(
-    {
-        "帮我",
-        "帮忙",
-        "一下",
-        "看看",
-        "看下",
-        "分析",
-        "比较",
-        "对比",
-        "怎么",
-        "什么",
-        "还是",
-        "可以",
-        "这个",
-        "那个",
-        "现在",
-        "今天",
-        "麻烦",
-        "给我",
-    }
-)
-_CONTENT_CHUNK_RE = re.compile(r"[0-9A-Za-z]{3,}|[\u4e00-\u9fff]+")
-_ASCII_ANCHOR_STOP = frozenset(
-    {
-        "the",
-        "and",
-        "with",
-        "this",
-        "that",
-        "from",
-        "have",
-        "been",
-        "your",
-        "what",
-        "when",
-        "where",
-        "which",
-        "would",
-        "could",
-        "should",
-        "about",
-        "there",
-        "their",
-        "them",
-        "then",
-        "than",
-        "into",
-        "over",
-        "also",
-        "just",
-        "some",
-        "more",
-        "help",
-        "please",
-        "today",
-    }
-)
-
-
-def _glue_span(span: str) -> bool:
-    if span in _TURN_GLUE:
-        return True
-    if len(span) < 4:
-        return False
-    return all(span[i : i + 2] in _TURN_GLUE for i in range(len(span) - 1))
-
-
-def turn_content_anchors(text: str) -> list[str]:
-    """原话里能锚定任务的片段。英文至少 4 字且不是功能词；中文滑窗至少 4 字。"""
-    seen: set[str] = set()
-    anchors: list[str] = []
-    for chunk in _CONTENT_CHUNK_RE.findall(text or ""):
-        if chunk.isascii():
-            token = chunk.lower()
-            if len(token) < 4 or token in _ASCII_ANCHOR_STOP or token in seen:
-                continue
-            seen.add(token)
-            anchors.append(token)
-            continue
-        n = len(chunk)
-        if 2 <= n <= 3 and chunk not in _TURN_GLUE and chunk not in seen:
-            seen.add(chunk)
-            anchors.append(chunk)
-        for size in range(min(8, n), 3, -1):
-            for i in range(0, n - size + 1):
-                span = chunk[i : i + size]
-                if span in seen or _glue_span(span):
-                    continue
-                seen.add(span)
-                anchors.append(span)
-                if len(anchors) >= 40:
-                    return anchors
-    return anchors
-
-
-def delegation_grounded(task: str, ground: str) -> bool:
-    """任务要含原话里的一个长锚，或两个标点切开的短锚。对不上就拒绝。"""
-    anchors = turn_content_anchors(ground)
-    if not anchors:
-        return False
-    hay = task or ""
-    hay_low = hay.lower()
-    short_hits = 0
-    for span in anchors:
-        found = span in hay_low if span.isascii() else span in hay
-        if not found:
-            continue
-        if len(span) >= 4:
-            return True
-        short_hits += 1
-        if short_hits >= 2:
-            return True
-    return False
-
-
-def turn_ground_source(ev: Event) -> str:
-    parts: list[str] = []
-    if ev.raw_text:
-        parts.append(ev.raw_text)
-    elif ev.text:
-        parts.append(ev.text)
-    if ev.reply:
-        parts.append(ev.reply)
-    return "\n".join(parts)
-
-
 async def _dispatch_via_kanban(
     ctx: RunContext[ToolContext],
     task: str,
     agent_profile: str,
 ) -> str:
     """把 create_subagent(agent_profile=...) 转为创建 Kanban **单任务**（叶子根）
-    并启动执行。生产路径立刻 deferred 回灌，不占主会话锁；TEST 仍同步等待。
-
-    每条主人格通过画像派出的任务都走这条路：
-    1. ``kanban.create_kanban_tree(root_agent_profile=pid)`` 建一棵**只有根任务**
-       的叶子树——根任务自身带 ``agent_profile``，被调度器当作单一可执行节点直接
-       派出。**不再**创建冗余的"根 + 1 子任务"双节点结构；
-    2. ``kick_root`` 立刻派活；
-    3. 生产：``mark_deferred_main_delivery`` 后立即返回，完成后
-       ``_wake_main_agent_for_delivery``；TEST 同步等到终态。
-    4. 抓根任务最新产出 artifact 句柄 + relay 文本，拼成回执给主人格。
+    并启动执行。生产路径登记 deferred 后立刻返回：主 session 放锁，别人可以继续
+    说话/再委派；结论只走 ``_wake_main_agent_for_delivery``。TEST 仍同步等到终态。
     """
     ev = ctx.deps.ev
     if ev is None:
@@ -803,12 +729,20 @@ async def _dispatch_via_kanban(
     from gsuid_core.ai_core.agent_node import get_node, resolve_node
 
     pid = resolve_node(agent_profile)
-    _wake = ctx.deps.extra["delivery_wake"] if "delivery_wake" in ctx.deps.extra else False
-    if _wake is True and pid != "render_agent":
-        return (
-            '⚠️ 本轮是任务交付回灌，只可 create_subagent(agent_profile="render_agent") 出图，'
-            "或 send_message_by_ai 发送已有的图。不要新开查询。"
-        )
+    _extra = ctx.deps.extra
+    _wake = _extra["delivery_wake"] if "delivery_wake" in _extra else False
+    if _wake is True:
+        from gsuid_core.ai_core.planning.kanban_executor import delivery_wake_blocks_new_delegate
+
+        sid = str(ev.session_id) if ev.session_id else ""
+        _has_img = _extra["delivery_has_image"] is True if "delivery_has_image" in _extra else False
+        if _has_img or delivery_wake_blocks_new_delegate(sid):
+            return "⚠️ 本帧只许 send_message_by_ai 发给发起人，禁止再委派。"
+        if pid != "render_agent":
+            return (
+                '⚠️ 本轮是任务交付回灌，只可 create_subagent(agent_profile="render_agent") 出图，'
+                "或 send_message_by_ai 发送已有的图。不要新开查询。"
+            )
     profile = get_node(pid)
     if profile is None:
         from gsuid_core.ai_core.agent_node import list_nodes
@@ -896,14 +830,34 @@ async def _dispatch_via_kanban(
     mark_deferred_main_delivery(root.id)
     asyncio.create_task(kick_root(root.id))
 
+    from gsuid_core.ai_core.agent_run.opening_line import release_opening_line
+    from gsuid_core.ai_core.capability_agents.delegation_contracts import (
+        format_deferred_subagent_ack,
+    )
+
+    # 派发成功之后才开口：校验被拒时用户什么也听不到，模型重派也不会说两遍
+    opening = await release_opening_line(ctx.deps) if ctx.deps is not None else None
+    spoken = opening.text if opening is not None else ""
+    opening_missed = opening is not None and not opening.text
+
     extra = ctx.deps.extra if ctx.deps is not None else {}
-    parent_cb = extra["parent_create_by"] if "parent_create_by" in extra else ""
-    wait_sec = _KANBAN_TEST_WAIT_TIMEOUT_SEC if parent_cb == "TEST" else 0.0
+    _raw_cb = extra["parent_create_by"] if "parent_create_by" in extra else ""
+    parent_cb = _raw_cb if isinstance(_raw_cb, str) else ""
+    wait_sec = _kanban_wait_sec(parent_cb)
     handle = delegation_handle(root.id)
+    if wait_sec <= 0:
+        return format_deferred_subagent_ack(
+            ordinal=root.ordinal,
+            pid=pid,
+            handle=handle,
+            spoken=spoken,
+            opening_missed=opening_missed,
+        )
     deleg = await await_delegation(handle, wait_sec=wait_sec)
     if deleg is None:
         return f"⚠️ Kanban 任务记录消失（task_id={root.id}）；可能被并发删除，请到 webconsole 看任务列表。"
     final: Optional[AIAgentTask] = await AIAgentTask.get_by_id(root.id) if deleg.is_terminal else None
+    claim_gate = _InlineClaimGate()
 
     if final is None:
         fresh_after = await AIAgentTask.get_by_id(root.id)
@@ -913,19 +867,24 @@ async def _dispatch_via_kanban(
             "cancelled",
             "waiting_approval",
         ):
-            if try_claim_deferred_for_inline_return(root.id):
-                final = fresh_after
-            else:
-                return (
-                    f"✅ 任务#{root.ordinal} 刚好完成，框架正在回灌产物。"
-                    "请只输出 <SILENCE>，勿向用户说话、勿重复 create_subagent。"
-                )
+            verdict = claim_gate.take(lambda: try_claim_deferred_for_inline_return(root.id), root.ordinal)
+            if verdict is not None:
+                return verdict
+            final = fresh_after
         else:
-            from gsuid_core.ai_core.capability_agents.delegation_contracts import (
-                format_deferred_subagent_ack,
+            return format_deferred_subagent_ack(
+                ordinal=root.ordinal,
+                pid=pid,
+                handle=handle,
+                spoken=spoken,
+                opening_missed=opening_missed,
             )
 
-            return format_deferred_subagent_ack(ordinal=root.ordinal, pid=pid, handle=handle)
+    # 终态与超时边界都要认领；已经认领过就不要再调，否则第二次失败会把全文丢掉。
+    # 留下 interactive：执行体见到「interactive 在、deferred 不在」就不再唤醒。
+    verdict = claim_gate.take(lambda: try_claim_deferred_for_inline_return(root.id), root.ordinal)
+    if verdict is not None:
+        return verdict
 
     # 抓 artifact（最新一份用作产物展示）
     arts = await AIAgentArtifact.list_for_task(final.id)

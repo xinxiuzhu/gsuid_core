@@ -56,6 +56,7 @@ from gsuid_core.ai_core.agent_run.support import (
     _claims_deferred_work,
     _correction_nudge_markers,
     _looks_like_report_speech,
+    absorb_run_image_delivered,
     usage_limit_return_payload,
     _claims_missing_offered_tool,
 )
@@ -95,6 +96,21 @@ from gsuid_core.ai_core.agent_run.speech_policy import (
 )
 from gsuid_core.ai_core.agent_run.user_turn_ctx import reset_user_turn_id
 
+# 收口交付的第一行。不以能力代理失败前缀开头，看板才会把这一步标完成。
+_USAGE_LIMIT_SALVAGE_BANNER = "⚠ 思考轮数已到上限。下面是根据已收集材料收口的交付，未继续补查。"
+_SALVAGE_SKIP_TOOLS = frozenset(
+    {
+        "read_handle",
+        "list_skills",
+        "artifact_get",
+        "artifact_get_recent",
+        "artifact_list",
+    }
+)
+_SALVAGE_ITEM_CAP = 2000
+_SALVAGE_TOTAL_CAP = 12000
+_SALVAGE_ROW_LIMIT = 10
+
 
 async def _deliver_withheld(st: RunOnceState, sent: set[str]) -> None:
     """把排版闸暂扣的原文真正发给用户（INV-4 兜底，只发第一段防刷屏）。"""
@@ -104,6 +120,7 @@ async def _deliver_withheld(st: RunOnceState, sent: set[str]) -> None:
         if st.bot is None:
             return
         await send_chat_result(st.bot, body, ev=st.ev, extra_metadata=turn_reply_metadata(st.ev))
+        absorb_run_image_delivered(st)
         sent.add(body)
         return
 
@@ -159,11 +176,12 @@ _RENDER_OBLIGATION_REASONS: frozenset[str] = frozenset({"report_speech", "empty_
 
 
 def _has_unread_attachment(st: RunOnceState, *, video_readable: bool) -> bool:
-    """本条是否带未读附件（图/音频/文件/可读视频）。只看 Event 结构字段。"""
+    """本条是否带未读附件（图/音频/文件/可读视频）。引用纯图消息不计为用户新附件。"""
     ev = st.ev
     if ev is None:
         return False
-    if ev.image_id_list or ev.image_id:
+    quoted_pure_image = bool((ev.reply_id or (st.tg is not None and st.tg.quoted_tome)) and not ev.reply)
+    if (ev.image_id_list or ev.image_id) and not quoted_pure_image:
         return True
     if ev.audio_id_list or ev.audio_id:
         return True
@@ -218,15 +236,12 @@ def _voice_block_reason(st: RunOnceState, result_msg: str) -> str:
 
 
 def _needs_render_obligation(st: RunOnceState, result_msg: str, *, allow_render: bool = True) -> bool:
-    """有出处凭据且台词呈报告体 / 空交付暂扣时才进纠正。mismatch 单独不够。
+    """有出处凭据且台词呈报告体、念数或空交付时才进纠正。
 
-    念数被话术闸拦下时，即使本轮没工具，也要纠正去出图，否则用户什么都看不到。
-    人格关掉 render_agent 时不把委派出图当成义务。
+    没有事实包的念数是回答本身，不武装出图。人格关掉 render_agent 时不把出图当义务。
     """
     if not allow_render:
         return False
-    if "numeric_recitation" in st.presentation_withheld_reasons:
-        return True
     if not st.saw_structured_return or not st.tool_call_list:
         return False
     if _looks_like_report_speech(result_msg or ""):
@@ -265,14 +280,14 @@ def _forbid_title(st: RunOnceState, persona_name: str | None) -> str:
     return non_master_title(uid, persona_name)
 
 
-def _correction_is_deliverable(text: str) -> bool:
+def _correction_is_deliverable(text: str, *, is_delivery_wake: bool = False) -> bool:
     """纠正产出是否可直接交付（非沉默、非编排/元叙述脏输出）。"""
     body = (text or "").strip()
     if not body or is_silence_marker(body):
         return False
     return not (
         has_orchestration_narration(body)
-        or claims_premature_delivery(body)
+        or claims_premature_delivery(body, is_delivery_wake=is_delivery_wake)
         or _looks_like_report_speech(body)
         or looks_like_process_meta(body)
     )
@@ -354,6 +369,50 @@ def _corrected_or_original(corrected: object, *, original: str) -> str:
     return strip_open_solicitations(corrected.strip()) or original
 
 
+async def load_session_salvage_material(session_id: str) -> str:
+    """本会话最近落盘的检索原文，新的在前。库失败时返回空串，改用本轮摘录。"""
+    if not session_id:
+        return ""
+    try:
+        return await _read_session_salvage_material(session_id)
+    except Exception as exc:
+        logger.warning(i18n_t("log.agent.usage_limit_salvage_sources_fail", e=exc))
+        return ""
+
+
+async def _read_session_salvage_material(session_id: str) -> str:
+    import asyncio
+
+    from gsuid_core.ai_core.planning.tool_output_store import AIToolOutputRecord
+    from gsuid_core.ai_core.planning.tool_output_protocol import load_payload_text
+
+    rows = await AIToolOutputRecord.list_recent(session_id=session_id, limit=_SALVAGE_ROW_LIMIT)
+    chunks: list[str] = []
+    used = 0
+    for rec in rows:
+        if rec.tool_name in _SALVAGE_SKIP_TOOLS:
+            continue
+        text, _err = await asyncio.to_thread(
+            load_payload_text,
+            payload_inline=rec.payload_inline,
+            payload_path=rec.payload_path,
+        )
+        body = text.strip()
+        if not body:
+            continue
+        block = f"[{rec.tool_name}] {body[:_SALVAGE_ITEM_CAP]}"
+        if used + len(block) > _SALVAGE_TOTAL_CAP:
+            remain = _SALVAGE_TOTAL_CAP - used
+            if remain < 200:
+                break
+            block = block[:remain]
+        chunks.append(block)
+        used += len(block)
+        if used >= _SALVAGE_TOTAL_CAP:
+            break
+    return "\n\n".join(chunks)
+
+
 class SettlePhase(RunOnceHost):
     async def _try_correction_pass(
         self,
@@ -363,13 +422,14 @@ class SettlePhase(RunOnceHost):
         suppress_intermediate_text: bool | None = None,
         return_mode: ReturnMode | None = None,
     ) -> object:
-        """纠正重跑；失败返回 None，原答案按 INV-3 生效。"""
+        """纠正重跑；失败返回 None，原答案按 INV-3 生效。
+        成功时把本轮工具事实并回父级，失败不并回。"""
         _suppress = st.suppress_intermediate_text if suppress_intermediate_text is None else suppress_intermediate_text
         # 话术纠正要拿回文本：by_bot 成功路径会 return ""，父级补发看不到改写。
         _mode = st.return_mode if return_mode is None else return_mode
         # Why: 纠正是增强路径，失败不得毁掉已完成的用户轮（INV-3）
         try:
-            return await self._execute_run_once(
+            corrected = await self._execute_run_once(
                 user_message=render_control_envelope(directives),
                 bot=st.bot,
                 ev=st.ev,
@@ -383,7 +443,19 @@ class SettlePhase(RunOnceHost):
             )
         except Exception as _fe:
             logger.warning(i18n_t("log.agent.fakedone_correction_run_keeping_fail", _fe=_fe))
+            # 失败时指针已指向纠正轮的空列表，拨回父级，否则对外报成没调过工具。
+            self._last_attempt_tool_calls = st.tool_call_list
             return None
+        _absorb_attempt_facts(
+            st,
+            tool_calls=self._last_attempt_tool_calls,
+            delegated_render=self._last_attempt_delegated_render,
+            image_sent=self._last_attempt_image_sent,
+            pending_async=self._last_attempt_pending_async,
+            has_status_tool=self._last_attempt_has_status_tool,
+        )
+        self._last_attempt_tool_calls = st.tool_call_list
+        return corrected
 
     def _record_prefix_break_probe(self, st: RunOnceState, new_msgs: List[ModelMessage]) -> None:
         """对比上一 run 发送快照与当前 history 头，记 prefix_break_reason。"""
@@ -394,15 +466,15 @@ class SettlePhase(RunOnceHost):
             history_payloads,
             hash_system_prompt,
             record_prefix_break,
-            classify_prefix_break,
             hash_history_messages,
+            classify_prefix_break_with_pos,
         )
 
         tools_hash = hash_tool_names(st.tool_names)
         system_hash = hash_system_prompt(self.system_prompt or "")
         hist_hashes = hash_history_messages(self.history)
         prev = self._prefix_snapshot
-        reason = classify_prefix_break(
+        reason, break_pos, approx_tokens_before = classify_prefix_break_with_pos(
             prev,
             history_hashes=hist_hashes,
             tools_hash=tools_hash,
@@ -417,7 +489,14 @@ class SettlePhase(RunOnceHost):
             if removed:
                 logger.warning(i18n_t("log.agent.prefix_tools_removed", names=removed[:12]))
         record_prefix_break(reason)
-        self._session_logger.log_prefix_break(reason, tools_hash=tools_hash, system_hash=system_hash, tools_diff=diff)
+        self._session_logger.log_prefix_break(
+            reason,
+            tools_hash=tools_hash,
+            system_hash=system_hash,
+            tools_diff=diff,
+            break_pos=break_pos,
+            approx_tokens_before=approx_tokens_before,
+        )
         combined = list(self.history) + list(new_msgs)
         self._prefix_snapshot = PrefixSnapshot(
             history_hashes=hash_history_messages(combined),
@@ -434,6 +513,7 @@ class SettlePhase(RunOnceHost):
         statistics_manager: Any,
     ) -> Any:
         """iter 成功路径：history / 闸门 / token / 假完成 / OOC / return。"""
+        absorb_run_image_delivered(st)
         # 遍历完成后，直接从 agent_run 中获取最终结果
         result = agent_run.result
         if result:
@@ -489,13 +569,16 @@ class SettlePhase(RunOnceHost):
             if self.create_by in ["Chat", "Agent"] and st.intent not in _PROGRESSIVE_TOOLS_SKIP_INTENTS:
                 if st.tool_call_list:
                     self._consecutive_no_tool_rounds = 0
+                    self._unmet_tool_promise = False
                 else:
                     self._consecutive_no_tool_rounds += 1
-                    # 意图-行为不一致检测（结构化）：thinking 里提到了本轮
-                    # 已装配的工具名却没真正调用——顶到阈值，下轮强制提醒。
+                    # 思考里点了本轮已装配的工具名却没调用。只记这一笔，不因空轮催工具。
                     thinking_blob = "\n".join(st.thinking_segments)
-                    if thinking_blob and st.tool_names and any(tn in thinking_blob for tn in st.tool_names):
-                        self._consecutive_no_tool_rounds = max(self._consecutive_no_tool_rounds, 2)
+                    mentioned = bool(
+                        thinking_blob and st.tool_names and any(tn in thinking_blob for tn in st.tool_names)
+                    )
+                    self._unmet_tool_promise = mentioned
+                    if mentioned:
                         logger.debug(i18n_t("log.agent.intent_action_mismatch_force"))
 
             # 记录 Token 使用量和延迟统计
@@ -521,9 +604,8 @@ class SettlePhase(RunOnceHost):
                     )
                 )
 
-                # 小时级性能统计（TTFT/TPS）已在每轮 CallToolsNode 中按请求结算,
-                # 此处记录 run 级 Token 汇总 + User Turn / Agent Run 效率计数。
-                # 计数在 token 为 0 时仍记（完整 settle 的 run 也算一次），避免漏计分母。
+                # TTFT/TPS 已在 CallToolsNode 按请求结算。这里只记 run 级 token。
+                # token 为 0 仍计数，避免漏掉分母。
                 _is_nested = bool(self.is_subagent) or (bool(st.user_turn_id) and not st.owns_user_turn)
                 if input_tokens > 0 or output_tokens > 0:
                     statistics_manager.record_token_usage(
@@ -590,31 +672,6 @@ class SettlePhase(RunOnceHost):
 
             # 始终返回字符串类型
             result_msg = str(result.output).strip()
-            from gsuid_core.ai_core.memory.config import memory_config as _eo_mc
-            from gsuid_core.ai_core.memory.retrieval.event_time import looks_like_order_query as _eo_order
-
-            _eo_q = st.user_message if isinstance(st.user_message, str) else ""
-            if not _eo_q and st.ev is not None:
-                _eo_q = st.ev.raw_text or ""
-            if self.create_by != "EoSelector" and _eo_mc.eo_strategy == "ledger" and _eo_order(_eo_q):
-                from gsuid_core.ai_core.agent_run.order_answer import (
-                    get_order_meta,
-                    set_order_meta,
-                    apply_order_answer,
-                    get_order_rendered,
-                    maybe_override_persona,
-                )
-
-                _eo_list = get_order_rendered()
-                _eo_prev = get_order_meta()
-                if _eo_mc.eo_selector == "dedicated":
-                    if _eo_list:
-                        result_msg, _over = maybe_override_persona(result_msg, _eo_list)
-                        if _over and _eo_prev is not None:
-                            _eo_prev["fallback_used"] = "eo_override"
-                            set_order_meta(_eo_prev)
-                else:
-                    result_msg, _eo_meta = apply_order_answer(result_msg, _eo_q)
             # 工具调用列表只进调试日志，不追加到用户可见消息
             if st.tool_call_list:
                 logger.debug(i18n_t("log.agent.current_tool_call_event", p0=", ".join(st.tool_call_list)))
@@ -634,11 +691,14 @@ class SettlePhase(RunOnceHost):
                             logger.warning(i18n_t("log.agent.fakedone_bot_object_unavailable"))
                             continue
                         await send_chat_result(st.bot, _bt, ev=st.ev, extra_metadata=turn_reply_metadata(st.ev))
+                        absorb_run_image_delivered(st)
                         self._run_sent_texts.add(_bt)
                     except Exception as _se:
                         logger.debug(i18n_t("log.agent.fakedone_se", _se=_se))
 
-            if st.fab_blocked and st.tool_call_list and st.bot and st.return_mode in ["always", "by_bot"]:
+            # 直发暂扣原文只在真改过世界时成立。tool_call_list 对只读工具（搜索/翻页）
+            # 也会填，用它当条件会让「只查了没改」也跳过纠正，把编造的完成声明发出去。
+            if st.fab_blocked and st.effectual_mutate and st.bot and st.return_mode in ["always", "by_bot"]:
                 logger.info(i18n_t("log.agent.fakedone_claim"))
                 await _resend_fab_blocked()
             elif (
@@ -651,25 +711,12 @@ class SettlePhase(RunOnceHost):
             ):
                 _settle_correction_ran = True
                 logger.warning(i18n_t("log.agent.fakedone_call_action_appending_ok"))
-                try:
-                    corrected = await self._execute_run_once(
-                        user_message=render_control_envelope((fake_done_directive(tool_pool_size=len(st.tool_names)),)),
-                        bot=st.bot,
-                        ev=st.ev,
-                        tools=st.tools,
-                        return_mode=st.return_mode,
-                        intent=st.intent,
-                        has_active_task=st.has_active_task,
-                        suppress_intermediate_text=st.suppress_intermediate_text,
-                        fake_done_retry=True,
-                        is_framework_injection=True,
-                    )
-                except Exception as _fe:
-                    # 纠正 pass 是增强路径，失败不影响原结果返回；暂扣文本补发防"整轮沉默"
-                    logger.warning(i18n_t("log.agent.fakedone_correction_run_keeping_fail", _fe=_fe))
-                    corrected = None
-                    if st.fab_blocked and st.bot and st.return_mode in ["always", "by_bot"]:
-                        await _resend_fab_blocked()
+                corrected = await self._try_correction_pass(
+                    st,
+                    (fake_done_directive(tool_pool_size=len(st.tool_names)),),
+                )
+                if corrected is None and st.fab_blocked and st.bot and st.return_mode in ["always", "by_bot"]:
+                    await _resend_fab_blocked()
                 # 与其它三条纠正的 INV-3 有意分岔：原答案是**编造的完成声明**，
                 # 不能当 fallback 留给用户；无干净纠正则静默，并一律剥掉那句谎话。
                 _fabricated = {t.strip() for t in st.fab_blocked}
@@ -731,12 +778,11 @@ class SettlePhase(RunOnceHost):
                 else:
                     self._scrub_fake_done_history(set())
 
-            # 被直接呼叫却整段沉默（引用/寻址门仍允许沉默）
+            # 被直接呼叫却整段沉默（含无可见文本出站；引用/寻址门仍允许沉默）
             elif (
-                result_msg
-                and is_silence_marker(result_msg.strip())
+                (not result_msg or is_silence_marker(result_msg.strip()))
+                and not self._run_sent_texts
                 and not st.fake_done_retry
-                and not st.tool_call_list
                 and self.create_by in _INTERACTIVE_CREATE_BY
                 and self.create_by != "CapabilityAgent"
                 and st.tg is not None
@@ -766,7 +812,7 @@ class SettlePhase(RunOnceHost):
                 result_msg = _corrected_or_original(_sc, original=result_msg)
                 self._scrub_fake_done_history(set())
 
-            # 交付回灌的进度句或长文：补一次出图/发图。短收尾留给用户。
+            # 交付回灌的进度句或大报表：补一次出图/发图。短事实直接交付用户。
             elif (
                 st.fw_msg
                 and ("delivery_wake" in st.run_extra and st.run_extra["delivery_wake"] is True)
@@ -775,13 +821,33 @@ class SettlePhase(RunOnceHost):
                 and not st.image_sent_this_run
                 and result_msg
                 and not is_silence_marker(result_msg.strip())
-                and (looks_like_deliver_progress(result_msg) or len(result_msg.strip()) > 40)
                 and self.create_by in ("Chat", "Agent")
             ):
-                _settle_correction_ran = True
-                logger.warning(i18n_t("log.agent.delivery_idle_correction"))
-                await self._try_correction_pass(st, (framework_idle_deliver_directive(),))
-                result_msg = "<SILENCE>"
+                _is_dense_report = (_looks_like_report_speech(result_msg) and len(result_msg.strip()) >= 160) or (
+                    result_msg.count("|") >= 6 and "\n" in result_msg
+                )
+                _is_progress_meta = looks_like_deliver_progress(result_msg)
+                if _is_progress_meta or _is_dense_report:
+                    _settle_correction_ran = True
+                    logger.warning(i18n_t("log.agent.delivery_idle_correction"))
+                    _prior = result_msg.strip()
+                    _disputes_before = len(self._run_disputes)
+                    _dc = await self._try_correction_pass(
+                        st,
+                        (framework_idle_deliver_directive(),),
+                        suppress_intermediate_text=True,
+                        return_mode="return",
+                    )
+                    _disputed = len(self._run_disputes) > _disputes_before
+                    if _disputed:
+                        result_msg = _prior
+                    elif isinstance(_dc, str) and _correction_is_deliverable(_dc, is_delivery_wake=True):
+                        result_msg = strip_open_solicitations(_dc.strip()) or "<SILENCE>"
+                    else:
+                        result_msg = "<SILENCE>"
+                else:
+                    # 简短事实交付（如版本查询、轻量状态），直接放行
+                    pass
 
             # 实体已装上查询工具却空口作答：先拦住，纠正轮拿回文本再发。
             elif (
@@ -835,6 +901,7 @@ class SettlePhase(RunOnceHost):
                         at_user_id=str(_send_at) if isinstance(_send_at, str) and _send_at else None,
                         extra_metadata=turn_reply_metadata(st.ev),
                     )
+                    absorb_run_image_delivered(st)
                     self._run_sent_texts.add(result_msg.strip())
 
             elif (
@@ -873,6 +940,7 @@ class SettlePhase(RunOnceHost):
                         at_user_id=str(_send_at) if isinstance(_send_at, str) and _send_at else None,
                         extra_metadata=turn_reply_metadata(st.ev),
                     )
+                    absorb_run_image_delivered(st)
                     self._run_sent_texts.add(result_msg.strip())
 
             _voice_reason = _voice_block_reason(st, result_msg)
@@ -897,6 +965,7 @@ class SettlePhase(RunOnceHost):
                     suppress_intermediate_text=True,
                     return_mode="return",
                 )
+                # 纠正轮的工具事实已由 _try_correction_pass 就地并回父级并指回。
                 _disputed = len(self._run_disputes) > _disputes_before
                 if _disputed:
                     logger.info(i18n_t("log.agent.directive_disputed", reason=self._run_disputes[-1][:120]))
@@ -909,6 +978,7 @@ class SettlePhase(RunOnceHost):
                     and st.return_mode in ("always", "by_bot")
                 ):
                     await send_chat_result(st.bot, result_msg, ev=st.ev, extra_metadata=turn_reply_metadata(st.ev))
+                    absorb_run_image_delivered(st)
                     self._run_sent_texts.add(result_msg.strip())
                     if st.main_channel_sends == 0:
                         st.main_channel_sends = 1
@@ -934,7 +1004,7 @@ class SettlePhase(RunOnceHost):
                 and self.create_by != "CapabilityAgent"
             ):
                 logger.warning(i18n_t("log.agent.render_data_nudge_once"))
-                if "numeric_recitation" in st.presentation_withheld_reasons and not st.saw_structured_return:
+                if "numeric_recitation" in st.presentation_withheld_reasons:
                     _directive = numeric_recitation_directive(allow_render=_allow_render)
                 else:
                     _directive = render_obligation_directive(
@@ -949,15 +1019,8 @@ class SettlePhase(RunOnceHost):
                     (_directive,),
                     suppress_intermediate_text=True,
                 )
-                # 纠正轮是新 st；先并回父级再判义务，否则嵌套 create_subagent 恒未履行
-                _absorb_attempt_facts(
-                    st,
-                    tool_calls=self._last_attempt_tool_calls,
-                    delegated_render=self._last_attempt_delegated_render,
-                    image_sent=self._last_attempt_image_sent,
-                    pending_async=self._last_attempt_pending_async,
-                    has_status_tool=self._last_attempt_has_status_tool,
-                )
+                # 纠正轮的工具事实已由 _try_correction_pass 就地并回父级并指回，
+                # 所以下面判义务时读到的 st.tool_call_list 已含嵌套 create_subagent。
                 _disputed = len(self._run_disputes) > _disputes_before
                 _orig_before = result_msg
                 # 模型申辩了观察不成立 → 原答案照原样交付（这正是它不再对用户反驳的前提）
@@ -997,26 +1060,52 @@ class SettlePhase(RunOnceHost):
                         or looks_like_process_meta(_rs)
                     ):
                         result_msg = "<SILENCE>"
+                        st.silence_reason = (
+                            "orchestration_leak"
+                            if has_orchestration_narration(_rs)
+                            else ("report_speech" if _looks_like_report_speech(_rs) else "process_meta")
+                        )
                     else:
                         _stripped = strip_open_solicitations(_rs)
                         if _stripped != _rs:
                             result_msg = _stripped if _stripped else "<SILENCE>"
+                            if not result_msg or is_silence_marker(result_msg):
+                                st.silence_reason = "open_solicit_stripped"
                         elif len(_rs) > 120:
                             result_msg = "<SILENCE>"
+                            st.silence_reason = "post_image_too_long"
                 elif (st.pending_async_delivery or st.delegated_render) and not is_silence_marker(_rs):
                     # 在途默认静默；极短等待安慰可保留一次
                     if looks_like_wait_comfort(_rs) and not st.wait_comfort_sent:
                         result_msg = _rs
                     else:
                         result_msg = "<SILENCE>"
+                        st.silence_reason = "silence_only_or_async"
                 elif has_orchestration_narration(_rs) or looks_like_process_meta(_rs):
                     result_msg = "<SILENCE>"
-                elif claims_premature_delivery(_rs) and not st.image_sent_this_run:
+                    st.silence_reason = "orchestration_leak" if has_orchestration_narration(_rs) else "process_meta"
+                elif (
+                    claims_premature_delivery(
+                        _rs,
+                        has_fact_pack=st.saw_structured_return,
+                        tool_called_this_run=bool(st.tool_call_list),
+                        is_delivery_wake=bool(st.fw_msg and st.run_extra.get("delivery_wake") is True),
+                    )
+                    and not st.image_sent_this_run
+                ):
                     result_msg = "<SILENCE>"
+                    st.silence_reason = "premature_delivery"
                 elif looks_like_empty_handoff(_rs) and not st.image_sent_this_run:
                     result_msg = "<SILENCE>"
-                elif not st.image_sent_this_run and looks_like_numeric_recitation(_rs) and st.intent != "问答":
+                    st.silence_reason = "empty_handoff"
+                elif (
+                    st.saw_structured_return
+                    and st.tool_call_list
+                    and not st.image_sent_this_run
+                    and looks_like_numeric_recitation(_rs)
+                ):
                     result_msg = "<SILENCE>"
+                    st.silence_reason = "numeric_recitation"
                 elif (
                     _render_obligation
                     and not _skip_report_exit
@@ -1025,10 +1114,13 @@ class SettlePhase(RunOnceHost):
                 ):
                     # 有真事实包却念表 → 静默（该走 render）；无事实包的长正文放行
                     result_msg = "<SILENCE>"
+                    st.silence_reason = "report_speech"
                 else:
                     _stripped = strip_open_solicitations(_rs)
                     if _stripped != _rs:
                         result_msg = _stripped if _stripped else "<SILENCE>"
+                        if not result_msg or is_silence_marker(result_msg):
+                            st.silence_reason = "open_solicit_stripped"
 
             # INV-4：暂扣原文在纠正未兑现（或根本没进纠正）且没有替代品时必须发出。
             if _should_deliver_withheld(
@@ -1038,8 +1130,8 @@ class SettlePhase(RunOnceHost):
             ):
                 await _deliver_withheld(st, self._run_sent_texts)
 
-            self._session_logger.log_result(result_msg, st.tool_call_list)
             if st.return_mode in ["by_bot"] and st.bot and st.ev:
+                self._log_run_result(st, result_msg)
                 return ""
             # 对用户可见出口才做 roleplay OOC；子代理/能力代理 return 必须保留 res_ 句柄
             if result_msg and output_firewall.is_enabled() and self.create_by not in ("EvalJudge", "TEST"):
@@ -1063,19 +1155,165 @@ class SettlePhase(RunOnceHost):
                                 p0=_hit.category,
                             )
                         )
-                        result_msg = await self._ooc_recover_persona_voice(_hit, result_msg, st.ev) or "<SILENCE>"
+                        recovered = await self._ooc_recover_persona_voice(_hit, result_msg, st.ev) or "<SILENCE>"
+                        had_body = bool(result_msg.strip()) and not is_silence_marker(result_msg.strip())
+                        if had_body and (not recovered.strip() or is_silence_marker(recovered.strip())):
+                            st.silence_reason = "ooc_recover"
+                        result_msg = recovered
             if isinstance(result_msg, str) and not (
                 self.is_subagent or self.create_by in ("CapabilityAgent", "AutoPlanner")
             ):
-                result_msg = strip_framework_user_leaks(result_msg)
+                leaked = strip_framework_user_leaks(result_msg)
+                had_body = bool(result_msg.strip()) and not is_silence_marker(result_msg.strip())
+                result_msg = leaked
                 if not result_msg.strip():
+                    if had_body:
+                        st.silence_reason = "framework_leak_stripped"
                     result_msg = "<SILENCE>"
+            self._log_run_result(st, result_msg)
             if isinstance(result_msg, str):
                 self._remember_outbound_on_silence(st, result_msg)
             return result_msg
 
         # result 为空时的默认返回值（常量：handle_ai 好感度门等消费端按它识别准失败轮）
         return NO_RESULT_TEXT
+
+    async def _note_truncated_usage(
+        self,
+        st: RunOnceState,
+        statistics_manager: Any,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        count_run: bool,
+        close_chat: bool,
+    ) -> None:
+        """把一段用量写入统计和会话日志。close_chat 只在整轮合计时用一次。"""
+        model = st.model_name or "unknown"
+        chat_type = st.stats_chat_type if st.stats_chat_type else self.create_by
+        if count_run:
+            nested = bool(self.is_subagent) or (bool(st.user_turn_id) and not st.owns_user_turn)
+            statistics_manager.record_agent_run(
+                owns_user_turn=bool(st.owns_user_turn),
+                under_user_turn=bool(st.user_turn_id),
+                is_nested=nested,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+            )
+        if input_tokens > 0 or output_tokens > 0:
+            statistics_manager.record_token_usage(
+                model_name=model,
+                chat_type=chat_type,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                cache_read_tokens=cache_read_tokens,
+                cache_write_tokens=cache_write_tokens,
+            )
+            if st.budget_scope is not None:
+                # 记账失败不挡住收口，否则调研白跑一趟还交不出交付
+                try:
+                    from gsuid_core.ai_core.budget import budget_manager
+
+                    await budget_manager.record_usage_scope(
+                        st.budget_scope[0],
+                        st.budget_scope[1],
+                        st.budget_scope[2],
+                        self.session_id,
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_write_tokens,
+                    )
+                except Exception as exc:
+                    logger.warning(i18n_t("log.agent.budget_fail", _be=exc))
+        if close_chat:
+            # 超轮数没有 End。不收起对话的话，合计用量会粘在最后一轮上。
+            self._session_logger.log_node_transition("End")
+        has_usage = input_tokens > 0 or output_tokens > 0 or cache_read_tokens > 0 or cache_write_tokens > 0
+        if has_usage or (model and model != "unknown"):
+            self._session_logger.log_token_usage(
+                input_tokens,
+                output_tokens,
+                model,
+                cache_read_tokens,
+                cache_write_tokens,
+            )
+
+    async def _salvage_capability_delivery(self, st: RunOnceState, statistics_manager: Any) -> str | None:
+        """有材料时收成交付交回调用方。返回 None 表示仍走可识别失败。"""
+        if st.return_mode != "return":
+            return None
+        if st.delegated_render and not st.image_sent_this_run:
+            return None
+        if self.create_by not in ("CapabilityAgent", "AutoPlanner"):
+            return None
+        material = await self._capability_salvage_material(st)
+        if not material.strip():
+            return None
+        question = (st.last_user_question or "完成任务描述里的交付")[:2000]
+        prompt = (
+            f"【任务】\n{question}\n\n{material}\n\n"
+            "思考轮数已用尽，禁止调用工具。只根据上面的材料写出本任务的交付。"
+            "材料里没有的事实写进缺口，禁止编造。"
+            "用条目列出结论、依据和时点。"
+            f"第一行必须是：{_USAGE_LIMIT_SALVAGE_BANNER}"
+        )
+        _fb_settings: ModelSettings | None = None
+        if self.max_tokens is not None:
+            _fb_settings = ModelSettings(max_tokens=int(self.max_tokens))
+        _fallback_agent = Agent(
+            model=self.model,
+            system_prompt=self.system_prompt or "你是一个智能助手。",
+            model_settings=_fb_settings,
+            tools=[],
+            toolsets=[],
+            retries=0,
+            output_type=str,
+        )
+        result = await _fallback_agent.run(
+            prompt,
+            message_history=list(self.history),
+            usage_limits=UsageLimits(request_limit=1),
+        )
+        from pydantic_ai.run import AgentRunResult
+
+        if isinstance(result, AgentRunResult):
+            usage = result.usage
+            st.usage_input_tokens += usage.input_tokens
+            st.usage_output_tokens += usage.output_tokens
+            st.usage_cache_read_tokens += usage.cache_read_tokens
+            st.usage_cache_write_tokens += usage.cache_write_tokens
+        text = str(result.output).strip()
+        if not text or is_silence_marker(text):
+            return None
+        if not text.startswith("⚠"):
+            text = f"{_USAGE_LIMIT_SALVAGE_BANNER}\n\n{text}"
+        from gsuid_core.ai_core.buildin_tools.subagent import (
+            looks_like_incomplete_subagent_delivery,
+        )
+
+        if looks_like_incomplete_subagent_delivery(text):
+            return None
+        logger.info(i18n_t("log.agent.usage_limit_salvage"))
+        return text
+
+    async def _capability_salvage_material(self, st: RunOnceState) -> str:
+        """优先用本会话已落盘的检索原文（按新到旧）。没有再退回本轮摘录。"""
+        persisted = await load_session_salvage_material(self.session_id or "")
+        thinking = collect_run_thinking(st.thinking_segments)
+        if persisted:
+            body = f"【已落盘的检索原文】\n{persisted}"
+        else:
+            tool_outputs = "\n".join(st.run_tool_outputs)
+            body = f"【本轮已查到的内容】\n{tool_outputs}" if tool_outputs else ""
+        if thinking:
+            clue = f"【本轮的推理线索】\n{thinking}"
+            body = f"{body}\n\n{clue}" if body else clue
+        return body
 
     async def _run_once_usage_limit_fallback(
         self,
@@ -1085,11 +1323,35 @@ class SettlePhase(RunOnceHost):
         """UsageLimitExceeded 专属兜底总结。"""
         # 达到限制后的处理逻辑
         logger.warning(i18n_t("log.agent.pydanticai_reached_maximum_thinking", p0=_require_limits(st).request_limit))
-        statistics_manager.record_error(error_type="usage_limit")
+        statistics_manager.record_error(
+            error_type="usage_limit",
+            message=f"达到最高思考轮数限制 {_require_limits(st).request_limit}",
+        )
         self._session_logger.log_error("usage_limit", f"达到最高思考轮数限制 {_require_limits(st).request_limit}")
 
-        # 子代理 return：不对用户说话、不把中间产物回灌。评测静音；能力代理要可识别失败。
+        salvaged = None
         if st.return_mode == "return":
+            salvaged = await self._salvage_capability_delivery(st, statistics_manager)
+
+        # 主循环与收口 run 的合计用量统一记账与落盘，确保日志完整且不被覆盖
+        await self._note_truncated_usage(
+            st,
+            statistics_manager,
+            input_tokens=st.usage_input_tokens,
+            output_tokens=st.usage_output_tokens,
+            cache_read_tokens=st.usage_cache_read_tokens,
+            cache_write_tokens=st.usage_cache_write_tokens,
+            count_run=True,
+            close_chat=True,
+        )
+
+        if st.return_mode == "return":
+            if salvaged:
+                self._session_logger.log_text_output(salvaged)
+                self._session_logger.log_result(salvaged, st.tool_call_list)
+                self._session_logger.log_run_end()
+                return salvaged
+            self._session_logger.log_run_end()
             return usage_limit_return_payload(
                 create_by=self.create_by,
                 is_subagent=self.is_subagent,
@@ -1099,6 +1361,8 @@ class SettlePhase(RunOnceHost):
 
         if st.delegated_render and not st.image_sent_this_run:
             self._remember_outbound_on_silence(st, "<SILENCE>")
+            st.silence_reason = st.silence_reason or "delegated_render_unfinished"
+            self._log_run_result(st, "<SILENCE>")
             return "<SILENCE>"
 
         # 「思考链过长…」是框架内部状态，原样发进群等于人格当场破功（生产日志出现过
@@ -1126,6 +1390,8 @@ class SettlePhase(RunOnceHost):
                 return await self._deliver_no_material_reply(st, user_question)
             logger.debug(i18n_t("log.agent.chain_too_long_no_context_silence"))
             self._remember_outbound_on_silence(st, "<SILENCE>")
+            st.silence_reason = st.silence_reason or "usage_limit_no_material"
+            self._log_run_result(st, "<SILENCE>")
             return "<SILENCE>"
 
         final_message = (
@@ -1164,12 +1430,18 @@ class SettlePhase(RunOnceHost):
         fallback_text = str(fallback_result.output)
         if not fallback_text.strip() or is_silence_marker(fallback_text.strip()):
             self._remember_outbound_on_silence(st, "<SILENCE>")
+            self._session_logger.log_result(
+                "<SILENCE>",
+                st.tool_call_list,
+                silence_reason=st.silence_reason or "usage_limit_fallback_silence",
+            )
             return "<SILENCE>"
         self._session_logger.log_text_output(fallback_text)
         self._session_logger.log_result(fallback_text, st.tool_call_list)
 
         if st.bot:
             await send_chat_result(st.bot, fallback_result.output, ev=st.ev, extra_metadata=turn_reply_metadata(st.ev))
+            absorb_run_image_delivered(st)
         return ""
 
     def _no_material_reply_expected(self, st: RunOnceState) -> bool:
@@ -1215,12 +1487,30 @@ class SettlePhase(RunOnceHost):
         text = str(result.output)
         if not text.strip() or is_silence_marker(text.strip()):
             self._remember_outbound_on_silence(st, "<SILENCE>")
+            self._session_logger.log_result(
+                "<SILENCE>",
+                st.tool_call_list,
+                silence_reason=st.silence_reason or "no_material_reply_silence",
+            )
             return "<SILENCE>"
         self._session_logger.log_text_output(text)
         self._session_logger.log_result(text, st.tool_call_list)
         if st.bot:
             await send_chat_result(st.bot, text, ev=st.ev, extra_metadata=turn_reply_metadata(st.ev))
+            absorb_run_image_delivered(st)
         return ""
+
+    def _log_run_result(self, st: RunOnceState, result_msg: str) -> None:
+        """沉默或空输出时把原因写进 result。有正文则不带 silence_reason。"""
+        reason: str | None = None
+        text = str(result_msg).strip()
+        if is_silence_marker(text) or not text:
+            reason = (
+                st.silence_reason
+                or st.last_block_reason
+                or ("delivered_terminal" if st.delivered_terminal else "model_voluntary")
+            )
+        self._session_logger.log_result(result_msg, st.tool_call_list, silence_reason=reason)
 
     def _remember_outbound_on_silence(self, st: RunOnceState, result_msg: str) -> None:
         """静默不进 A 轨；把本轮出站句柄补上，追问才能 read_handle。"""

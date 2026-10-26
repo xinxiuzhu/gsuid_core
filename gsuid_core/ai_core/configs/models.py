@@ -25,6 +25,7 @@ from collections.abc import Callable, AsyncIterator
 from typing_extensions import override
 
 import httpx
+import httpx2
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionChunk
 from pydantic_ai.usage import RequestUsage
@@ -42,12 +43,18 @@ from pydantic_ai.providers.anthropic import AnthropicProvider
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
+from gsuid_core.ai_core.request_effort import capture_model_request_effort
 from gsuid_core.utils.plugins_config.gs_config import StringConfig
-from gsuid_core.ai_core.multimodal.openai_files import OpenAIChatModelWithVideo
+from gsuid_core.ai_core.multimodal.openai_files import (
+    OpenAIVideoInputFormat,
+    OpenAIChatModelWithVideo,
+    parse_video_part_extra,
+)
 
 from .ai_config import ai_config
 from .gemini_config import get_gemini_config, get_gemini_config_dict
 from .openai_config import get_openai_config, get_openai_config_dict
+from .anthropic_wire import RecoveringAnthropicModel, anthropic_profile_for_model
 from .anthropic_config import get_anthropic_config, get_anthropic_config_dict
 
 if TYPE_CHECKING:
@@ -72,15 +79,33 @@ OpenAIModel = Union[OpenAIChatModel, OpenAIResponsesModel]
 # read 是流式段间超时，不限制正常长输出；瞬时故障重试统一由 _execute_run 负责。
 MODEL_REQUEST_TIMEOUT = httpx.Timeout(connect=15.0, read=180.0, write=60.0, pool=30.0)
 
+# openai 3.x / anthropic 1.x 的 HTTP 栈换成了 httpx2，与 httpx 不是同一套类、不可互传；
+# 只有 google-genai 仍吃 httpx，故按库分两套池（同 §23 墙钟）。
+MODEL_REQUEST_TIMEOUT_HTTPX2 = httpx2.Timeout(connect=15.0, read=180.0, write=60.0, pool=30.0)
+
 
 @lru_cache(maxsize=None)
 def _shared_model_http_client(provider: str) -> httpx.AsyncClient:
     """进程级共享 HTTP 客户端（按 provider 一池，进程生命周期不关闭）。
 
     每次建模型都 new 私有客户端会累积不被关闭的连接池、且丢失跨请求连接复用
-    （评审修复 F8）；三类 provider 工厂统一从这里取池、统一吃 §23 墙钟超时。
+    （评审修复 F8）；provider 工厂统一从这里取池、统一吃 §23 墙钟超时。
     """
-    return httpx.AsyncClient(timeout=MODEL_REQUEST_TIMEOUT)
+    # 钩子从发出的 JSON 读思考档位，不读本地 model_effort。
+    return httpx.AsyncClient(
+        timeout=MODEL_REQUEST_TIMEOUT,
+        event_hooks={"request": [capture_model_request_effort]},
+    )
+
+
+@lru_cache(maxsize=None)
+def _shared_model_httpx2_client(provider: str) -> httpx2.AsyncClient:
+    """已迁到 httpx2 的 SDK（openai 3.x / anthropic 1.x）用的共享池，语义同上。"""
+    # 钩子从发出的 JSON 读思考档位，不读本地 model_effort。
+    return httpx2.AsyncClient(
+        timeout=MODEL_REQUEST_TIMEOUT_HTTPX2,
+        event_hooks={"request": [capture_model_request_effort]},
+    )
 
 
 def parse_provider_config_name(full_name: str) -> tuple[str, str]:
@@ -136,10 +161,8 @@ def format_provider_config_name(provider: str, config_name: str) -> str:
     return f"{provider}{PROVIDER_CONFIG_SEPARATOR}{config_name}"
 
 
-# 配置项 model_effort 字符串 → pydantic_ai ThinkingLevel 的映射。
-# ThinkingLevel = bool | Literal["minimal","low","medium","high","xhigh"]，
-# "enable"/"disable" 必须映射为 True/False，原样透传会在 provider 的
-# REASONING_EFFORT/THINKING_BUDGET 映射表中触发 KeyError。
+# model_effort 配置映射至 pydantic_ai ThinkingLevel，规范化 enable/disable 值为布尔值。
+# adaptive 不在此表：不写 thinking，让模型用自己的默认。
 THINKING_LEVEL_MAP: dict[str, ThinkingLevel] = {
     "enable": True,
     "disable": False,
@@ -150,13 +173,68 @@ THINKING_LEVEL_MAP: dict[str, ThinkingLevel] = {
     "xhigh": "xhigh",
 }
 
+# 已保存的「自动」/ auto 仍省略 thinking，避免落到未知值后被当成 enable。
+_OMIT_EFFORT = frozenset({"adaptive", "自动", "auto"})
 
-def to_thinking_level(value: str) -> ThinkingLevel:
-    """将配置中的 model_effort 字符串转换为 pydantic_ai 的 ThinkingLevel"""
+
+def to_thinking_level(value: str) -> ThinkingLevel | None:
+    """将配置中的 model_effort 字符串转换为 pydantic_ai 的 ThinkingLevel。
+
+    adaptive 返回 None，调用方不要把 thinking 写进请求。
+    """
+    if value in _OMIT_EFFORT:
+        return None
     if value not in THINKING_LEVEL_MAP:
         logger.warning(t("log.ai.gscore_effort_config_value_fell", value=repr(value)))
         return True
     return THINKING_LEVEL_MAP[value]
+
+
+# 统一 ThinkingLevel 没有 max。OpenAI 协议用 openai_reasoning_effort 原样带上。
+OpenAIConfiguredEffort = ThinkingLevel | Literal["max"]
+
+
+def to_openai_effort(value: str) -> OpenAIConfiguredEffort | None:
+    """OpenAI 兼容配置的档位。max 不进统一 thinking。"""
+    if value == "max":
+        return "max"
+    return to_thinking_level(value)
+
+
+def _with_thinking(settings: ModelSettings, model_effort: ThinkingLevel | None) -> ModelSettings:
+    if model_effort is None:
+        return settings
+    settings["thinking"] = model_effort
+    return settings
+
+
+def _with_openai_effort(
+    settings: OpenAIChatModelSettings,
+    model_effort: OpenAIConfiguredEffort | None,
+) -> OpenAIChatModelSettings:
+    # prepare_request 只剥统一 thinking。max 留在协议字段里。
+    if model_effort == "max":
+        settings["openai_reasoning_effort"] = "max"
+        return settings
+    if model_effort is not None:
+        settings["thinking"] = model_effort
+    return settings
+
+
+def user_thinking_profile(
+    model_effort: ThinkingLevel | None,
+) -> Callable[[ModelProfile], ModelProfile]:
+    """用户选了档位时让画像承认思考，否则 prepare_request 会丢掉 settings['thinking']。"""
+
+    def _overlay(default: ModelProfile) -> ModelProfile:
+        # adaptive 不传。画像已承认思考时不动，保留「不能关闭」的结论。
+        if model_effort is None:
+            return default
+        if default.get("supports_thinking", False) or default.get("thinking_always_enabled", False):
+            return default
+        return merge_profile(default, ModelProfile(supports_thinking=True))
+
+    return _overlay
 
 
 def to_request_method(value: str) -> RequestMethod:
@@ -301,13 +379,15 @@ class AutoUsageOpenAIChatModel(OpenAIChatModelWithVideo):
         return _AutoUsageStreamedResponse
 
 
-def get_openai_config_by_name(config_name: str) -> tuple[str, str, str, ThinkingLevel, RequestMethod, bool, str]:
+def get_openai_config_by_name(
+    config_name: str,
+) -> tuple[str, str, str, OpenAIConfiguredEffort | None, RequestMethod, bool, str]:
     oconfig = get_openai_config(config_name)
     base_url, api_key, model_name, model_effort, request_method = (
         oconfig.get_config("base_url").data,
         oconfig.get_config("api_key").data[0],
         oconfig.get_config("model_name").data,
-        to_thinking_level(oconfig.get_config("model_effort").data),
+        to_openai_effort(oconfig.get_config("model_effort").data),
         to_request_method(oconfig.get_config("request_method").data),
     )
     # 旧配置文件缺该 key 时 get_config 会自动从模板补默认值 "auto", 不会抛异常
@@ -326,7 +406,7 @@ def get_openai_config_by_name(config_name: str) -> tuple[str, str, str, Thinking
     return base_url, api_key, model_name, model_effort, request_method, continuous_usage, usage_stats_mode
 
 
-def get_anthropic_config_by_name(config_name: str) -> tuple[str, str, str, ThinkingLevel]:
+def get_anthropic_config_by_name(config_name: str) -> tuple[str, str, str, ThinkingLevel | None]:
     aconfig = get_anthropic_config(config_name)
     base_url, api_key, model_name, model_effort = (
         aconfig.get_config("base_url").data,
@@ -359,40 +439,46 @@ def get_openai_model_by_name(config_name: str) -> OpenAIModel:
         get_openai_config_by_name(config_name)
     )
 
-    # §23 墙钟 + 共享连接池（见 MODEL_REQUEST_TIMEOUT / _shared_model_http_client）；
+    # §23 墙钟 + 共享连接池（见 MODEL_REQUEST_TIMEOUT_HTTPX2 / _shared_model_httpx2_client）；
     # timeout 显式传 SDK 保证逐请求生效，max_retries=1 收紧 SDK 内建重试。
     _client = AsyncOpenAI(
         api_key=api_key,
         base_url=base_url,
-        timeout=MODEL_REQUEST_TIMEOUT,
+        timeout=MODEL_REQUEST_TIMEOUT_HTTPX2,
         max_retries=1,
-        http_client=_shared_model_http_client("openai"),
+        http_client=_shared_model_httpx2_client("openai"),
     )
     provider = OpenAIProvider(openai_client=_client)
 
-    # 思考回传开关(send_back_thinking=off):多轮对话时不把历史 ThinkingPart 以
-    # <think> 标签/厂商字段回发给模型 —— 部分中转网关对回发格式不兼容会 4xx/5xx。
-    # 通过 profile 覆写实现(openai_chat_send_back_thinking_parts=False 是
-    # pydantic_ai 的官方开关);旧配置文件缺该 key 时自动补默认值 "auto"。
-    send_back_thinking = str(get_openai_config(config_name).get_config("send_back_thinking").data)
-    if send_back_thinking == "off":
+    oconfig = get_openai_config(config_name)
+    send_back_thinking = str(oconfig.get_config("send_back_thinking").data)
+    video_input_format_val = str(oconfig.get_config("video_input_format").data)
+    video_input_format: OpenAIVideoInputFormat = "video_url" if video_input_format_val == "video_url" else "file"
+    video_fps_raw = oconfig.get_config("video_fps").data
+    video_fps = float(video_fps_raw) if isinstance(video_fps_raw, (int, float)) else 0.0
+    video_part_extra_raw = str(oconfig.get_config("video_part_extra").data).strip()
+    video_part_extra = parse_video_part_extra(video_part_extra_raw) if video_part_extra_raw else {}
+    video_inline_max_mb_raw = oconfig.get_config("video_inline_max_mb").data
+    video_inline_max_mb = int(video_inline_max_mb_raw) if isinstance(video_inline_max_mb_raw, int) else 12
+    video_url_passthrough = str(oconfig.get_config("video_url_passthrough").data)
+    # max 不写统一 thinking，画像不用为它改 supports_thinking。
+    keep_effort = user_thinking_profile(None if model_effort == "max" else model_effort)
+
+    def _chat_profile(default: ModelProfile) -> ModelProfile:
+        profile = keep_effort(default)
+        if send_back_thinking != "off":
+            return profile
         from pydantic_ai.profiles.openai import OpenAIModelProfile
 
-        def _overlay_send_back_off(default: ModelProfile) -> ModelProfile:
-            # v2: profile 已是 TypedDict, 直接用 merge_profile 叠加 OpenAI 专属字段
-            return merge_profile(default, OpenAIModelProfile(openai_chat_send_back_thinking_parts=False))
-
-        profile_spec = _overlay_send_back_off
-    else:
-        # 默认走 identity: 不叠加任何字段, 行为与 send_back_thinking=auto/on 一致
-        profile_spec: Callable[[ModelProfile], ModelProfile] = lambda default: default  # noqa: E731
+        return merge_profile(profile, OpenAIModelProfile(openai_chat_send_back_thinking_parts=False))
 
     if request_method == "responses":
         # 视频走 /v1/files UploadedFile，不覆写 pydantic_ai 父类静态 mapper
         return OpenAIResponsesModel(
             model_name=model_name,
             provider=provider,
-            settings=ModelSettings(thinking=model_effort),
+            profile=keep_effort,
+            settings=_with_openai_effort(OpenAIChatModelSettings(), model_effort),
         )
 
     # cumulative 语义网关须取「最后累计值」而非逐 chunk 累加, 否则统计膨胀数十倍;
@@ -403,13 +489,52 @@ def get_openai_model_by_name(config_name: str) -> OpenAIModel:
     return model_cls(
         model_name=model_name,
         provider=provider,
-        profile=profile_spec,
+        profile=_chat_profile,
         # 请求参数 stream_options.continuous_usage_stats 仅在部署者显式声明
         # cumulative 时发送; auto 的白名单/探测只作用于响应侧, 不改请求体
-        settings=OpenAIChatModelSettings(
-            thinking=model_effort,
-            openai_continuous_usage_stats=usage_stats_mode == "cumulative",
+        settings=_with_openai_effort(
+            OpenAIChatModelSettings(
+                openai_continuous_usage_stats=usage_stats_mode == "cumulative",
+            ),
+            model_effort,
         ),
+        video_input_format=video_input_format,
+        video_fps=video_fps,
+        video_part_extra=video_part_extra,
+        video_inline_max_mb=video_inline_max_mb,
+        video_url_passthrough=video_url_passthrough,
+    )
+
+
+def make_anthropic_model(
+    model_name: str,
+    model_effort: ThinkingLevel | None,
+    *,
+    api_key: str,
+    base_url: str,
+    http_client: httpx2.AsyncClient,
+) -> AnthropicModel:
+    """构造 Anthropic 模型。思考形状用本进程从 400 正文里学到的事实。"""
+    from anthropic import AsyncAnthropic
+
+    client = AsyncAnthropic(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=MODEL_REQUEST_TIMEOUT_HTTPX2,
+        max_retries=1,
+        http_client=http_client,
+    )
+    learned = anthropic_profile_for_model(model_name)
+    keep_effort = user_thinking_profile(model_effort)
+
+    def _profile(default: ModelProfile) -> ModelProfile:
+        return keep_effort(learned(default))
+
+    return RecoveringAnthropicModel(
+        model_name=model_name,
+        provider=AnthropicProvider(anthropic_client=client),
+        profile=_profile,
+        settings=_with_thinking(ModelSettings(), model_effort),
     )
 
 
@@ -430,19 +555,12 @@ def get_anthropic_chat_model_by_name(config_name: str) -> "AnthropicModel":
     )
 
     # §23 墙钟 + 共享连接池：与 openai 工厂同一套超时/重试策略（评审修复 F8/E13）
-    from anthropic import AsyncAnthropic
-
-    _client = AsyncAnthropic(
+    return make_anthropic_model(
+        model_name,
+        model_effort,
         api_key=api_key,
         base_url=base_url,
-        timeout=MODEL_REQUEST_TIMEOUT,
-        max_retries=1,
-        http_client=_shared_model_http_client("anthropic"),
-    )
-    return AnthropicModel(
-        model_name=model_name,
-        provider=AnthropicProvider(anthropic_client=_client),
-        settings=ModelSettings(thinking=model_effort),
+        http_client=_shared_model_httpx2_client("anthropic"),
     )
 
 
@@ -458,7 +576,7 @@ def normalize_gemini_base_url(base_url: str) -> str:
     return base_url.strip()
 
 
-def get_gemini_config_by_name(config_name: str) -> tuple[str, str, str, ThinkingLevel]:
+def get_gemini_config_by_name(config_name: str) -> tuple[str, str, str, ThinkingLevel | None]:
     gconfig = get_gemini_config(config_name)
     api_keys = gconfig.get_config("api_key").data
     if not api_keys or not str(api_keys[0]).strip():
@@ -517,7 +635,8 @@ def get_gemini_model_by_name(config_name: str) -> "GoogleModel":
     return GoogleModel(
         model_name=model_name,
         provider=provider,
-        settings=ModelSettings(thinking=model_effort),
+        profile=user_thinking_profile(model_effort),
+        settings=_with_thinking(ModelSettings(), model_effort),
     )
 
 

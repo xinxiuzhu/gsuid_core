@@ -61,7 +61,9 @@ async def init_all():
                 )
                 await asyncio.sleep(delay)
 
-    from . import init_image_collection, init_tools_collection, init_knowledge_collection
+    from gsuid_core.ai_core.rag.tools import init_tools_collection
+    from gsuid_core.ai_core.rag.image_rag import sync_images, init_image_collection
+    from gsuid_core.ai_core.rag.knowledge import sync_knowledge, init_knowledge_collection
 
     await _init_with_retry("init_tools_collection", init_tools_collection)
     await _init_with_retry("init_knowledge_collection", init_knowledge_collection)
@@ -71,14 +73,10 @@ async def init_all():
     await sync_tools(all_tools)
     logger.info(t("log.rag.tools_buildin_imported_registry", p0=len(all_tools)))
 
-    from . import sync_images, sync_knowledge
-
     await sync_knowledge()
     await sync_images()
 
-    # 手动知识 SQL 真值源 ↔ Qdrant 向量对账：
-    # ① 回填旧的"仅 Qdrant"手动知识到 SQL；② 向量库丢失/换模型后从 SQL 重嵌缺失分片。
-    # 失败不影响启动（函数内自带兜底），数量一致时快速跳过。
+    # 手动知识 SQL 真值与 Qdrant 向量对账：回填缺失记录并重嵌缺失分片，数量一致快速跳过。
     from gsuid_core.ai_core.rag.knowledge import reconcile_manual_knowledge
 
     await reconcile_manual_knowledge()

@@ -34,6 +34,7 @@ from gsuid_core.ai_core.rag.tools import (
 )
 from gsuid_core.ai_core.tool_risk import skill_tool_visible
 from gsuid_core.ai_core.tool_safety import build_tool_safety_capability
+from gsuid_core.ai_core.control.lines import STATE_PERSISTED_FAMILY_HINT
 from gsuid_core.ai_core.agent_run.host import RunOnceHost
 from gsuid_core.ai_core.agent_run.state import (
     RunOnceState,
@@ -42,6 +43,7 @@ from gsuid_core.ai_core.agent_run.state import (
 from gsuid_core.ai_core.dynamic_toolset import RetrievableToolset
 from gsuid_core.ai_core.agent_run.support import (
     _INTERACTIVE_CREATE_BY,
+    _MAIN_PERSONA_CREATE_BY,
     _append_user_text,
     _pool_overlaps_capability_agent,
     _capability_exclusive_tool_names,
@@ -85,31 +87,6 @@ def l2_state_driven_wanted(
     if not is_group:
         return True
     return call_to_self or followup_detected
-
-
-def group_idle_request_limit(
-    default_limit: int,
-    *,
-    is_group: bool,
-    followup_detected: bool,
-    has_active_task: bool,
-    idle_cap: int,
-    call_to_self: bool = False,
-) -> int:
-    """纯旁观群聊轮收窄 request_limit；点名与省略续聊不收。
-
-    收窄只针对「无人寻址 + 无跟进 + 无在途任务」这一类——它们本不该干活，
-    放开到 multi_agent_lenth 就是零工具空转的烧钱口子。省略续聊轮
-    （``followup_detected`` = ellipsis_followup / task_management）要跑得完
-    find_tools → 真正查询的两跳链路，早期的收窄误伤了它们，见 §12.8。
-    """
-    if default_limit < 1 or idle_cap < 1:
-        return default_limit
-    if call_to_self:
-        return default_limit
-    if is_group and not followup_detected and not has_active_task:
-        return min(default_limit, idle_cap)
-    return default_limit
 
 
 def snapshot_tool_allowed(
@@ -229,11 +206,6 @@ def complete_kernel_family_names(core_names: Sequence[str], *, exclusive: set[st
     return out
 
 
-STATE_PERSISTED_FAMILY_HINT = (
-    "\n\n（系统提示：当前会话已有持久条目。变更已有条目请用对应能力族的查询/修改/取消工具，不要再创建一条来代替。）"
-)
-
-
 def stabilize_session_tool_names(
     frozen: list[str] | None,
     incoming: Sequence[str],
@@ -333,6 +305,19 @@ class ToolsPhase(RunOnceHost):
 
     async def _run_once_assemble_tools(self, st: RunOnceState) -> None:
         """工具五层装配 + 去重 + 渐进式暴露。"""
+        from gsuid_core.ai_core.command_aside.policy import aside_blocks_tools
+
+        if aside_blocks_tools():
+            st.tools = []
+            st.tool_names = []
+            st.exposed_tool_names = []
+            self._last_assembled_domains = set()
+            blocked_ctx = _require_context(st)
+            from gsuid_core.ai_core.output_firewall import EXPOSED_TOOLS_EXTRA_KEY
+
+            blocked_ctx.extra[EXPOSED_TOOLS_EXTRA_KEY] = []
+            self._session_logger.log_tools_list([])
+            return
         # 渐进式工具暴露是否在本轮生效（仅自动装配 + 非闲聊轮）。决定是否挂 RetrievableToolset。
         st.expose_dynamic = False
         # 媒体句柄（event 字段或正文 img_/图片ID 标注）——通道信号，非话题词
@@ -355,10 +340,8 @@ class ToolsPhase(RunOnceHost):
         else:
             _assemble = self.create_by in _AGENTIC_CREATE_BY and not st.tools
 
-        # tool_assembly 槽为 off（或被用户套件占据）时，内核**不跑**五层自动装配：
-        # 只留调用方传入的工具 + 下方的 exclusive 剥离与委派补全。
-        # 副作用：find_tools 是 meta 分类、由装配层注入，本槽 off 时渐进式工具发现
-        # 一并消失——这是正确行为（用户套件无权声明特权分类）。
+        # 装配套件为 off 时不执行自动装配，仅保留入参工具与委派补全。
+        # 此模式下特权分类 find_tools 一并不注入。
         if _assemble and not _kernel_owns_tool_assembly():
             logger.info(i18n_t("log.agent.tool_assembly_slot_not_kernel"))
             _assemble = False
@@ -566,30 +549,36 @@ class ToolsPhase(RunOnceHost):
                         scope=_scope,
                     )
                     turn_seeds = pin_trigger_keyword_hits(qy, _found, limit=_TURN_SEED_CAP, scope=_scope)
+                    from gsuid_core.ai_core.entity_index import (
+                        ALIAS_ROUTE_TEXT_KEY,
+                        ALIAS_PLUGIN_EXTRA_KEY,
+                        lock_plugin,
+                        strip_surfaces,
+                        plugins_in_text,
+                    )
+
+                    _utter = ""
+                    if st.ev is not None and st.ev.raw_text:
+                        _utter = st.ev.raw_text
+                    elif st.ev is not None and st.ev.text:
+                        _utter = st.ev.text
+                    else:
+                        from gsuid_core.ai_core.agent_run.speech_policy import spoken_user_body
+
+                        _utter = spoken_user_body(qy)
+                    _scan = strip_surfaces(_utter, _ignore) if _ignore else _utter
+                    _bg = ""
                     if st.ev is not None:
-                        from gsuid_core.ai_core.entity_index import (
-                            ALIAS_PLUGIN_EXTRA_KEY,
-                            sole_background_plugin,
-                        )
                         from gsuid_core.ai_core.turn_pipeline import build_group_history_block
 
-                        _ctx_plugin = sole_background_plugin(qy, build_group_history_block(st.ev))
-                        if _ctx_plugin:
-                            st.run_extra[ALIAS_PLUGIN_EXTRA_KEY] = _ctx_plugin
-                            turn_seeds = await align_seeds_to_context_plugin(turn_seeds, _ctx_plugin, qy, _scope)
+                        _bg = build_group_history_block(st.ev)
+                    _ctx_plugin = lock_plugin(_scan, _bg)
+                    if _ctx_plugin:
+                        st.run_extra[ALIAS_PLUGIN_EXTRA_KEY] = _ctx_plugin
+                        if _scan:
+                            st.run_extra[ALIAS_ROUTE_TEXT_KEY] = _scan
+                        turn_seeds = await align_seeds_to_context_plugin(turn_seeds, _ctx_plugin, _scan or qy, _scope)
                     if _call_self:
-                        from gsuid_core.ai_core.entity_index import strip_surfaces, plugins_in_text
-
-                        _utter = ""
-                        if st.ev is not None and st.ev.raw_text:
-                            _utter = st.ev.raw_text
-                        elif st.ev is not None and st.ev.text:
-                            _utter = st.ev.text
-                        else:
-                            from gsuid_core.ai_core.agent_run.speech_policy import spoken_user_body
-
-                            _utter = spoken_user_body(qy)
-                        _scan = strip_surfaces(_utter, _ignore) if _ignore else _utter
                         _routed = plugins_in_text(_scan)
                         # 向量检索命中不算。要实体路由真正装上该插件的工具。
                         if len(_utter) >= 12 and _routed:
@@ -740,15 +729,23 @@ class ToolsPhase(RunOnceHost):
         else:
             logger.debug(i18n_t("log.agent.skip_tool_search_searching_tools"))
 
-        # H14 / H15：工具装配套件与第三方钉工具。两点之后**各剥离一次** exclusive——
-        # H14 后防套件直接装上 render_*，H15 后防第三方 ensure 回来。
-        # addr_gated 时两点都不打（C-3 零工具硬约束）。
+        # 工具装配套件与第三方钉工具点后各剥离一次 exclusive，防误装 render_* 工具。
+        # addr_gated 为真时不执行钩子。
         if not st.addr_gated:
             await self._fire_tool_hooks(st)
 
         logger.debug(i18n_t("log.agent.tool_list", p0=[tool.name for tool in st.tools]))
 
         # 最终去重（兼容外部直接传入 st.tools 的情况）
+        from gsuid_core.ai_core.command_aside.policy import aside_extra_tools
+
+        for extra_tool in aside_extra_tools():
+            st.tools.append(extra_tool)
+        if self.create_by == "Autonomy":
+            from gsuid_core.ai_core.autonomy.tools import autonomy_tool_allowed
+
+            # 钩子不能把发送或高危工具塞回自主行动。
+            st.tools = [tool for tool in st.tools if autonomy_tool_allowed(tool.name)]
         st.tools = list({obj.name: obj for obj in st.tools}.values())
         st.tool_names = [t.name for t in st.tools]
         st.exposed_tool_names = list(st.tool_names)
@@ -756,6 +753,16 @@ class ToolsPhase(RunOnceHost):
         from gsuid_core.ai_core.output_firewall import EXPOSED_TOOLS_EXTRA_KEY
 
         _ctx.extra[EXPOSED_TOOLS_EXTRA_KEY] = list(st.tool_names)
+
+        # 主会话工具集在会话内只增不减：把本轮实际暴露的非 exclusive 工具沉淀进表
+        if self.create_by in _MAIN_PERSONA_CREATE_BY:
+            _exclusive = _capability_exclusive_tool_names()
+            for _tname in st.tool_names:
+                if _tname not in _exclusive:
+                    if self._session_toolset_frozen is not None and _tname not in self._session_toolset_frozen:
+                        self._session_toolset_frozen.append(_tname)
+                    if _tname not in self._session_appended_tools:
+                        self._session_appended_tools.append(_tname)
 
         # 回填本轮装配工具的能力域，供 handle_ai 偏好注入精确过滤（"装配后回传"）： 把工具名映射回 capability_domain
         # handle_ai 据此只注入本轮可用工具相关的软偏好。
@@ -843,9 +850,7 @@ class ToolsPhase(RunOnceHost):
 
     def _run_once_build_agent_meta(self, st: RunOnceState) -> object:
         """构建 pydantic-ai Agent 与流式统计元数据；返回 Agent 实例。"""
-        # 当 return_model 指定时，使用 st.output_type 让 pydantic_ai 强制结构化输出
-        # st.output_type 默认为 str（返回文本），指定 Pydantic 模型时强制返回结构化 JSON
-        # 非主人在 get_tools 时看不见 run_skill_script；执行期还有 wrap_tool_execute。
+        # 指定 return_model 时通过 st.output_type 强制 pydantic_ai 结构化输出。
         _guarded_skills = skills_toolset.filtered(skill_tool_visible)
         _toolsets = [_guarded_skills] if self.create_by in _SKILLS_CREATE_BY and not st.addr_gated else []
         # 启用渐进式暴露时挂 RetrievableToolset：每个 step 读 dynamic_tool_names 即时暴露命中工具。
@@ -863,6 +868,17 @@ class ToolsPhase(RunOnceHost):
         if self.model:
             # 必须拷贝：self.model.settings 是模型对象的共享状态，就地改会污染后续所有 run
             _base_settings: ModelSettings = self.model.settings.copy() if self.model.settings else ModelSettings()
+            thinking_override = self.thinking
+            if thinking_override is not None:
+                _base_settings["thinking"] = thinking_override
+            elif self.create_by in (
+                "MemEntityExtraction",
+                "MemPreferenceDistill",
+                "MemSummary",
+                "MemProfileExtraction",
+                "MemClusterNaming",
+            ):
+                _base_settings["thinking"] = False
             if memory_config.eval_mode:
                 _base_settings["temperature"] = 0.0
             # 归属透传（默认关闭）：把本次 run 的调用方标识按配置带给上游网关
@@ -908,9 +924,7 @@ class ToolsPhase(RunOnceHost):
         st.last_event_at = None
         st.model_name = self.model.model_name if self.model else "unknown"
         st.provider = self.model.system if self.model else "unknown"
-        # 流式响应下需手动按完整文本重新拆分内嵌 <think> 标签（见 _split_embedded_thinking）。
-        # thinking_tags 取自模型 profile；缺省与 pydantic_ai DEFAULT_THINKING_TAGS 对齐。
-        # 裸名 ('think','think') 会误伤英文思考里的单词 think，必须先规范化。
+        # 流式响应需按模型 profile 规范化思考标签（默认与 DEFAULT_THINKING_TAGS 对齐）。
         st.thinking_tags = ("<think>", "</think>")
         if self.model is not None:
             _profile_obj = self.model.profile

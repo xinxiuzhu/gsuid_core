@@ -18,21 +18,21 @@ from fastapi import File, Form, Depends, UploadFile
 from pydantic import Field, BaseModel
 from fastapi.responses import StreamingResponse
 
+import gsuid_core.webconsole.meme_pack_api  # noqa: F401  登记 /packs，必须早于 /{meme_id}
 from gsuid_core.webconsole.app_app import app
 from gsuid_core.webconsole.web_api import require_auth, require_admin
 from gsuid_core.ai_core.meme.tagger import enqueue_tag, is_tagging_enabled
 from gsuid_core.ai_core.meme.library import (
     MemeLibrary,
     _read_file,
+    ext_for_mime,
     get_memes_base_path,
 )
 from gsuid_core.ai_core.meme.database_model import AiMemeRecord
 
 from ._api_tags import MEME
 
-# ─────────────────────────────────────────────
-# Pydantic 请求模型
-# ─────────────────────────────────────────────
+# --- Pydantic 请求模型 ---
 
 
 class MemeUpdateRequest(BaseModel):
@@ -57,13 +57,7 @@ _VALID_MEME_STATUSES = ("pending", "tagged", "manual", "pending_manual", "reject
 # 可进入向量索引（可被检索）的状态
 _INDEXABLE_STATUSES = ("tagged", "manual")
 
-# 预保留的 meme_id 名：与 `/api/meme/...` 静态子路径同名
-# （例如 `/api/meme/personas`、`/api/meme/stats`）。用于在所有以 `{meme_id}`
-# 为路径参数的路由（详情/编辑/删除/移动/重打标/图片）中防御性阻断
-# 路由匹配顺序造成的静默吞招。与 mcp_config_api.py 的
-# `MCP_STATIC_ROUTES` 同源。
-# 实际优先依靠路由声明顺序（静态路由必须先于 `{meme_id}` 声明），
-# 本集合作为最后一道防线以防未来版本调整匹配策略。
+# 预保留 meme_id 名：防止路径参数路由覆盖静态子路由（如 /personas、/stats）。
 _RESERVED_MEME_IDS = frozenset(
     {
         "personas",
@@ -78,6 +72,7 @@ _RESERVED_MEME_IDS = frozenset(
         "purge_rejected",
         "delete_operations",
         "batch_retag_pending",
+        "packs",
     }
 )
 
@@ -171,6 +166,7 @@ class MemeBatchExportRequest(BaseModel):
 
     meme_ids: Optional[List[str]] = Field(None, description="要导出的表情包 ID 列表，为空则导出全部")
     folder: Optional[str] = Field(None, description="按文件夹导出（与 meme_ids 互斥，优先使用 meme_ids）")
+    pack_id: Optional[str] = Field(None, description="按表情包导出。与 meme_ids、folder 互斥，优先级低于 meme_ids")
 
 
 # ── .meme 包格式常量 ──
@@ -180,9 +176,7 @@ MEME_METADATA_FILE = "metadata.json"
 MEME_FILES_DIR = "files"
 
 
-# ─────────────────────────────────────────────
-# 辅助函数
-# ─────────────────────────────────────────────
+# --- 辅助函数 ---
 
 
 def _record_to_dict(record: AiMemeRecord) -> Dict[str, Any]:
@@ -212,9 +206,7 @@ def _record_to_dict(record: AiMemeRecord) -> Dict[str, Any]:
     }
 
 
-# ─────────────────────────────────────────────
-# 1. 列表查询
-# ─────────────────────────────────────────────
+# --- 1. 列表查询 ---
 
 
 @app.get("/api/meme/list", summary="列表查询", tags=MEME)
@@ -305,16 +297,7 @@ async def get_meme_list(
         return {"status": 1, "msg": f"查询失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 1b. 按人格分类列表（前端“按人格分类”入口用）
-# ─────────────────────────────────────────────
-#
-# 【路由顺序重要】本端点必须声明在 `/api/meme/{meme_id}` 之前。
-# Starlette / FastAPI 按声明顺序匹配路由，单段静态路径 `/api/meme/personas`
-# 如果声明在后，会被 `/api/meme/{meme_id}` 吞掉并被当作 `meme_id="personas"`
-# 去查询表情包记录，从而返回“表情包不存在”。同问题在 mcp_config_api.py
-# 中以 `MCP_STATIC_ROUTES` 白名单与路由顺序记录过。
-# （保留在 1b 节仅为可读性，实际位置是控制：声明顺序先于 2）
+# 按人格分类列表：必须在 /api/meme/{meme_id} 之前声明以防静态路由被路径参数匹配吞掉。
 
 
 @app.get("/api/meme/personas", summary="a. 按人格分类列表（前端“按人格分类”入口）", tags=MEME)
@@ -346,9 +329,7 @@ async def get_meme_personas(
         return {"status": 1, "msg": f"获取人格分类失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 2. 获取单条记录详情
-# ─────────────────────────────────────────────
+# --- 2. 获取单条记录详情 ---
 
 
 @app.get("/api/meme/{meme_id}", summary="获取单条记录详情", tags=MEME)
@@ -383,9 +364,7 @@ async def get_meme_detail(
         return {"status": 1, "msg": f"查询失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 3. 获取原始图片文件
-# ─────────────────────────────────────────────
+# --- 3. 获取原始图片文件 ---
 
 
 @app.get("/api/meme/image/{meme_id}", summary="获取原始图片文件", tags=MEME)
@@ -421,6 +400,9 @@ async def get_meme_image(
                 status_code=404,
                 media_type="text/plain",
             )
+        if not file_path.is_file():
+            await MemeLibrary.delete_meme(meme_id)
+            return StreamingResponse(io.BytesIO(b"file not found"), status_code=404, media_type="text/plain")
         image_data = await _read_file(file_path)
         if not image_data:
             return StreamingResponse(
@@ -442,9 +424,48 @@ async def get_meme_image(
         )
 
 
-# ─────────────────────────────────────────────
-# 4. 更新标签/描述/归属
-# ─────────────────────────────────────────────
+@app.get("/api/meme/thumb/{meme_id}", summary="获取表情预览图", tags=MEME)
+async def get_meme_thumb(
+    meme_id: str,
+    _: Dict[str, Any] = Depends(require_auth),
+) -> StreamingResponse:
+    """长边 160 像素的 JPEG。表情 ID 不变，缩略图就可以缓存。"""
+    from gsuid_core.pool import to_thread
+    from gsuid_core.ai_core.meme.thumb import cached_thumb, thumb_or_none, remember_thumb
+
+    cached = cached_thumb(meme_id)
+    if cached is None:
+        record = await AiMemeRecord.get_by_meme_id(meme_id)
+        if record is None:
+            return StreamingResponse(io.BytesIO(b"meme not found"), status_code=404, media_type="text/plain")
+        from gsuid_core.utils.path_safety import PathEscapeError, safe_join
+
+        try:
+            file_path = safe_join(get_memes_base_path(), record.file_path)
+        except PathEscapeError:
+            return StreamingResponse(io.BytesIO(b"file not found"), status_code=404, media_type="text/plain")
+        if not file_path.is_file():
+            await MemeLibrary.delete_meme(meme_id)
+            return StreamingResponse(io.BytesIO(b"file not found"), status_code=404, media_type="text/plain")
+        image_data = await _read_file(file_path)
+        if not image_data:
+            return StreamingResponse(io.BytesIO(b"file not found"), status_code=404, media_type="text/plain")
+        made = await to_thread(thumb_or_none)(image_data)
+        if made is None:
+            return StreamingResponse(io.BytesIO(b"thumb failed"), status_code=404, media_type="text/plain")
+        remember_thumb(meme_id, made)
+        cached = made
+    return StreamingResponse(
+        io.BytesIO(cached),
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "private, max-age=604800",
+            "ETag": f'"{meme_id}"',
+        },
+    )
+
+
+# --- 4. 更新标签/描述/归属 ---
 
 
 @app.put("/api/meme/{meme_id}", summary="更新标签/描述/归属", tags=MEME)
@@ -477,7 +498,7 @@ async def update_meme(
             if req.status not in _VALID_MEME_STATUSES:
                 return {"status": 1, "msg": f"无效的状态: {req.status}", "data": None}
             new_status: Optional[str] = req.status
-        elif record.status == "rejected":
+        elif record.status in ("rejected", "pending", "pending_manual"):
             new_status = None
         else:
             new_status = "manual"
@@ -497,35 +518,25 @@ async def update_meme(
         final_status = new_status or record.status
 
         if final_status == "rejected":
-            # 显式置为 rejected：移动到 rejected 文件夹并移出向量索引
+            from gsuid_core.ai_core.meme.pack_model import PackStore
+
+            await PackStore.reject_meme(meme_id)
             if record.folder != "rejected":
                 await MemeLibrary.move_file(meme_id, "rejected")
             await MemeLibrary.remove_from_index(meme_id)
             return {"status": 0, "msg": "更新成功", "data": None}
 
         if final_status in _INDEXABLE_STATUSES:
-            # persona_hint 编辑联动 folder；从 inbox/rejected 恢复的图也归位到归属文件夹
-            hint = req.persona_hint if req.persona_hint is not None else record.persona_hint
-            expected_folder = _folder_for_persona(hint)
-            persona_changed = req.persona_hint is not None and req.persona_hint != record.persona_hint
-            need_move = (persona_changed or record.folder in ("inbox", "rejected")) and record.folder != expected_folder
-            if need_move:
-                # move_file 内部会更新 persona_hint 并重新同步 Qdrant
-                await MemeLibrary.move_file(meme_id, expected_folder)
-            else:
-                # 未移动文件时补一次同步，保证最新标签/描述写入向量索引
-                updated_record = await AiMemeRecord.get_by_meme_id(meme_id)
-                if updated_record:
-                    await MemeLibrary.sync_to_qdrant(updated_record)
+            updated_record = await AiMemeRecord.get_by_meme_id(meme_id)
+            if updated_record:
+                await MemeLibrary.sync_to_qdrant(updated_record)
 
         return {"status": 0, "msg": "更新成功", "data": None}
     except Exception as e:
         return {"status": 1, "msg": f"更新失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 5. 移动表情包到目标文件夹
-# ─────────────────────────────────────────────
+# --- 5. 移动表情包到目标文件夹 ---
 
 
 @app.post("/api/meme/{meme_id}/move", summary="移动表情包到目标文件夹", tags=MEME)
@@ -558,9 +569,7 @@ async def move_meme(
         return {"status": 1, "msg": f"移动失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 6. 删除表情包
-# ─────────────────────────────────────────────
+# --- 6. 删除表情包 ---
 
 
 @app.delete("/api/meme/{meme_id}", summary="删除表情包", tags=MEME)
@@ -591,9 +600,7 @@ async def delete_meme(
         return {"status": 1, "msg": f"删除失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 7. 手动上传表情包
-# ─────────────────────────────────────────────
+# --- 7. 手动上传表情包 ---
 
 
 @app.post("/api/meme/upload", summary="手动上传表情包", tags=MEME)
@@ -601,6 +608,7 @@ async def upload_meme(
     file: UploadFile = File(...),
     folder: str = Form("common"),
     auto_tag: bool = Form(True),
+    pack_id: Optional[str] = Form(None),
     _: Dict[str, Any] = Depends(require_auth),
 ) -> Dict[str, Any]:
     """
@@ -620,24 +628,20 @@ async def upload_meme(
         data: 包含 meme_id 的上传结果
     """
     try:
-        from PIL import Image
-
-        # 读取文件内容
         image_data = await file.read()
-
-        # 获取 MIME 类型
         file_mime = file.content_type or "image/jpeg"
 
-        # 获取图片尺寸
-        img = Image.open(io.BytesIO(image_data))
-        width, height = img.size
+        from gsuid_core.ai_core.meme.pack_model import PackStore
 
-        # 保存到库中（save_raw 保存到 inbox，后续可移动）
+        if pack_id:
+            if folder not in ("common", "inbox"):
+                return {"status": 1, "msg": "选定表情包时，目录只能是 common 或 inbox", "data": None}
+            if not await PackStore.pack_exists(pack_id):
+                return {"status": 1, "msg": "表情包不存在", "data": None}
+
         record = await MemeLibrary.save_raw(
             image_data=image_data,
             file_mime=file_mime,
-            width=width,
-            height=height,
             source_group="manual",
         )
 
@@ -649,12 +653,18 @@ async def upload_meme(
         if folder != "inbox":
             await MemeLibrary.move_file(record.meme_id, folder)
 
-        # 更新状态
+        if pack_id:
+            await PackStore.note_pending_pack(record.meme_id, pack_id)
+
         if auto_tag:
             await AiMemeRecord.update_record(record.meme_id, {"status": "pending"})
             await enqueue_tag(record.meme_id)
         else:
             await AiMemeRecord.update_record(record.meme_id, {"status": "manual"})
+            await PackStore.apply_successful_tag(record.meme_id)
+            updated = await AiMemeRecord.get_by_meme_id(record.meme_id)
+            if updated is not None and (updated.description or updated.all_tags):
+                await MemeLibrary.sync_to_qdrant(updated)
 
         return {
             "status": 0,
@@ -665,9 +675,7 @@ async def upload_meme(
         return {"status": 1, "msg": f"上传失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 8. 重新触发 VLM 打标
-# ─────────────────────────────────────────────
+# --- 8. 重新触发 VLM 打标 ---
 
 
 @app.post("/api/meme/{meme_id}/retag", summary="重新触发 VLM 打标", tags=MEME)
@@ -689,7 +697,9 @@ async def retag_meme(
         if not record:
             return {"status": 1, "msg": "表情包不存在", "data": None}
 
-        # 重置状态为待打标（即使 VLM 打标当前关闭也保留 pending，开启后会自动补打标）
+        from gsuid_core.ai_core.meme.pack_model import PackStore
+
+        await PackStore.prepare_retag(meme_id)
         await AiMemeRecord.update_record(meme_id, {"status": "pending"})
 
         if not is_tagging_enabled():
@@ -707,9 +717,7 @@ async def retag_meme(
         return {"status": 1, "msg": f"操作失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 9. 统计概览
-# ─────────────────────────────────────────────
+# --- 9. 统计概览 ---
 
 
 @app.get("/api/meme/stats", summary="统计概览", tags=MEME)
@@ -969,9 +977,7 @@ async def batch_delete_memes(
     }
 
 
-# ─────────────────────────────────────────────
-# 10b. 按条件批量清空表情包（支持全部 / 按状态 / 文件夹 / 人格）
-# ─────────────────────────────────────────────
+# --- 10b. 按条件批量清空表情包（支持全部 / 按状态 / 文件夹 / 人格） ---
 
 
 @app.post("/api/meme/purge", summary="b. 按条件批量清空表情包", tags=MEME)
@@ -1056,9 +1062,7 @@ async def purge_memes(
         return {"status": 1, "msg": f"清空失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 10b2. 清除所有已拒绝的表情包（兼容旧前端）
-# ─────────────────────────────────────────────
+# --- 10b2. 清除所有已拒绝的表情包（兼容旧前端） ---
 
 
 @app.post("/api/meme/purge_rejected", summary="b2. 清除所有已拒绝的表情包", tags=MEME)
@@ -1097,9 +1101,7 @@ async def purge_rejected_memes(
         return {"status": 1, "msg": f"清除失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 10c. 批量重新打标（待手动处理状态）
-# ─────────────────────────────────────────────
+# --- 10c. 批量重新打标（待手动处理状态） ---
 
 
 @app.post("/api/meme/batch_retag_pending", summary="c. 批量重新打标（待手动处理状态）", tags=MEME)
@@ -1127,8 +1129,11 @@ async def batch_retag_pending(
             }
 
         # VLM 打标关闭时，仅重置为 pending，由开启后台扫描自动补打标
+        from gsuid_core.ai_core.meme.pack_model import PackStore
+
         if not is_tagging_enabled():
             for record in records:
+                await PackStore.prepare_retag(record.meme_id)
                 await AiMemeRecord.update_record(record.meme_id, {"status": "pending"})
             return {
                 "status": 0,
@@ -1143,7 +1148,7 @@ async def batch_retag_pending(
 
         for record in records:
             try:
-                # 重置状态为待打标
+                await PackStore.prepare_retag(record.meme_id)
                 await AiMemeRecord.update_record(record.meme_id, {"status": "pending"})
                 # 加入打标队列
                 await enqueue_tag(record.meme_id)
@@ -1167,9 +1172,7 @@ async def batch_retag_pending(
         return {"status": 1, "msg": f"操作失败: {e}", "data": None}
 
 
-# ─────────────────────────────────────────────
-# 11. 批量导出表情包（.meme 格式）
-# ─────────────────────────────────────────────
+# --- 11. 批量导出表情包（.meme 格式） ---
 
 
 def _record_to_export_dict(record: AiMemeRecord) -> Dict[str, Any]:
@@ -1192,17 +1195,23 @@ def _record_to_export_dict(record: AiMemeRecord) -> Dict[str, Any]:
     }
 
 
-def _build_meme_zip(records: Sequence[AiMemeRecord], base_path: Path) -> io.BytesIO:
+def _build_meme_zip(
+    records: Sequence[AiMemeRecord],
+    base_path: Path,
+    pack_name: Optional[str] = None,
+) -> io.BytesIO:
     """把表情包记录压成 .meme(ZIP) 包写入内存缓冲（同步，供 ``asyncio.to_thread`` 调用）。"""
     from gsuid_core.utils.path_safety import PathEscapeError, safe_join
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        manifest = {
-            "version": MEME_FORMAT_VERSION,
+        manifest: Dict[str, Any] = {
+            "version": "1.1" if pack_name else MEME_FORMAT_VERSION,
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "total_count": len(records),
         }
+        if pack_name:
+            manifest["pack_name"] = pack_name
         zf.writestr(MEME_MANIFEST_FILE, json.dumps(manifest, ensure_ascii=False, indent=2))
 
         metadata = [_record_to_export_dict(r) for r in records]
@@ -1242,13 +1251,25 @@ async def export_memes(
     """
     try:
         # ── 获取要导出的记录 ──
+        pack_name: Optional[str] = None
         if req.meme_ids:
             records = await AiMemeRecord.get_by_meme_ids(req.meme_ids)
+        elif req.pack_id:
+            from gsuid_core.ai_core.meme.pack_model import PackStore
+
+            pack = await PackStore.get_pack(req.pack_id)
+            if pack is None:
+                return StreamingResponse(
+                    io.BytesIO(json.dumps({"status": 1, "msg": "表情包不存在"}).encode()),
+                    media_type="application/json",
+                    status_code=400,
+                )
+            member_ids = await PackStore.member_meme_ids(req.pack_id)
+            records = await AiMemeRecord.get_by_meme_ids(member_ids)
+            pack_name = pack.name
         elif req.folder:
-            # 按文件夹获取全部（不分页）
             records = await AiMemeRecord.get_all_by_folder(folder=req.folder)
         else:
-            # 导出全部
             records = await AiMemeRecord.get_all_records_no_page()
 
         if not records:
@@ -1260,7 +1281,7 @@ async def export_memes(
 
         # ── 构建 ZIP 到内存（压缩是 CPU 密集阻塞，丢线程池） ──
         base_path = get_memes_base_path()
-        buf = await asyncio.to_thread(_build_meme_zip, records, base_path)
+        buf = await asyncio.to_thread(_build_meme_zip, records, base_path, pack_name)
         buf.seek(0)
 
         # 生成文件名
@@ -1280,9 +1301,7 @@ async def export_memes(
         )
 
 
-# ─────────────────────────────────────────────
-# 12. 导入 .meme 格式表情包
-# ─────────────────────────────────────────────
+# --- 12. 导入 .meme 格式表情包 ---
 
 
 @app.post("/api/meme/import", summary="导入 .meme 格式文件", tags=MEME)
@@ -1293,13 +1312,10 @@ async def import_memes(
     persona_hint: str = Form(
         "common",
         max_length=64,
-        description=(
-            "指定导入后的归属人格（如 'common' 或某 persona 名，不含 'persona_' 前缀）。"
-            "会覆盖 metadata.json 中的 folder / persona_hint 字段，"
-            "使所有导入项落到该人格对应的 folder 下；缺省 'common' 代表通用表情包。"
-            "前端可调用 GET /api/meme/personas 拿到可选人格列表。"
-        ),
+        description=("指定导入后的目录提示。缺省 common：文件进入 common，尚未指定包的新图成为「通用表情包」的成员。"),
     ),
+    pack_id: Optional[str] = Form(None),
+    create_pack: Optional[bool] = Form(None),
     _: Dict[str, Any] = Depends(require_auth),
 ) -> Dict[str, Any]:
     """
@@ -1339,6 +1355,7 @@ async def import_memes(
 
         imported_ids: List[str] = []
         skipped_ids: List[str] = []
+        linked_ids: List[str] = []
         failed_items: List[Dict[str, Any]] = []
 
         base_path = get_memes_base_path()
@@ -1364,11 +1381,41 @@ async def import_memes(
 
             metadata_list = json.loads(zf.read(MEME_METADATA_FILE))
 
-            # ── 解析全局 persona_hint：与 `_folder_for_persona` 保持一致
-            # （与 MemeLibrary.move_file 的 folder ↔ persona_hint
-            # 双向一致规则同源）。空字符串 / 缺省一律走 "common"。 ──
             target_persona_hint = (persona_hint or "common").strip() or "common"
             target_folder = _folder_for_persona(target_persona_hint)
+
+            from gsuid_core.utils.path_safety import is_safe_filename as _safe_name
+            from gsuid_core.ai_core.meme.pack_model import DEFAULT_PACK_ID, PackStore
+
+            link_pack_id = ""
+            link_pack_name = ""
+            chosen_pack = (pack_id or "").strip()
+            if chosen_pack:
+                found = await PackStore.get_pack(chosen_pack)
+                if found is None:
+                    return {"status": 1, "msg": "表情包不存在", "data": None}
+                link_pack_id = found.pack_id
+                link_pack_name = found.name
+            elif create_pack is True:
+                raw_pack_name = ""
+                if "pack_name" in manifest and isinstance(manifest["pack_name"], str):
+                    raw_pack_name = manifest["pack_name"].strip()
+                if not raw_pack_name:
+                    raw_pack_name = Path(file.filename or "memes.meme").name
+                    if raw_pack_name.lower().endswith(".meme"):
+                        raw_pack_name = raw_pack_name[: -len(".meme")]
+                if not _safe_name(raw_pack_name) or not (1 <= len(raw_pack_name) <= 64):
+                    return {"status": 1, "msg": "包名无效或已被占用", "data": None}
+                if await PackStore.get_by_name(raw_pack_name) is not None:
+                    return {"status": 1, "msg": "包名无效或已被占用", "data": None}
+                created = await PackStore.create_pack(raw_pack_name)
+                link_pack_id = created.pack_id
+                link_pack_name = created.name
+            elif create_pack is False:
+                return {"status": 1, "msg": "未指定表情包", "data": None}
+
+            from gsuid_core.pool import to_thread
+            from gsuid_core.ai_core.meme.normalize import prepare_meme_image
 
             # ── 逐条导入（每条独立保护，单条失败不中断整体导入） ──
             for meta in metadata_list:
@@ -1379,8 +1426,12 @@ async def import_memes(
 
                 try:
                     exists = await AiMemeRecord.exists_by_meme_id(meme_id)
-                    if exists and skip_existing:
+                    if exists and skip_existing and not link_pack_id:
                         skipped_ids.append(meme_id)
+                        continue
+                    if exists and skip_existing and link_pack_id:
+                        await PackStore.add_member(link_pack_id, meme_id)
+                        linked_ids.append(meme_id)
                         continue
 
                     # 读取源文件
@@ -1391,9 +1442,13 @@ async def import_memes(
                         continue
 
                     image_data = zf.read(file_key)
-                    file_mime = meta.get("file_mime", "image/jpeg")
-                    width = meta.get("width", 0)
-                    height = meta.get("height", 0)
+                    raw_mime = meta.get("file_mime", "image/jpeg")
+                    file_mime = raw_mime if isinstance(raw_mime, str) and raw_mime else "image/jpeg"
+                    prepared = await to_thread(prepare_meme_image)(image_data, file_mime)
+                    image_data = prepared.data
+                    file_mime = prepared.mime
+                    width = prepared.width
+                    height = prepared.height
                     # 优先级：表单传入的 persona_hint 推导的 folder > metadata.json 中的 folder
                     # 避免“原导出处为 persona_A、却以 persona_B 导入”的不一致场景。
                     folder = target_folder
@@ -1407,7 +1462,7 @@ async def import_memes(
                         continue
                     target_folder_path.mkdir(parents=True, exist_ok=True)
 
-                    ext = Path(file_name).suffix or ".jpg"
+                    ext = ext_for_mime(file_mime)
                     dest_name = f"{meme_id}{ext}"
                     if not is_safe_filename(dest_name):
                         failed_items.append({"meme_id": meme_id, "reason": "非法文件名"})
@@ -1424,6 +1479,7 @@ async def import_memes(
                     # auto_tag 时直接以 pending 入库，避免"先按导入状态 sync、
                     # 打标后再 sync"的双写与陈旧状态入索引
                     status = "pending" if auto_tag else meta.get("status", "manual")
+                    assign_default = not link_pack_id and bool(auto_tag)
 
                     record_fields: Dict[str, Any] = {
                         "file_path": relative_path,
@@ -1440,6 +1496,8 @@ async def import_memes(
                         "custom_tags": meta.get("custom_tags", []),
                         "status": status,
                         "nsfw_score": meta.get("nsfw_score", 0.0),
+                        "pending_pack_id": link_pack_id if auto_tag and link_pack_id else "",
+                        "assign_default_pack": assign_default,
                     }
 
                     if exists:
@@ -1450,8 +1508,15 @@ async def import_memes(
                         record = AiMemeRecord(meme_id=meme_id, **record_fields)
                         await AiMemeRecord.insert_record(record)
 
+                    if link_pack_id and not auto_tag:
+                        await PackStore.add_member(link_pack_id, meme_id)
+                        linked_ids.append(meme_id)
+                    elif not link_pack_id and not auto_tag:
+                        await PackStore.ensure_default_pack()
+                        await PackStore.add_member(DEFAULT_PACK_ID, meme_id)
+                        await AiMemeRecord.update_record(meme_id, {"assign_default_pack": False})
+
                     if auto_tag:
-                        # 打标完成后由 tagger 统一同步向量索引
                         await enqueue_tag(meme_id)
                     elif (
                         record is not None
@@ -1477,6 +1542,16 @@ async def import_memes(
                 "imported_ids": imported_ids,
                 "skipped_ids": skipped_ids,
                 "failed": failed_items,
+                **(
+                    {
+                        "pack_id": link_pack_id,
+                        "pack_name": link_pack_name,
+                        "linked_count": len(linked_ids),
+                        "linked_ids": linked_ids,
+                    }
+                    if link_pack_id
+                    else {}
+                ),
             },
         }
     except Exception as e:

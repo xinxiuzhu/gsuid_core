@@ -91,6 +91,8 @@ class RunOnceState:
     # 终局 SILENCE 指令是否已注入过 ModelRequest（每 run 至多一次）
     delivered_nudged: bool = False
     has_status_tool_call: bool = False
+    last_block_reason: str = ""
+    silence_reason: str = ""
     # 排版失配：台词呈长结构被拦。**纯呈现问题**，不得据此强制工具或销毁内容
     # （用户可能就是要长文本）。与 saw_structured_return 正交，见 INV-1/INV-3。
     presentation_mismatch: bool = False
@@ -110,6 +112,8 @@ class RunOnceState:
     saw_non_web_data: bool = False
     # 本轮已发过一句等待安慰（出图前）
     wait_comfort_sent: bool = False
+    # 委派已派出，开场句却没说出去（没写或被闸拦）：回执后允许人格补一句
+    opening_missed: bool = False
     # 有活跃任务且本轮真人句很短：瘦检索/语境池，保住委派查询工具。
     in_flight_short: bool = False
     # 点名且本轮检索装上了查询工具：零工具事实回答要拦。
@@ -168,6 +172,13 @@ class RunOnceState:
     last_event_at: float | None = None
     model_name: str = "unknown"
     provider: str = "unknown"
+    # 已开始的模型请求次数。超轮数拿不到 result.usage，用量按请求累加。
+    model_requests: int = 0
+    iter_nudged: bool = False
+    usage_input_tokens: int = 0
+    usage_output_tokens: int = 0
+    usage_cache_read_tokens: int = 0
+    usage_cache_write_tokens: int = 0
     thinking_tags: tuple[str, str] = ("<think>", "</think>")
 
 

@@ -30,6 +30,7 @@ from gsuid_core.utils.database.base_models import async_maker
 from gsuid_core.ai_core.memory.ingestion.edge import extract_and_upsert_edges
 from gsuid_core.ai_core.memory.database.models import AIMemEpisode
 from gsuid_core.ai_core.memory.ingestion.entity import extract_and_upsert_entities
+from gsuid_core.ai_core.memory.relative_schedule import looks_like_one_off_relative_schedule
 from gsuid_core.ai_core.memory.ingestion.hiergraph import increment_entity_count, check_and_trigger_hierarchical_update
 
 from ...utils import extract_json_from_text
@@ -81,15 +82,7 @@ _NOISE_WORDS = frozenset(
 )
 
 
-# §14 低档 provider 故障转移环：额度/限流耗尽时按此顺序轮换。用户给定 3 家
-# {LongCat, MiniMax, 商汤科技}，但实测 MiniMax 额度已耗尽、LongCat-2.0-Preview 慢到撞 180s 超时，
-# 仅商汤科技 sensenova-flash-lite 又快又稳，故以它为主、其余为兜底（LongCat 置末，仅极端情况用）。
-# 改的是 in-memory ai_config，进程内生效、无需重启；仅作用于回灌期实体/边抽取的低档任务。
-# 主力 = MiniMax（用户说明：额度每 5h 重置、每窗口约 9M token，故是首选，全量需跨 2~3 个 5h 窗口
-# 续跑）。单元素 → 撞 429/额度时 _advance 为 no-op、只在 MiniMax 上退避重试，绝不自动切走（避免绕去
-# 慢/限流的备用 provider）。MiniMax 一个 5h 窗口额度用尽（429「用量上限」）时应**停下等下个窗口再续**
-# （驱动幂等续跑），而非在码内空转——见 docs/beam10m_memory_optimization.md §15。如需多家轮换，
-# 把 ["openai++商汤科技","openai++LongCat"] 加回本列表即可。
+# 低档 provider 故障转移配置：用于回灌期抽取任务在额度耗尽时轮换。
 _FAILOVER_LOW_PROVIDERS = ["openai++商汤科技"]
 # 撞限流后先在当前 provider 退避重试这么多次，仍失败才切下一家——避免单次抖动就切到慢/坏 provider。
 _FAILOVER_AFTER_ATTEMPTS = 4
@@ -399,9 +392,7 @@ class IngestionWorker:
                 self._buffers[record.scope_key].append(record)
                 self._last_activity[record.scope_key] = time.time()
 
-                # 首次入队时初始化 _last_flush 为当前时间，
-                # 避免新 scope_key 的 last=0 导致 timer 条件 (now-0 >> interval) 恒成立，
-                # 从而在第一次 timer 检查（30s 内）就立即 flush，使 batch_interval_seconds 失效。
+                # 首次入队初始化 _last_flush 为当前时间，避免立即触发定时刷盘。
                 if record.scope_key not in self._last_flush:
                     self._last_flush[record.scope_key] = time.time()
 
@@ -498,11 +489,7 @@ class IngestionWorker:
                         logger.warning(i18n_t("log.memory.scope_key_batch_ingestion", scope_key=scope_key))
                         _record_ingestion_stats(len(batch), success=False)
                     except Exception as e:
-                        # A-5 修复：以"批"为最小重试单位。原代码用外层 try/except 捕获，
-                        # 异常时把**整个 records**（含已成功写入的前几批）退回缓冲，
-                        # 重试时已写入的 Episode 没有幂等键会被重复摄入、实体计数虚高。
-                        # 现仅把"从当前失败批起、尚未成功处理"的剩余批次退回缓冲，
-                        # 已成功批次绝不重摄。
+                        # 仅退回从当前失败批起未处理的数据，避免重复摄入。
                         logger.error(
                             i18n_t(
                                 "log.memory.ingestion_batch_fail",
@@ -615,9 +602,7 @@ async def _ingest_batch_inner(
         valid_at=earliest_ts,
     )
 
-    # C1 / C6：分流——SELF scope（Bot 自我情景记忆）与全 LOW 价值批次只写 Episode，
-    # 跳过实体/边抽取。SELF scope 跳过可杜绝 Bot 戏言被提取成"客观事实"污染图谱；
-    # LOW 价值跳过可避免寒暄复读耗费 LLM 配额。
+    # SELF 作用域与纯低价值批次仅写入 Episode，跳过实体与关系抽取。
     is_self_scope = scope_key.startswith("self:")
     high_records = [r for r in records if getattr(r, "value_tier", "HIGH") == "HIGH"]
     if high_records:
@@ -648,13 +633,7 @@ async def _ingest_batch_inner(
         )
         return
 
-    # Step 3+：实体/边抽取与图谱写入（best-effort 富集）。
-    # N-2 修复：Episode 已在 Step 2 持久化为 durable 原始记忆；抽取阶段若抛**非超时**异常
-    # （_llm_extract JSON/网络错、entity/edge DB 错）并冒泡到 _flush，会让**整个失败批**
-    # （含已写入的 Episode）被退回缓冲重试——而 Episode 无幂等键 → 重复 Episode、实体计数
-    # 虚高。故把抽取与 Episode 写入解耦：在此就地吞掉抽取异常（仅记录），保证失败批不会被
-    # _flush 退回重试而重复写 Episode；唯有 Step 2（Episode 写库）失败才向上传播，那时尚无
-    # Episode，退回缓冲重试是安全的。
+    # 步骤 3+：实体与关系抽取写入。抽取异常不向上传播，避免 Episode 重复写入。
     try:
         await _extract_and_upsert_from_episode(
             episode_id=episode.id,
@@ -811,9 +790,7 @@ async def _extract_and_upsert_from_episode(
     if new_entity_count > 0:
         await increment_entity_count(scope_key, new_entity_count)
 
-    # Step 5: Edge 写入。valid_at 取本窗口 turn 的最新对话时间戳（回放语料的真实陈述
-    # 时间），而非抽取时刻——否则整个图谱的时序被抽取顺序覆盖（BEAM 复盘 §17 教训）。
-    # ObservationRecord.timestamp 是必填 aware datetime，直接取 max（无 record 时 None）。
+    # 步骤 5：边关系写入。valid_at 取当前窗口最新对话时间戳以维护真实时序。
     stmt_ts = max((r.timestamp for r in high_records), default=None)
     await extract_and_upsert_edges(
         scope_key=scope_key,
@@ -868,16 +845,14 @@ async def _extract_and_upsert_from_episode(
             if user_global_new_count > 0:
                 await increment_entity_count(user_global_scope, user_global_new_count)
 
-    # Step 7.5: 程序性/偏好记忆（默认开）——门控由实体抽取 LLM 顺手判定的 has_preference
-    # 决定（替代脆弱纯正则：既治"太宽"误触发、又治"太窄"漏自然口吻纠正）。命中才跑第二次、
-    # 带能力清单/工具轨迹的独立蒸馏 LLM（create_by=MemPreferenceExtraction，token 单独归账，
-    # 自带 try/except → 失败不连累已写入的 entity/edge）。观察期的纠错正则已降级为仅管"强制
-    # HIGH 让候选进抽取 + 触发即时 flush 时机"，不再门控本次蒸馏。
+    # 步骤 7.5：偏好记忆蒸馏，由抽取阶段判定的 has_preference 门控触发。
     pref_signal = extracted["has_preference"] if "has_preference" in extracted else False
     await _write_master_stated_facts(
         extracted["stated"] if "stated" in extracted else [],
         speaker_ids=speaker_ids,
         episode_id=episode_id,
+        scope_key=scope_key,
+        fallback_at=stmt_ts,
     )
     if memory_config.enable_preference_memory and pref_signal:
         try:
@@ -1295,11 +1270,7 @@ async def _llm_extract_single(dialogue: str, scope_key: str) -> ExtractedResult:
         system_prompt = ENTITY_EXTRACTION_SYSTEM
         if memory_config.enable_preference_memory:
             system_prompt = ENTITY_EXTRACTION_SYSTEM + PREFERENCE_FLAG_INSTRUCTION
-        # 不传 output_type，让模型直接输出 JSON，不产生 thinking trace。
-        # 限流退避 + 多 provider 故障转移（§14）：大规模并发回灌会撞上游 LLM 429（额度/限流），
-        # 上游把 429 作为**错误文本**返回（非异常），JSON 解析失败会被当"空抽取"静默丢窗口、污染
-        # 图谱。故先探测 429/额度文本：先在当前 provider 短退避重试，连撞则按 _FAILOVER 轮换低档
-        # provider（LongCat→MiniMax→商汤，见 _advance_low_provider）后用新 provider 重建 agent 重试。
+        # 模型输出 JSON，遇限流时执行退避重试与故障转移。
         from gsuid_core.ai_core.configs.ai_config import ai_config
 
         raw_text = ""
@@ -1323,18 +1294,14 @@ async def _llm_extract_single(dialogue: str, scope_key: str) -> ExtractedResult:
                 or "额度" in raw_text
             )
             if _is_rl and _rl_attempt < 7:
-                # 撞限流：先在当前 provider 退避重试（吸收瞬时抖动，live+eval 都做，是安全加固——
-                # 否则 429 会被当空抽取静默丢）。**仅 eval_mode** 才在连撞后轮换 provider：线上不应
-                # 因一次限流就自动改用户的 provider（_advance 会改 in-memory ai_config）。
+                # 遇限流先执行退避重试，eval 模式连撞后触发 provider 轮换。
                 if memory_config.eval_mode and _rl_attempt >= _FAILOVER_AFTER_ATTEMPTS:
                     _advance_low_provider(_cur_prov)
                 await asyncio.sleep(min(1.5**_rl_attempt, 8))
                 continue
             break
         data = extract_json_from_text(raw_text)
-        # 模型偶尔把对象包进数组（extract_json_from_text 的解析兜底也会返回 list），
-        # 与 heartbeat/decision 一致：取数组首个 dict 归一化；仍非 dict 则走下方
-        # ValueError 路径（warning + 计入提取失败统计），不静默丢弃
+        # 若模型输出为数组，取首个 dict 归一化解析。
         if isinstance(data, list):
             data = next((item for item in data if isinstance(item, dict)), None)
         if not isinstance(data, dict):
@@ -1371,10 +1338,8 @@ async def _llm_extract_single(dialogue: str, scope_key: str) -> ExtractedResult:
     return {"entities": [], "edges": [], "events": [], "has_preference": False, "stated": []}
 
 
-# ─────────────────────────────────────────────
 # 程序性 / 偏好记忆蒸馏（独立 LLM 调用，纠错门控命中才触发）
 # 设计：plans/procedural_preference_memory_design_20260614.md §4
-# ─────────────────────────────────────────────
 
 # 单批最多写入的偏好规则数，防 LLM 过度产出
 _PREFERENCE_MAX_PER_BATCH = 8
@@ -1414,19 +1379,22 @@ async def _write_master_stated_facts(
     *,
     speaker_ids: list[str],
     episode_id: str,
+    scope_key: str,
+    fallback_at: datetime | None,
 ) -> None:
     """主人自我陈述硬写偏好，不经置信度门。旁人陈述忽略。"""
     if not stated:
         return
     from gsuid_core.config import core_config
     from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
-    from gsuid_core.ai_core.memory.database.models import AIMemPreference
+    from gsuid_core.ai_core.memory.database.models import AIMemEvent, EventWriteRow, AIMemPreference
 
     raw_masters = core_config.get_config("masters")
     masters = {str(x) for x in raw_masters} if isinstance(raw_masters, list) else set()
     if not masters:
         return
     valid = set(speaker_ids)
+    pending_events: list[EventWriteRow] = []
     for item in stated:
         uid = item["u"]
         kind = item["k"]
@@ -1435,6 +1403,18 @@ async def _write_master_stated_facts(
             continue
         body = value.strip()
         if not body:
+            continue
+        # 一次性行程进事件；习惯和「明天指哪一天」仍进偏好。
+        if looks_like_one_off_relative_schedule(body):
+            pending_events.append(
+                {
+                    "summary": body[:200],
+                    "start_at": fallback_at,
+                    "end_at": None,
+                    "entities": [],
+                    "aliases": [],
+                }
+            )
             continue
         slot = kind.strip() if kind.strip() in ("location", "possession", "preference") else "preference"
         await AIMemPreference.upsert(
@@ -1445,6 +1425,13 @@ async def _write_master_stated_facts(
             polarity="do",
             is_correction=False,
             source_episode_id=episode_id,
+        )
+    if pending_events:
+        await AIMemEvent.upsert_events_bulk(
+            scope_key,
+            pending_events,
+            episode_id=episode_id,
+            fallback_at=fallback_at,
         )
 
 

@@ -12,6 +12,7 @@
   "log.core.core_auto_task_restart": "[Core自动任务] 开始执行 [自动重启]",
   "log.core.core_auto_task_update_gscore": "[Core自动任务] 开始更新 [早柚核心]",
   "log.core.core_auto_task_update_plugin_directory_start": "[Core自动任务] 开始更新 [插件目录]",
+  "log.core.core_restart_by_supervisor": "[Core重启] 关机钩子已执行，交给守护进程重新拉起",
   "log.core.core_restart_custom_command_start": "[Core重启] 使用自定义重启命令: {restart_command}",
   "log.core.core_restart_default_command_start": "[Core重启] 使用默认重启命令: {command}",
   "log.core.core_restart_subscription_found_start": "[Core重启] 没有找到[Core重启]的订阅, 无推送消息！",
@@ -33,7 +34,6 @@
   "log.core.gscore_status_start": "开始执行 早柚核心 [状态]",
   "log.core.gscore_status_synced": "[早柚核心] 状态已同步!",
   "log.core.gscore_websocket_connection_reset": "[GsCore] WebSocket 连接被重置: {bot_id}",
-  "log.core.hf_switch": "[GsCore] 切换HF地址，地址: {hf_endpoint}",
   "log.core.illegal_access": "[GsCore] 非法访问拒绝: IP={client_host}, BotID={bot_id}",
   "log.core.leftover_information_check_fail": "遗留信息检查失败!",
   "log.core.leftover_information_check_ok": "遗留信息检查完毕!",
@@ -59,5 +59,6 @@
   "log.core.startup_done": "启动完成 {duration:.2f}s · v{version}",
   "log.core.token_error": "[GsCore] Token 错误!剩余尝试次数: {remaining}",
   "log.core.web_console_background_initialization_fail": "[网页控制台] 后台初始化失败: {e}",
+  "log.core.ws_inbound_frame_skipped": "[GsCore] {bot_id} 上报的一帧无法解码为 MessageReceive：{reason}（{size} 字节）。Core 已跳过这一帧，连接保持。",
   "log.core.ws_starting": "[GsCore] 启动WS服务中..."
 }

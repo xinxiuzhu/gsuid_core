@@ -21,6 +21,8 @@
 6. **禁止人格锁定 / 能力锁定** ——框架不得写死某个角色的口癖/自称，也不得把游戏/股票等垂直词表写进分类器或路由（见 `AGENTS.md` §1.9）。
 7. **完全类型提示** ——所有函数参数/返回值都有注解，且注解不是 `Any`。
 8. **全异步** ——可能阻塞的都 `async def`；同步 CPU 用 `@to_thread`/专用线程池。
+9. **当轮控制句只定义一次** ——仍插进当前 request user 侧、入史前剥掉的句子只写在
+   `ai_core/control/lines.py`，调用处 import 同一对象（见 `AGENTS.md` §1.11、[§6.7.3](./06-ai-session-and-persona.md)）。
 
 > 注释规范：`#` 注释**不超过两行、每行 ≤88 字**，精简直白，用最精确的注释给指导，而不是长篇
 > 大论。详见 `AGENTS.md`。
@@ -55,12 +57,45 @@ LLM 调用是 `await` 的纯网络 I/O，等待期间不占用事件循环。双
 InvalidStateError → 主循环崩溃 → **WS 全线断连**）。现已回归主循环 `asyncio.create_task`。
 **任何"把耗时 AI 任务搬去独立线程跑事件循环"的想法都要先验证它不碰这三个共享资源。**
 
+### 🔴 `pool.to_thread` 不要用来装饰协程函数
+
+`gsuid_core/pool.py` 的 `to_thread` 遇到协程函数会 `asyncio.new_event_loop()`，在**线程池里
+另起一个循环**跑它。凡是被装饰的函数体里有 `await`（尤其是 DB 访问），就踩上面那条红线。
+
+实例：`_draw_status_uncached` 曾被 `@to_thread` 装饰，`core信息` 的取数因此跑在新循环上。
+
+**不要以为「跨循环排队会失效」**——实测（CPython 3.12，非 debug 模式）排队与交接是能正常
+完成的：`call_soon` 的线程检查被包在 `if self._debug:` 里，`set_result` 只是往对方循环的
+`_ready` 里塞 handle。真正出事的是另外两条：
+
+1. **读信号量会被永久绑死在临时循环上。** `asyncio.Semaphore`（`_LoopBoundMixin`）在**首次
+   竞争**时才调 `_get_loop()`，无竞争时只做 `self._value -= 1` 所以看不出来。一旦第一次竞争
+   落在临时循环上，循环随即被 `close()`，主循环之后**每一次竞争读**都抛
+   `RuntimeError: ... is bound to a different event loop`，且不会自愈。
+2. **超时路径会跨线程取消别人的写。** 写闸门排队超过 `GATE_WAIT_S` 会调 `_steal_if_overdue()`
+   去 `task.cancel()` 当前占锁的任务——从临时循环发起时，这是跨线程取消主循环那个**正常**的写。
+
+判据与写法：
+
+- 纯同步函数（无 `await`）→ `@to_thread` 正确。
+- 协程函数 → **直接 `async def`**；只把其中**不碰 DB / 不碰共享客户端的纯 CPU 段**用标准库
+  `asyncio.to_thread` 卸载（它不会新建循环）。
+- 判据不是"看起来慢"，而是"里面有没有 `await`"。
+- 混合函数按**取数 / 渲染**拆两半：协程那半留在主循环只负责 await 数据，同步那半进
+  `_compose_status_card`。`core信息` 现在就是这么分的（`_fetch_hw` / `_fetch_plugins_status` /
+  `draw_data_analysis1` 的入参由主循环备好，PIL 全在 `_compose_status_card` 里画）。
+- 注意别把**插件公开 API** 顺手改成同步：`image_tools.draw_pic_with_ring` 是插件文档里写着
+  `await draw_pic_with_ring(...)` 的协程函数，动它属于破坏性变更。`draw_title` 因此留在主循环。
+
+回归锁：`tests/test_status_render_event_loop.py` 打桩渲染会碰到的取数入口，断言它们都发生在
+调用方事件循环上（修复前 7/7 落在 `ThreadPoolExecutor-0_0`）。它不碰真实写闸门。
+
 ### Windows 事件循环：现在是 Proactor，子进程可用（2026-08-14 更正）
 
 > ⚠️ **本节此前写的是「`core.py` 切到 `WindowsSelectorEventLoopPolicy`，所以 Windows 不支持
 > 子进程」。该描述已过期，写新代码不要按它决策。**
 
-**现状**：`core.py` **不设置任何事件循环策略**。它 `asyncio.run(main())` 并在其中
+**现状**：`core.py` **不设置任何事件循环策略**。它 `asyncio.run(serve())` 并在其中
 `await server.serve()`；uvicorn 的 loop factory 只在 `Server.run()` 里生效，走 `serve()`
 不会被套用。因此 Windows 上跑的是 **Python 默认的 `WindowsProactorEventLoopPolicy` →
 `ProactorEventLoop`**（实测 Python 3.12.4 + uvicorn 0.42）。
@@ -70,10 +105,9 @@ InvalidStateError → 主循环崩溃 → **WS 全线断连**）。现已回归�
 那么 Proactor 关 socket 的 `InvalidStateError` 怎么办？改成**顶层兜底吞掉**，不再换策略：
 
 ```python
-# core.py:288-297
-if multiprocessing.current_process().name == "MainProcess":
+# core.py::main()（被守护的子进程分支）
     try:
-        asyncio.run(main())
+        asyncio.run(serve())
     except (ConnectionResetError, ConnectionAbortedError):
         # Windows ProactorEventLoop: 客户端异常断开时可能逃逸到顶层
         pass
@@ -105,6 +139,8 @@ AI 关闭时**不该有任何 AI 逻辑在跑**。改 AI 模块时务必保留�
 - `handle_ai` 里 `enable_ai` **函数内动态读取**（不要缓存进模块级常量，否则切开关要重启）。
 - HTTP Agent：`register_http_agent_routes` 总开关关则不 `include_router`（再开需重启）。
   已挂上后关掉仍 404。Admin 建钥不走 Agent 面、不查总开关。
+- 导入闸（`heavy_import_gate`）只拦 `onnxruntime` / `fastembed`。**不要**把 `playwright`
+  放回去：插件命令出图走浏览器渲染，与 AI 总开关无关；拦了会 `HeavyImportBlocked`。
 
 ## 12.5 Bot 类型混淆（D-5）
 
@@ -131,7 +167,8 @@ Session ID 群聊**不含 user_id**（`…:group:{group_id}`），群内共享 S
 - 禁止再实现「`history[-n:]` 砍头」式 compact；
 - 禁止 compact 后把角色锚点 **插回头部**（平移前缀 = 整段 cache 失效）；
 - 框架契约 / 纠正 nudge 只 **append** 到本 run request，落盘前 `_relean` 剥掉
-  （`（系统：` / `（系统校验：` / thrash / 墙钟 等）。
+  （`（系统：` / `（系统校验：` / thrash / 墙钟 等）。这些句子的正文只在
+  `control/lines.py` 定义一次，调用处 import，不要在闸门旁边再抄一份（[§6.7.3](./06-ai-session-and-persona.md)）。
 
 旧 API `_truncate_history_with_tool_safety` 仍为「保尾」语义，**主会话勿用**。
 
@@ -198,7 +235,7 @@ Agent 达 `UsageLimitExceeded`（思考轮数上限）时的 fallback 不能让 
 `heartbeat/decision.py`、`send_chat_result`、`extract_json_from_text` 全部引用解析函数。
 **不要**再散落硬编码列表或只认单枚 token（曾把 `<silence></silence>` 当台词下发）。
 
-## 12.14 记忆系统正确性细节（D-12~D-19）
+## 12.14 记忆系统正确性细节（D-12 到 D-19）
 
 改记忆系统时注意这些已修复的坑：
 
@@ -274,7 +311,7 @@ output 近似平方级膨胀。Moonshot/OpenAI/DeepSeek 官方等标准网关不
 5. 依赖 pydantic_ai（1.77.0）的 `_validate_response` / `_streamed_response_cls` 覆写钩子，
    升级该库需回归验证探测逻辑。
 
-## 12.18 历史缺陷速查表（D-1~D-22，全部已修复）
+## 12.18 历史缺陷速查表（D-1 到 D-22，全部已修复）
 
 | ID | 模块 | 问题 | 详见 |
 |----|------|------|------|
@@ -286,7 +323,7 @@ output 近似平方级膨胀。Moonshot/OpenAI/DeepSeek 官方等标准网关不
 | D-7 | WebConsole | 文件上传缺 MIME 检查 | [§11](./11-statistics-webconsole-database.md) |
 | D-8 | Handler | 用户触发缺并发控制 → Rate Limit | [§04](./04-event-trigger-flow.md) |
 | D-11 | handle_ai | RAG 强制前置检索 | §12.16 / [§10](./10-rag-knowledge-embedding.md) |
-| D-12~D-19 | memory | 去重 key / 计数虚高 / N+1 / 并行化等 | §12.14 / [§09](./09-memory-system.md) |
+| D-12 到 D-19 | memory | 去重 key / 计数虚高 / N+1 / 并行化等 | §12.14 / [§09](./09-memory-system.md) |
 | D-20 | gs_agent | 强制总结偏离用户问题 | §12.8 |
 | D-21 | 全局 | AI 总开关关闭后仍跑 AI 逻辑 | §12.4 / [§02](./02-startup-lifecycle.md) |
 | D-22 | configs/models | 累计语义网关流式 usage 被逐 chunk 累加致统计膨胀数十倍 | §12.17 / [§11](./11-statistics-webconsole-database.md) |
@@ -327,7 +364,7 @@ BEAM-10M / LongMemEval 这类"单题灌数百~上千 turn"的大语料，会撞�
 - **解法（评测/回灌专用，`eval_mode` / 新端点字段闸门保护，线上行为不变）**：
   1. **Episode 粒度**：`AIMemEpisode.create_episodes_bulk` **每 turn 一条 granular Episode**（`_chunk_text`
      按句子边界切 ≤900 字符、同 turn 块共享时间戳），纯嵌入零 LLM、可被 System-1 精确召回。
-  2. **抽取批次粒度**：`batch_observe(extract=true)` → `worker.extract_window` 把**连续若干 turn 拼成
+  2. **抽取批次粒度**：`batch_observe(extract=true)` → `worker.extract_window` 把**连续多轮 turn 拼成
      抽取窗口**（字符/turn 数先到者收口），每窗口一次 LLM 抽取，复用
      `_extract_and_upsert_from_episode` 全下游。**绝不**复活 observer 队列 + 80-turn 聚合。
   3. **窗口宽松超时只跳过不丢整 plan**：`_run_extract_pass` 每窗口 `asyncio.wait_for`，超时/异常只
@@ -592,7 +629,7 @@ v9 评测驱动的一批防线（编码注入中和 / 假完成闸 / 防火墙�
   丢弃器：启动卡顿 >90s 该 job 被静默扔掉、任务永滞 pending。这类 job 要显式
   `misfire_grace_time=None`。排查"任务没跑"先看有没有 `Run time of job ... was missed` 日志。
 
-## 12.22d 交互脚手架（C-1~C-4，`ai_core/interaction_scaffold.py`，2026-07-12）
+## 12.22d 交互脚手架（C-1 到 C-4，`ai_core/interaction_scaffold.py`，2026-07-12）
 
 评测把问题从"防线误杀"推进到"多步正确性 + 泛化"后，新增了一层**结构化交互脚手架**，
 把过去全靠模型自觉的四件事变成框架层的显式约束/提示。只对**交互式主 Agent**生效
@@ -613,9 +650,9 @@ v9 评测驱动的一批防线（编码注入中和 / 假完成闸 / 防火墙�
 - **C-3 寻址前置门**（`addressed_to_someone_else`）：当前消息带「@的是这位用户，不是你」标注、
   未同时点名自己、非 is_tome 时，**装配层直接把 `tools` 清空**（含 send_message_by_ai / find_tools
   / skills_toolset），把"不冲你来=零工具"从模型自觉变成硬约束。根治隐性指代域的 over-tooling。
-  **@ 标注文案唯一定义在 `interaction_scaffold.AT_OTHER_MARKER`/`DIRECT_MARKER`**——
-  utils/history_format 渲染只准 import 常量，字面量重复会让门静默失效
-  （`test_at_marker_single_source` 源码级锁）。
+  **寻址记号唯一定义在 `control/lines.py` 的 `AT_OTHER_MARKER` / `DIRECT_MARKER`**。
+  `interaction_scaffold` 再导出同一对象；utils / history_format 只 import，不抄字面量。
+  再抄一份，C-3 寻址门对不上，静默失效（`test_at_marker_single_source`）。
 - **C-4 墙钟软预算**（`gs_agent` ModelRequestNode 前）：交互式 run 墙钟超预算后，请求前注入一次
   "停止发起新工具轮、用已有信息收敛作答"，治多步任务的延迟长尾。与 token 预算正交。
   nudge 挂在 run 中途的后续 ModelRequest 上，**由 `_relean_user_turn(strip_hint_texts=…)` 从
@@ -716,8 +753,8 @@ option）下排 **#1**；英文模型的相似度全挤在 0.058 的窄带里，
 与 `batch_observe` 显式调了 `worker.flush_all()`；真实 WS/QQ 链路从不主动 flush。
 排查时这个分布本身就是最强线索：**"只有走 API 的数据活下来了"= 落库依赖显式 flush**。
 
-现已新增 `idle_flush_seconds`(默认 180)：**按「对话静默」而非固定周期触发**——对话进行中
-一直有新消息 → 不算静默 → 不 flush，抽取仍是整段一次调用，**批量效率不受影响**；
+现已新增 `idle_flush_seconds`(默认 180)：**按「对话静默」而非固定周期触发**——对话持续产生
+新消息 → 不算静默 → 不 flush，抽取仍是整段一次调用，**批量效率不受影响**；
 对话结束 3 分钟后落库，记忆的最长在险时间从 2 小时降到 3 分钟。
 `batch_interval_seconds` 退化为刷屏 scope 的兜底上限。
 
@@ -806,7 +843,7 @@ memory / statistics / planning / meme / favor_decay 每次启动都初始化两�
 
 关系温度改造新增了每轮注入的 `（对这个人的口气：…）`。对**从未打过分**的用户，
 `score` 落到 0 → zone `distant` → 注入「公事公办，少废话」。单看这句没问题；但人设卡
-里已经有「回复 3~15 字」「默认潜水」「低好感只在被 @ 时回应」。两段叠起来，模型读出的
+里已经有「回复 3 到 15 字」「默认潜水」「低好感只在被 @ 时回应」。两段叠起来，模型读出的
 结论是**可以拒办**：问时间答「自己看手机…我没表」，查偏好答「记不清了…你再说一遍」。
 
 > 两条规矩：
@@ -848,7 +885,7 @@ memory / statistics / planning / meme / favor_decay 每次启动都初始化两�
 3. AI 总开关：新加的 AI 初始化/定时任务/建表/HTTP 面都查了 `enable`。
 4. 状态：新加的进程内存状态知道多实例不共享；没碰 IngestionWorker 的独立线程禁区。
 5. Bot：取 `_Bot` 用 `WS_BOT_ID`；需要 `Bot` 的地方没传裸 `_Bot`。
-6. 历史/记忆：截断保留 ToolCall/ToolReturn 配对；记忆改动没踩 D-12~D-19。
+6. 历史/记忆：截断保留 ToolCall/ToolReturn 配对；记忆改动没踩 D-12 到 D-19。
 7. 注释：`#` 注释 ≤2 行、每行 ≤88 字，精简直白。
 8. 输出链路：新「打回/熔断」挂 `output_gate.pre_send_gate`，呈现变换挂 `send_chat_result`；
    `ooc_check=False` 仅限已过 gate / 重说产物；框架层文本人格中性（§1.9）；词库加词先过规范化
@@ -856,7 +893,7 @@ memory / statistics / planning / meme / favor_decay 每次启动都初始化两�
    新分类器词 / 规划提示 / 用户可见兜底不得绑某个角色口癖或某个业务垂直。
 9. 防线改动：注入/出戏/假完成相关的正则或词库改动，坏样本（eval inj_*/adv_*）与好样本
    （良性误杀集）**两个方向都要跑**（§12.22b）；处理用户文本的标注函数保持幂等。
-10. 交互脚手架（§12.22d）：C-1~C-4 只对交互式主 Agent 生效；判据只用结构/语言学范畴、
+10. 交互脚手架（§12.22d）：C-1 到 C-4 只对交互式主 Agent 生效；判据只用结构/语言学范畴、
     绝不塞评测载荷词；改动跑 `tests/test_interaction_scaffold.py` 双向锁。
 11. 文档：改了核心机制，回头同步对应章节（源码是唯一事实源，但导航别让它过期）。
 12. 套件 / 启动顺序（§12.22h）：新套件的 `init_step` 没有和 `_INIT_STEPS` 撞同一个
@@ -866,6 +903,8 @@ memory / statistics / planning / meme / favor_decay 每次启动都初始化两�
     调语气的档位都带履约地板；没有依据（未打分 / 无数据）时不注入。
 14. 单测全绿不等于没回归：碰了装配 / 闸门 / 每轮注入 / 启动顺序的改动，跑一轮
     `eval/agent` 群聊基准并与上一份报告逐例对比（`--concurrency 1` 排除争用）。
+15. 新的当轮 user 侧句子写在 `control/lines.py` 再 import。不在闸门旁边再抄一份，
+    也不把「什么时候插入」做成提示词组字段（§1.11 / §6.7.3）。
 
 ## 12.25 HTTP 流式 Agent API（2026-08-26）
 

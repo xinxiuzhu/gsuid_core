@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Optional
+from typing import Optional, NamedTuple
 from datetime import datetime
 from contextvars import Token, ContextVar
 from dataclasses import dataclass
@@ -17,6 +17,8 @@ from gsuid_core.logger import logger
 from gsuid_core.models import Event
 
 _outbound_image_label: ContextVar[str] = ContextVar("outbound_image_label", default="")
+# 泄漏句柄补发不经过 send_message_by_ai，用这个标记并回本轮「已经出图」。
+_run_image_delivered: ContextVar[bool] = ContextVar("run_image_delivered", default=False)
 
 
 def _db_ready() -> bool:
@@ -32,6 +34,12 @@ def ledger_group_key(ev: Event | None, *, group_id: str = "", user_id: str = "")
         return group_id
     uid = str(ev.user_id) if ev is not None and ev.user_id else user_id
     return f"direct:{uid}" if uid else ""
+
+
+def format_meme_placeholder(mood: str) -> str:
+    """群聊历史里的表情占位。只放情绪词，方便记忆摄入当文字表情跳过。"""
+    word = (mood or "").strip()
+    return f"[表情:{word}]" if word else "[表情]"
 
 
 def format_outbound_image_placeholder(topic: str, res_id: str) -> str:
@@ -56,17 +64,72 @@ def reset_outbound_image_label(token: Token) -> None:
     _outbound_image_label.reset(token)
 
 
+def note_run_image_delivered() -> None:
+    _run_image_delivered.set(True)
+
+
+def take_run_image_delivered() -> bool:
+    if not _run_image_delivered.get():
+        return False
+    _run_image_delivered.set(False)
+    return True
+
+
+def reset_run_image_delivered() -> None:
+    _run_image_delivered.set(False)
+
+
+# 与 send 路径的 @数字 对齐，并收带数字的平台 ID。纯单词 @the 不是接收人。
+_AT_ID_RE = re.compile(r"@([0-9A-Za-z][0-9A-Za-z_\-]{2,64})")
+_CQ_AT_RE = re.compile(r"\[CQ:at\s*,\s*qq=([^,\]\s]+)(?:,[^\]]*)?\]")
+_DELIVERY_TASK_TITLE_RE = re.compile(r"任务#\d+「([^」]+)」")
+
+
+def rewrite_cq_at(text: str) -> str:
+    """把 [CQ:at,qq=ID] 收成 @ID。出站解析、主动消息历史、话题标题共用。"""
+    if not text:
+        return text
+    return _CQ_AT_RE.sub(r"@\1 ", text)
+
+
+def _clean_topic_head(raw: str, max_len: int = 12) -> str:
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    m = _DELIVERY_TASK_TITLE_RE.search(s)
+    if m is not None:
+        s = m.group(1).strip()
+    s = _AT_ID_RE.sub("", rewrite_cq_at(s)).strip()
+    head = s.split("\n", 1)[0].strip()
+    return head[:max_len]
+
+
 def topic_from_extra(extra: dict[str, object]) -> str:
     raw = extra["outbound_topic"] if "outbound_topic" in extra else ""
     if isinstance(raw, str) and raw.strip():
-        return raw.strip()[:12]
+        return _clean_topic_head(raw, 12)
     return ""
 
 
 def remember_outbound_topic(extra: dict[str, object], task_head: str) -> None:
-    head = (task_head or "").strip().split("\n", 1)[0].strip()[:12]
+    head = _clean_topic_head(task_head, 12)
     if head:
         extra["outbound_topic"] = head
+
+
+async def ensure_outbound_topic_from_artifact(extra: dict[str, object], image_id: str) -> None:
+    if not image_id.startswith("res_") or topic_from_extra(extra) or not _db_ready():
+        return
+    from sqlalchemy.exc import OperationalError, ProgrammingError
+
+    from gsuid_core.ai_core.planning.models import AIAgentArtifact
+
+    try:
+        art = await AIAgentArtifact.get_by_id(image_id)
+    except (OperationalError, ProgrammingError):
+        return
+    if art is not None and art.summary:
+        remember_outbound_topic(extra, art.summary)
 
 
 @dataclass(frozen=True)
@@ -94,17 +157,13 @@ def _fmt_ago(age_seconds: float) -> str:
     return f"{minutes} 分钟前"
 
 
-# 与 send 路径的 @数字 对齐，并收带数字的平台 ID。纯单词 @the 不是接收人。
-_AT_ID_RE = re.compile(r"@([0-9A-Za-z][0-9A-Za-z_\-]{2,64})")
-
-
 def proactive_directed_target(event: Event, message: str) -> str:
     """群播报只有正文里的 @用户ID 才算定向。
 
     没有点名时不要把 Event.user_id 写成接收人，否则下一条别人的话会被记成发给这个人。
     """
     if event.group_id:
-        matched = _AT_ID_RE.search(message or "")
+        matched = _AT_ID_RE.search(rewrite_cq_at(message or ""))
         if matched is None:
             return ""
         token = matched.group(1)
@@ -139,12 +198,21 @@ async def record_outbound(
     sid = session_id or (ev.session_id if ev is not None else "")
     owner = str(ev.user_id) if ev is not None and ev.user_id else target_user
     handles = (image_id or "").strip()
-    topic_s = (topic or "").strip()[:12]
+    topic_s = _clean_topic_head(topic, 12)
+    if not topic_s and handles.startswith("res_"):
+        from gsuid_core.ai_core.planning.models import AIAgentArtifact
+
+        try:
+            art = await AIAgentArtifact.get_by_id(handles)
+        except (OperationalError, ProgrammingError):
+            art = None
+        if art is not None and art.summary:
+            topic_s = _clean_topic_head(art.summary, 12)
     if not topic_s:
         from gsuid_core.ai_core.configs.ai_config import ai_config
 
         n = int(ai_config.get_config("outbound_topic_n").data)
-        topic_s = (text or "").strip().replace("\n", " ")[:n]
+        topic_s = _clean_topic_head((text or "").replace("\n", " "), n)
     try:
         await OutboundAudit.record(
             session_id=sid,
@@ -190,7 +258,10 @@ async def record_outbound(
 
 async def resolve_quote(ev: Event) -> Optional[QuoteResolve]:
     raw = (ev.reply or "").strip()
-    if not raw:
+    is_image_quote = bool(
+        (ev.reply_id or ev.is_tome) and (not raw or raw.startswith("[图片")) and (ev.image_id_list or ev.image)
+    )
+    if not raw and not is_image_quote:
         return None
     from sqlalchemy.exc import OperationalError, ProgrammingError
 
@@ -199,18 +270,24 @@ async def resolve_quote(ev: Event) -> Optional[QuoteResolve]:
     if not _db_ready():
         return None
     gid = ledger_group_key(ev)
+    hit: Optional[OutboundAudit] = None
     try:
-        hit = await OutboundAudit.match_by_text(group_id=gid, text=raw)
+        if raw and not raw.startswith("[图片"):
+            hit = await OutboundAudit.match_by_text(group_id=gid, text=raw)
+        if hit is None and is_image_quote:
+            hit = await OutboundAudit.recent_image_for_group(group_id=gid)
     except (OperationalError, ProgrammingError) as e:
         logger.debug(i18n_t("log.ai.outbound_read_skip", e=e))
         return None
     if hit is None:
         return None
     who = hit.target_name or hit.target_user or "对方"
-    topic = hit.topic or "图片"
+    topic = _clean_topic_head(hit.topic or hit.text, 12) or "图片"
     handle = (hit.image_handles or "").split(",", 1)[0].strip()
     extra = f"，句柄 {handle}" if handle else ""
-    line = f"（系统：引用对象：你于 {_fmt_hm(hit.ts)} 发给{who}的「{topic}」{extra}）"
+    from gsuid_core.ai_core.control.lines import quote_object_line
+
+    line = quote_object_line(_fmt_hm(hit.ts), who, topic, extra)
     return QuoteResolve(line=line, topic=topic, handle=handle, target=who)
 
 
@@ -245,14 +322,55 @@ async def ownership_hint(ev: Event) -> str:
     if age > OWNERSHIP_HINT_TTL_SECONDS:
         return ""
     who = last.target_name or last.target_user
-    topic = last.topic or "图片"
-    return f"（系统：{_fmt_ago(age)}你把「{topic}」发给了{who}。）"
+    topic = _clean_topic_head(last.topic or last.text, 12) or "图片"
+    from gsuid_core.ai_core.control.lines import ownership_line
+
+    return ownership_line(_fmt_ago(age), topic, who)
 
 
 @dataclass(frozen=True)
 class ImageClaim:
     occupied: bool
     refuse: str | None
+
+
+class ResOwner(NamedTuple):
+    found: bool
+    owner_user_id: str
+
+
+async def lookup_res_owner(res_id: str) -> ResOwner:
+    """res_ 是否存在，以及任务树发起人。找不到产物与产物没有发起人分开。"""
+    rid = (res_id or "").strip()
+    if not rid.startswith("res_"):
+        return ResOwner(False, "")
+    from gsuid_core.ai_core.planning.models import AIAgentTask, AIAgentArtifact
+
+    art = await AIAgentArtifact.get_by_id(rid)
+    if art is None:
+        return ResOwner(False, "")
+    source = await AIAgentTask.get_by_id(art.root_task_id)
+    if source is None:
+        return ResOwner(True, "")
+    return ResOwner(True, (source.owner_user_id or "").strip())
+
+
+def speaker_may_take_res(owner: ResOwner, speaker_user_id: str) -> bool:
+    """产物不存在时交给原有的解析失败路径；存在则必须是当前说话人。"""
+    if not owner.found:
+        return True
+    speaker = (speaker_user_id or "").strip()
+    if not speaker or not owner.owner_user_id:
+        return False
+    return owner.owner_user_id == speaker
+
+
+def res_owner_refusal(owner: ResOwner, speaker_user_id: str) -> str:
+    if not (speaker_user_id or "").strip():
+        return "⚠️ 当前对话没有说话人，未发送该图。"
+    if not owner.owner_user_id:
+        return "⚠️ 该图没有发起人记录，未发送。"
+    return "⚠️ 该图属于其它发起人，未发送。请用本帧交付的句柄发给当前发起人。"
 
 
 async def try_claim_image_delivery(ev: Event | None, image_id: str, *, session_id: str) -> ImageClaim:

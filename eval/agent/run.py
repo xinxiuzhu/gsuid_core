@@ -211,8 +211,10 @@ async def _run_live(active: list[dict], k: int, args, judge: Callable[[str], boo
     force_k = args.k is not None
     if args.reset_state:
         from eval.agent.reset_state import reset_eval_side_effects
+        from gsuid_core.ai_core.interaction_scaffold import list_speaker_ids
 
-        stats = await reset_eval_side_effects()
+        speakers = {sid for c in active for sid in list_speaker_ids(json.dumps(c, ensure_ascii=False, default=str))}
+        stats = await reset_eval_side_effects(sorted(speakers))
         print(f"[reset] {stats}", flush=True)
     async with httpx.AsyncClient() as client:
         # 回答阶段：fire 全部 run（并发=args.concurrency）→ 只等一次 flush → 一趟扫盘
@@ -256,7 +258,7 @@ async def _run_live(active: list[dict], k: int, args, judge: Callable[[str], boo
                 flush=True,
             )
             if not r["case_pass"] and r["fail_reasons"]:
-                print(f"        ↳ {str(r['fail_reasons'][0])[:160]}", flush=True)
+                print(f"        -> {str(r['fail_reasons'][0])[:160]}", flush=True)
         return row
 
     # gather 保输入序，报告仍按用例表顺序；打印按完成先后
@@ -340,8 +342,11 @@ def main() -> int:
         extra_paths.append(cases_dir / "group_chat_expansion.yaml")
         # 生产群聊结构抽象出的合成用例（无真实 ID/原文）
         extra_paths.append(cases_dir / "group_chat_prod_patterns.yaml")
+        extra_paths.append(cases_dir / "group_chat_voice_ooc.yaml")
         extra_paths.append(cases_dir / "cognition_hub_mixed.yaml")
         extra_paths.append(cases_dir / "speaker_slot_recall.yaml")
+        extra_paths.append(cases_dir / "run_code_fanout.yaml")
+        extra_paths.append(cases_dir / "group_chat_meme.yaml")
     if args.extra_cases:
         for p in args.extra_cases.split(","):
             p = p.strip()

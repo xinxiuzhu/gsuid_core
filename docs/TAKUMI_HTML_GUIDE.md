@@ -204,7 +204,7 @@ safe = html.escape(user_text, quote=True)
 | `border-bottom` 等单边边框 | ✅ |
 | `border-style:dashed` | ✅ |
 | `border-radius` | ✅ |
-| `overflow:hidden` | ✅，可配合圆角裁剪 |
+| `overflow:hidden` | ⚠️ 容器有 `border-radius`（≥1px）时才裁切；没有圆角，子元素会画到容器外 |
 
 ### 5.4 背景与视觉效果
 
@@ -241,6 +241,8 @@ safe = html.escape(user_text, quote=True)
 | 能力 | 状态 |
 |---|---:|
 | `<img src="data:image/png;base64,...">` | ✅ |
+| `object-fit:cover` | ✅，居中裁切；`object-position` 不支持 |
+| `aspect-ratio` | ✅ |
 | `<br>` | ✅ |
 | `<hr>` | ✅ |
 | `<style>` 标签 | ✅ |
@@ -456,6 +458,27 @@ from gsuid_core.utils.html_render import render_html_to_bytes
 
 代码中如使用可选功能，必须做能力探测或 try/except 降级。
 
+### 8.3.1 照片要放进带圆角的容器，并让 img 绝对铺满
+
+下面三条在 Takumi 里都会出问题：
+
+- `background-image` 放照片：即使容器有圆角和 `overflow:hidden`，图也会画出容器外。
+- 裸 `<img>` 写 `margin` 或固定 `height`：margin 被忽略，或留下空白。
+- 容器里有绝对定位的兄弟元素（遮罩、角标）时，文档流里 img 的 `height:100%` 不生效，
+  图按原始比例排版，下方露出底色。
+
+照片槽位写法：
+
+```css
+.cover{position:relative;height:250px;overflow:hidden;border-radius:12px;}
+.cover img{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:cover;}
+```
+
+`render_html_to_image` 用到 `gs-` 类时注入的组件库（`render_kit.py`）已经按这个写法处理，
+包括 `gs-split-media`、`gs-thumb sm`、`gs-avatar lg` 这些照片槽位。
+离线检查 8 种版式的效果：`uv run python eval/manual/render_layout_gallery.py`。
+flex 行里 `flex:1` 的文字列要写 `min-width:0`，否则图片的原始宽度会把这一列撑出卡片。
+
 ### 8.4 IM 场景不要写太小的字
 
 聊天窗口（QQ）会按气泡宽度缩小整图。2x 栅格已经够清，糊通常是字相对画布太小。
@@ -498,6 +521,17 @@ svg = await render_chart_spec(
 - 类目名由工具保留（约 18 字），不要在 HTML 里再截成 8 字。
 
 回归：`tests/test_chart_encoding_and_inflight.py`、`tests/test_svg_chart_rewrite.py`。
+
+### 8.5.1 Mermaid
+
+`render_html_to_bytes` 和 `render_md_to_bytes` 在交给 pytakumi 之前，把
+`class="mermaid"`、`language-mermaid` 和 Markdown 的 mermaid 代码块换成 mermaid.ink 返回的 SVG。
+pytakumi 不跑页面里的 mermaid.js。
+
+mermaid.ink 连不上、超时或返回 5xx 时，这一块变成黑底红字「服务不可用」。同一页的其他内容照常出图。
+语法不被接受时，红字是「这张图无法渲染」。
+
+回归：`tests/test_mermaid_ink_render.py`。
 
 ### 8.6 修饰色被基类盖掉（class 优先级）
 

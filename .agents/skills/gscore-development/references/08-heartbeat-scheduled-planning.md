@@ -2,12 +2,14 @@
 
 > **返回主入口**：[`../SKILL.md`](../SKILL.md) · **上一章**：[七、工具注册表与 Agent 装配](./07-tool-registry-and-agent.md) · **下一章**：[九、记忆系统](./09-memory-system.md)
 
-本章讲三条"不由用户当前消息触发"的链路：Heartbeat 定时巡检（AI 主动说话）、Scheduled Task
-定时任务（用户预约）、Kanban 长任务编排（多步多代理协作）。
+本章讲四条不由用户当前消息触发的链路：Heartbeat 定时巡检、Scheduled Task
+定时任务、Kanban 长任务编排、自主行动。定时巡检和自主行动共用人格作息
+`active_hours`（默认 `08:00-23:30`，时区 `Asia/Shanghai`）。时段外这两条都不跑。
 
 ## 8.1 Heartbeat 定时巡检（`ai_core/heartbeat/`）
 
 `ai_mode` 含"定时巡检"时启用，AI 每 `inspect_interval` 分钟主动巡检群聊决定要不要说话。
+当前时间不在该人格的 `active_hours` 内时，这一轮巡检直接返回。
 
 ```
 heartbeat/
@@ -153,7 +155,10 @@ current_task；引用类工具用自然语言句柄（`resolver.resolve_task_ref
 2. 建树：covered=true 时 register_kanban_task 创建根 + N 子任务，立刻 kick_root 一次
 3. 并发派活：kanban_executor.execute_ready_tasks 扫树拿可跑节点，asyncio.gather 并发 run_capability_agent
 4. 状态推进：节点完/败 → 子任务落终态 + refresh_root_status 汇总根 → 递归 _schedule_continuation（最多 4 层）
-5. 追问溯源：每个能力代理 artifact_put 登记产出（没登记则执行器用 raw_result 兜底写 output artifact）
+5. 追问溯源：每个能力代理 artifact_put 登记产出（没登记则执行器用 raw_result 兜底写 output artifact）。
+   能力代理撞上 `task_max_iterations` 时，倒数第二次模型请求注入收口提示（停止新检索，用已有材料交付）。
+   仍撞上限则把按请求累加的 token 写入 `token_usage`（这条路径没有 `result.usage`）。
+   已有落盘检索或本轮回执时，无工具收成一份交付交回看板，不以失败前缀开头；评测和零材料仍回可识别失败。
 6. 失败处理：默认 notify_persona 策略，重派达 3 次自动转 waiting_approval
 7. 崩溃恢复：启动期 recover_zombie_subtasks 复活心跳过期的 running 子任务 + 统一 kick_root
 ```
@@ -171,18 +176,18 @@ current_task；引用类工具用自然语言句柄（`resolver.resolve_task_ref
 漂移。`run_capability_agent` 按子任务 `agent_profile` 唤醒**无人格能力代理**（不拒绝、不漂移），
 结果经 `_persona_relay` 用人格口吻转译后通知主人。
 
-> 🔁 **交互式 `create_subagent` 不许双份播报**（2026-07-15 修）。`create_subagent(agent_profile=...)`
-> 走 `_dispatch_via_kanban` 建**叶子根**、`kick_root` 后**同步轮询等完成**，再把结论回执给主人格、
-> 由主人格**亲自转述一次**。但 executor 的 `_run_one_task_node` 完成时**也**会 `_persona_relay`+`_notify`
-> 自动推群 → 同一份结论推两遍刷屏（实测 session ...644256：executor 转译播报 + 主人格 relay）。
-> 修复 = **执行体静默登记**：`_dispatch_via_kanban` 把 leaf-root 的 `root.id` 登进
-> `_INTERACTIVE_RELAY_ROOTS`（`mark_interactive_relay_root`），executor 在终态判定处 `_consume_interactive_relay`
-> **读即弃**地命中 → `no_broadcast=True`，完成/失败/审批分支一律不推群，交给主人格转述。
-> 无竞态关键：只有"任务已进终态"时 executor 才消费；主人格侧**等待超时**（`final is None`）会
-> `discard_interactive_relay_root` 撤销登记，让后台完成时的 executor 照常推群兜底（否则结论既没被
-> 转述、也没被播报，彻底消失）。**后台 kanban 定时 tick**（无主人格在场）从不登记 → 照常自动播报，
-> 行为不变。回执文案也改成"请你转述给用户"并显式禁止把 `res_/img_` 句柄写进给用户看的话
-> （配合 `send_chat_result._strip_resource_handles` 双保险，见 [§7.13](./07-tool-registry-and-agent.md)）。
+> 🔁 **交互式 `create_subagent` 不许双份播报**（2026-07-15 修；2026-10 群聊改为派完即走）。
+> `create_subagent(agent_profile=...)` 走 `_dispatch_via_kanban` 建**叶子根**、`kick_root` 后
+> **立刻返回 deferred ack**，主 session 放锁，群里其他人可以继续说话或再委派。结论只走
+> `_wake_main_agent_for_delivery` 回灌主人格，由主人格转述/发图。执行体把 leaf-root 登进
+> `_INTERACTIVE_RELAY_ROOTS` + `_DEFERRED_MAIN_DELIVERY_ROOTS`；终态时消费 deferred 才唤醒，
+> 不再 `_persona_relay` 推群。`create_by` 为 TEST 时同步等到终态，因为该入口等不到回灌。
+> 回灌帧带发起人。任何轮次发 `res_` 都跟当前 `ev.user_id` 对发起人，对不上、没有说话人或没有发起人记录就拒发；
+> 模型传入的 `user_id` 不能改收件人。回灌轮仍把 C 端 @ 钉在 `ev.user_id`。本帧已有主图则禁止再委派；
+> 同一条任务根在 180 秒内第 2 次回灌禁止再委派。同一发起人的另一条任务各自回灌，次数不共用。没有主会话的兜底通知不算回灌次数。群/频道排队**不受** `STALE_CHAT_REQUEST_TTL`（8s）丢弃：
+> 后到说话人只是在等共享 `_run_lock`，晚回优于静默；私聊同用户连发仍按 TTL 丢过期请求。
+> **后台 kanban 定时 tick**（无主人格在场）从不登记 → 照常自动播报。句柄禁止写进给用户看的话
+> （配合 `send_chat_result._strip_resource_handles`，见 [§7.13](./07-tool-registry-and-agent.md)）。
 
 内置 6 画像：`research_agent` / `code_agent` / `aigc_creator` / `data_analyst` /
 `memory_curator` / `scheduler_assistant` + 内部 `capability_evaluator`。业务画像（如
@@ -234,3 +239,27 @@ artifact 原文查回来，再用角色口吻转告主人。**严禁**自行 `we
 - `/api/ai/kanban/*`：5 列看板 / 详情 / 暂停 / 恢复 / 终止 / 审批 / 重派 / 评估触发（`webconsole/docs/35-kanban.md`）。
 - `/api/ai/artifacts/*` + `/api/ai/kanban/tasks/{id}/workspace/*`：Artifact Hub 与 Workspace 文件管理。
 - `/api/ai/capability-agents/*`：AgentNode CRUD（builtin/plugin/user/persona 四态，字段已 v2 化，`webconsole/docs/34-capability-agents.md`）。
+
+## 8.4 自主行动（`ai_core/autonomy/`）
+
+`ai_mode` 含「自主行动」时启用。它不替代定时巡检，也不替用户发消息。全进程一个
+APScheduler 任务 `ai_autonomy_tick`，每 5 分钟最多挑一个到期人格。
+
+到期条件：模式开着、范围不是 `disabled`、当前在 `active_hours` 内、聊天模型槽有空、
+预算允许、距上一行审计已过 `autonomy_interval_minutes`（15–720，默认 45）再乘 0.8–1.2。
+表是空的时，首次延迟 10–20 分钟。这些门没过不写审计行。底片是空的则写一行休息，不打模型。
+
+一轮四段：观察底片（好感达到 `autonomy_care_min_zone` 的用户，主人始终留下；群摘要）
+→ 一次性 Agent（`create_by="Autonomy"`，工具表关闭，思考轮数用全局 `multi_agent_lenth`）
+→ 只认成功工具的事实 → 交付。没做成事、或动力是休息，只记审计。
+
+交付三条：亲近或主人且对方没在说话，立刻把摘要发出去；熟人、配额满或对方正忙，挂到下次开口
+（4 小时，和定时任务的 300 秒合并槽分开）；自我探索只挂槽，不立刻发。模型点名的群或用户不在
+底片里，改成自我探索，不发到那个群。
+
+代跑命令固定 `user_pm = 6`，对象必须在本轮观察名单。发送工具和高危执行不挂。
+审计表只有 `aiautonomyactivity`。问过模型的一轮把 `session_id` 写进行里，会话日志来源是
+`Autonomy`；只记休息的行没有会话号。登录用户 `GET /api/autonomy/feed` 看各人格最近一行
+和分页记录，`GET /api/autonomy/{persona}/activities` 查单个人格。产出物页「自主行动」页签
+用的就是这条 feed。管理员 `POST /api/autonomy/{persona}/trigger_once` 可跳过作息、忙闲和冷却，
+仍受预算、模式和工具限制。

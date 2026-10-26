@@ -9,12 +9,14 @@ from typing import Any, Optional, Sequence
 from dataclasses import replace
 
 from pydantic_ai import RunContext
+from pydantic_ai.tools import Tool
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.rag.tools import search_tools, search_tools_by_domain
+from gsuid_core.ai_core.control.lines import FIND_TOOLS_GAP_NOTE
 from gsuid_core.ai_core.buildin_tools.visibility import (
     check_sched_create,
     check_sched_mutate,
@@ -31,10 +33,57 @@ from gsuid_core.ai_core.buildin_tools.find_tools_rank import (
 )
 
 FIND_TOOLS_LOADED_KEY = "find_tools_last_loaded"
-FIND_TOOLS_GAP_NOTE = (
-    "（系统：连续检索未暴露新工具。下一动：改 need 再检索，或委派通用调研。"
-    "禁止对用户讲检索过程、禁止念工具名、禁止说成「你要的东西不存在」。）"
-)
+
+
+def _registry_identity_names(need: str, rows: Sequence[tuple[str, str]]) -> list[str]:
+    """need 是工具名、插件名，或同一插件下的工具名前缀时，返回这些工具名。
+
+    含空白的句子不是标识符。短前缀打到多个插件时不挂。
+    """
+    needle = need.strip()
+    if not needle or any(ch.isspace() for ch in needle):
+        return []
+    if any(name == needle for name, _plugin in rows):
+        return [needle]
+    plugin_hits = [name for name, plugin in rows if plugin == needle]
+    if plugin_hits:
+        return plugin_hits
+    grouped: dict[str, list[str]] = {}
+    for name, plugin in rows:
+        if plugin and name.startswith(needle):
+            grouped.setdefault(plugin, []).append(name)
+    if len(grouped) != 1:
+        return []
+    plugin = next(iter(grouped))
+    if not needle.startswith(plugin):
+        return []
+    return grouped[plugin]
+
+
+def _identity_tools(need: str) -> list[Tool[ToolContext]]:
+    # capability_map 已把名字交给模型。向量库缺这个点时，按名字仍要挂上。
+    from gsuid_core.ai_core.register import get_all_tools
+
+    tools = get_all_tools()
+    rows = [(tb.name, tb.plugin) for tb in tools.values()]
+    out: list[Tool[ToolContext]] = []
+    for name in _registry_identity_names(need, rows):
+        out.append(tools[name].tool)
+    return out
+
+
+def _prepend_tools(
+    pinned: Sequence[Tool[ToolContext]],
+    found: Sequence[Tool[ToolContext]],
+) -> list[Tool[ToolContext]]:
+    seen = {tool.name for tool in pinned}
+    out: list[Tool[ToolContext]] = list(pinned)
+    for tool in found:
+        if tool.name in seen:
+            continue
+        seen.add(tool.name)
+        out.append(tool)
+    return out
 
 
 def _record_find_tools_round(extra: dict[str, Any], loaded: list[str]) -> bool:
@@ -66,6 +115,35 @@ def _node_hit(node_id: str, score: float) -> RankedHit | None:
         return None
     when = (node.when_to_use or "").strip() or node.display_name
     return RankedHit(name=node.node_id, label=when, score=score)
+
+
+def _node_plugin_ok(node_id: str, plugin: str) -> bool:
+    """锁定插件时，别的插件的代理不进回执。空插件名的通用节点保留。"""
+    from gsuid_core.ai_core.agent_node import get_node
+
+    node = get_node(node_id)
+    if node is None:
+        return False
+    owner = node.plugin
+    return owner == "" or owner == plugin
+
+
+def _pick_locked_tools(fold_names: list[str], plugin: str, route: str) -> list[str]:
+    """没有对口代理时，从锁定插件的 exclusive 工具里挑至多 4 个。"""
+    from gsuid_core.ai_core.register import find_tool_base
+
+    matched: list[str] = []
+    rest: list[str] = []
+    for name in fold_names:
+        tb = find_tool_base(name)
+        if tb is None or tb.plugin != plugin:
+            continue
+        if need_matches_tool_text(route, tb.retrieval_text, list(tb.covers)):
+            matched.append(name)
+        else:
+            rest.append(name)
+    chosen = matched if matched else rest
+    return chosen[:4]
 
 
 def _node_on_topic(need: str, node_id: str) -> bool:
@@ -253,7 +331,7 @@ def get_capability_gaps(limit: int = 20) -> list[tuple[str, int]]:
 
 # 不声明 capability_domain（会被 L3 按族驻留带进闲聊轮）；category 必须为 meta：
 # 落入 buildin 等保底分类会让渐进式暴露门控失效、加载的工具无人暴露（实测踩坑）。
-@ai_tools(category="meta")
+@ai_tools(category="meta", code_callable=False)
 async def find_tools(
     ctx: RunContext[ToolContext],
     need: str,
@@ -261,6 +339,7 @@ async def find_tools(
     """列表没有的能力必须先调：用一句话描述所缺能力。未调用前禁止说做不到/没装。
 
     每次都会检索，不因列表里已有工具而跳过。已暴露且真正对口的专用工具并入回执。
+    need 等于已注册工具名，或等于插件名（工具名前缀）时，直接挂上该工具。
     一次返回专用能力 / 专用工具 / 通用能力 / 通用工具；有专用项时禁止改用通用项。
     专用工具下一步可直接调；专用能力用 create_subagent(agent_profile=node_id)。
 
@@ -290,25 +369,43 @@ async def find_tools(
         visible_offered_set = set(visible_offered)
         offered_hits = [h for h in offered_hits if h.name in visible_offered_set]
 
-        family_tools = await search_tools_by_domain(
-            query=need,
-            domain_limit=3,
-            per_domain_limit=6,
-            exclude_names=offered_set,
-            scope=ctx.deps.tool_scope,
-        )
+        pinned = _identity_tools(need)
+        if _scope is not None and not _scope.is_open:
+            pinned = [tool for tool in pinned if _scope.tool_enabled(tool.name)]
+        identity_names = {tool.name for tool in pinned}
+
+        try:
+            family_tools = await search_tools_by_domain(
+                query=need,
+                domain_limit=3,
+                per_domain_limit=6,
+                exclude_names=offered_set,
+                scope=ctx.deps.tool_scope,
+            )
+        except RuntimeError as e:
+            if not pinned:
+                logger.warning(t("log.ai.find_tools_feature_enabled", e=e))
+                return "⚠️ 工具检索功能未启用，无法动态加载工具。"
+            family_tools = []
         from gsuid_core.ai_core.rag.tools import align_seeds_to_context_plugin
-        from gsuid_core.ai_core.entity_index import ALIAS_PLUGIN_EXTRA_KEY
+        from gsuid_core.ai_core.entity_index import ALIAS_ROUTE_TEXT_KEY, ALIAS_PLUGIN_EXTRA_KEY
 
         _alias_plugin = ""
         if ALIAS_PLUGIN_EXTRA_KEY in ctx.deps.extra:
             _raw_plugin = ctx.deps.extra[ALIAS_PLUGIN_EXTRA_KEY]
             if isinstance(_raw_plugin, str):
                 _alias_plugin = _raw_plugin
+        _route = need
+        if ALIAS_ROUTE_TEXT_KEY in ctx.deps.extra:
+            _raw_route = ctx.deps.extra[ALIAS_ROUTE_TEXT_KEY]
+            if isinstance(_raw_route, str) and _raw_route.strip():
+                _route = _raw_route.strip()
+        merged = _prepend_tools(pinned, family_tools)
         if _alias_plugin:
-            family_tools = await align_seeds_to_context_plugin(family_tools, _alias_plugin, need, ctx.deps.tool_scope)
+            merged = await align_seeds_to_context_plugin(merged, _alias_plugin, _route, ctx.deps.tool_scope)
         if _scope is not None and not _scope.is_open:
-            family_tools = [t for t in family_tools if _scope.tool_enabled(t.name)]
+            merged = [tool for tool in merged if _scope.tool_enabled(tool.name)]
+        family_tools = merged
         dedicated_tools: list[RankedHit] = list(offered_hits)
         generic_tools: list[RankedHit] = []
         fold_names: list[str] = []
@@ -331,7 +428,7 @@ async def find_tools(
                 # 向量已召回；词面过滤会丢掉「对比表出成图」这类 exclusive
                 fold_names.append(tool.name)
                 continue
-            if not need_matches_tool_text(need, retrieval, covers):
+            if tool.name not in identity_names and not need_matches_tool_text(need, retrieval, covers):
                 continue
             try:
                 run_ctx = replace(
@@ -383,6 +480,8 @@ async def find_tools(
                 continue
             if not _node_on_topic(need, node_id):
                 continue
+            if _alias_plugin and not _node_plugin_ok(node_id, _alias_plugin):
+                continue
             hit = _node_hit(node_id, float(2000 - idx))
             if hit is not None:
                 dedicated_agents.append(hit)
@@ -392,9 +491,39 @@ async def find_tools(
                 continue
             if not _node_on_topic(need, node_id):
                 continue
+            if _alias_plugin and not _node_plugin_ok(node_id, _alias_plugin):
+                continue
             hit = _node_hit(node_id, float(1500 - idx))
             if hit is not None:
                 dedicated_agents.append(hit)
+
+        if _alias_plugin and fold_names and not dedicated_agents:
+            folded_by_name = {tool.name: tool for tool in family_tools}
+            for idx, name in enumerate(_pick_locked_tools(fold_names, _alias_plugin, _route)):
+                tb = find_tool_base(name)
+                tool = folded_by_name[name] if name in folded_by_name else None
+                if tb is None or tool is None:
+                    continue
+                retries = tool.max_retries if tool.max_retries is not None else 1
+                try:
+                    run_ctx = replace(ctx, tool_name=name, retry=0, max_retries=retries)
+                except TypeError:
+                    run_ctx = ctx
+                try:
+                    tool_def = await tool.prepare_tool_def(run_ctx)
+                except Exception as e:
+                    logger.debug(t("log.ai.find_tools_prepare_treated_unavailable_fail", p0=name, e=e))
+                    tool_def = None
+                if not tool_def:
+                    continue
+                dedicated_tools.append(
+                    RankedHit(
+                        name=name,
+                        label=tool_brief(covers=list(tb.covers), description=tb.description),
+                        score=float(900 - idx),
+                    )
+                )
+                ctx.deps.alias_callable_tools.add(name)
 
         matched_ids = await _matched_capability_node_ids(need)
         for idx, node_id in enumerate(matched_ids):

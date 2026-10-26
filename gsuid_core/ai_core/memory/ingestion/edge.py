@@ -35,7 +35,7 @@ _DANGLING_FACT_RE = re.compile(
 _NEGATION_MARKERS = ("不", "没", "无", "非", "别", "讨厌", "拒绝", "反对", "停止")
 
 # 英文否定：词边界匹配，避免 note/nothing→"not"、"knows"→"no" 类误命中。
-# （BEAM 教训：仅中文标记时英文语料 "never/not/n't" 全漏检，C11 矛盾引擎从未触发。）
+# 否定词表必须含英文，否则纯英文语料里的 never/not/n't 全漏检，矛盾引擎从不触发。
 _NEGATION_RE_EN = re.compile(
     r"\b(never|not|no|none|without|refuse[sd]?|den(?:y|ies|ied)|stopped)\b|n't\b",
     re.IGNORECASE,
@@ -150,9 +150,7 @@ async def extract_and_upsert_edges(
     if not valid_edges:
         return
 
-    # C1 跨发言者归并：并行检索语义等价的既有 Edge（session 外执行，避免长时间持连接）。
-    # 同一 fact（相似度≥阈值）被不同 source 重复陈述时，归并到既有 Edge 并累加
-    # mention_count，而不再写入 N 条重复 Edge + 软删除。
+    # 跨发言者归并：检索语义等价的既有 Edge，相似度达标时归并并累加 mention_count。
     async def _find_mergeable_edge(fact: str, source_id: str, target_id: str) -> str:
         """返回可归并到的既有有效 Edge ID（同 src/tgt 且语义≥阈值），无则返回空串。"""
         try:

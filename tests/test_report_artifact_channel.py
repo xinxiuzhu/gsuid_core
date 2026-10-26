@@ -17,9 +17,7 @@ import pytest
 
 from gsuid_core.ai_core.utils import _report_footer, _extract_report_blocks
 
-# ─────────────────────────────────────────────
-# _extract_report_blocks
-# ─────────────────────────────────────────────
+# --- _extract_report_blocks ---
 
 
 def test_report_block_separated_from_persona_speech() -> None:
@@ -77,9 +75,7 @@ def test_plain_text_untouched() -> None:
     assert reports == []
 
 
-# ─────────────────────────────────────────────
-# _report_footer（生成来源 + 渲染入口溯源）
-# ─────────────────────────────────────────────
+# --- _report_footer（生成来源 + 渲染入口溯源） ---
 
 
 def test_footer_contains_agent_origin_and_render_fn() -> None:
@@ -92,9 +88,7 @@ def test_footer_contains_agent_origin_and_render_fn() -> None:
     assert "投资" not in footer
 
 
-# ─────────────────────────────────────────────
-# persona prompt 输出契约
-# ─────────────────────────────────────────────
+# --- persona prompt 输出契约 ---
 
 
 def test_system_constraints_teach_report_contract() -> None:
@@ -116,9 +110,7 @@ def test_system_constraints_teach_report_contract() -> None:
     assert "render_agent" in POST_TOOL_OUTPUT_CONTRACT
 
 
-# ─────────────────────────────────────────────
-# execute_scheduled_task：中性执行体 + 静默闸 + 溯源尾注
-# ─────────────────────────────────────────────
+# --- execute_scheduled_task：中性执行体 + 静默闸 + 溯源尾注 ---
 
 
 class _StubLogger:
@@ -204,6 +196,7 @@ def executor_env(monkeypatch: pytest.MonkeyPatch) -> dict:
 @pytest.mark.anyio
 async def test_executor_uses_neutral_prompt_not_persona(executor_env: dict) -> None:
     """执行体必须用中性 prompt，不注入 persona（§4："发不发"在无人格上下文中判定）。"""
+    from gsuid_core.ai_core.base_prompts import FRAMEWORK_CORE_CONSTRAINTS
     from gsuid_core.ai_core.scheduled_task.executor import (
         SCHEDULED_TASK_EXECUTOR_PROMPT,
         execute_scheduled_task,
@@ -213,7 +206,10 @@ async def test_executor_uses_neutral_prompt_not_persona(executor_env: dict) -> N
     await execute_scheduled_task("scheduled_task_test01")
 
     kwargs = executor_env["create_agent_kwargs"]
-    assert kwargs["system_prompt"] == SCHEDULED_TASK_EXECUTOR_PROMPT
+    prompt = kwargs["system_prompt"]
+    assert isinstance(prompt, str)
+    assert prompt.startswith(SCHEDULED_TASK_EXECUTOR_PROMPT.rstrip())
+    assert FRAMEWORK_CORE_CONSTRAINTS in prompt
     assert kwargs["persona_name"] is None
     # 中性 prompt 本身必须写明静默硬约束
     assert "<SILENCE>" in SCHEDULED_TASK_EXECUTOR_PROMPT

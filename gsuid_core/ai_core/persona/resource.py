@@ -25,16 +25,8 @@ _voice_anchor_cache: Dict[str, str] = {}
 # Tone Markers 词表缓存；人格 md 变更时随 voice_anchor 一起清
 _tone_marker_cache: Dict[str, Tuple[str, ...]] = {}
 
-# 兜底正则：从 persona.md 抓取最具描述性的一行作为口吻锚点。
-# 优先级：Style (风格) 块 > Tone Markers (语气词) 块 > Identity 行。
-# 设计参考 ``persona/prompts.py`` 的 ``sayu_persona_prompt`` / CHARACTER_BUILDING_TEMPLATE。
-#
-# 两种书写格式都支持：
-#   - 块形式：``Style (风格):\n        <content>\n        <content>``
-#   - 行内形式：``Style (风格): <content>``（如爱弥斯人格）
-# 块正则用 ``^(\s*)<header>:\n((?:\1[ \t]+...)+)`` 的形式：内容行必须比 header
-# **更深**一级缩进，避免捕到下一个同级 section header（如 ``Style (风格):``
-# 紧跟 ``Tone Markers (语气词):`` 时不串行）。
+# 从 persona.md 提取口吻锚点正则，按 Style 块 > Tone Markers 块 > Identity 行优先级解析。
+# 支持缩进块格式与单行行内格式。
 _STYLE_BLOCK_RE = re.compile(
     r"^([ \t]*)Style\s*\(\s*风格\s*\)\s*:[ \t]*\n((?:\1[ \t]+[^\n]+\n?)+)",
     re.IGNORECASE | re.MULTILINE,
@@ -55,6 +47,8 @@ _IDENTITY_RE = re.compile(r"Identity\s*:[ \t]*([^\n]+)", re.IGNORECASE)
 
 _TONE_SKIP_LINE_PREFIXES: Tuple[str, ...] = (
     "配额",
+    "禁忌",
+    "表达禁忌",
     "[SLOT:",
     "如：",
     "如:",
@@ -69,9 +63,7 @@ _TONE_SPLIT_RE = re.compile(r"[、，,/|;；\s]+")
 _TONE_PUNCT_ONLY_RE = re.compile(r"^[\s…。.．!！?？~～、,，'\"“”‘’·\-—]+$")
 _TONE_TRAIL_PUNCT = "…。.．!！?？~～、,， "
 
-# compact persona 抽取：心跳决策只需要"我是谁 / 怎么说话 / 何时开口"四要素，
-# 不需要工具协议、好感度梯度、触发例等执行细节。下列正则与上方块/行版本
-# 配套使用，行匹配优先级 Name / Identity / Interest 顺序。
+# compact persona 抽取正则：提取 Name、Identity 与 Interest，供心跳轻量决策使用。
 _NAME_RE = re.compile(r"Name\s*:[ \t]*([^\n]+)", re.IGNORECASE)
 _INTEREST_RE = re.compile(r"Interest\s*:[ \t]*([^\n]+)", re.IGNORECASE)
 # Presence 块下面常见两行：感兴趣的话题、主动发言示例。这两行最能帮 Heartbeat
@@ -80,6 +72,9 @@ _PRESENCE_TOPIC_RE = re.compile(r"感兴趣的话题\s*[：:][ \t]*([^\n]+)")
 _PRESENCE_EXAMPLE_RE = re.compile(r"主动发言示例\s*[：:][ \t]*([^\n]+)")
 
 # 跳过模板占位符 / 通用说明 / 示例 / 元提示行（这些不是真正的"风格描述"）
+# 口吻锚只要节奏，不要「被叫 X 会 Y」这类触发句（每轮催演会变成人机腔）。
+_TRIGGER_CLAUSE_RE = re.compile(r"被叫|一被|有人叫")
+
 _META_LINE_PREFIXES: Tuple[str, ...] = (
     "举出",
     "举例",
@@ -117,6 +112,14 @@ def _pick_concrete_line(block: str) -> str:
     return max(candidates, key=len) if candidates else ""
 
 
+def _strip_trigger_clauses(text: str) -> str:
+    """丢掉「被叫 / 一被 / 有人叫」触发句，只留风格节奏。"""
+    if not text:
+        return ""
+    kept = [p for p in re.split(r"(?<=[。！？])", text) if p.strip() and not _TRIGGER_CLAUSE_RE.search(p)]
+    return "".join(kept).strip()
+
+
 def _extract_voice_anchor_from_persona(persona_text: str) -> str:
     """从人格文本中正则提取一行作为兜底口吻锚点。
 
@@ -129,14 +132,16 @@ def _extract_voice_anchor_from_persona(persona_text: str) -> str:
     # Style: 块形式优先，回退行内形式
     style_match = _STYLE_BLOCK_RE.search(persona_text)
     if style_match:
-        line = _pick_concrete_line(style_match.group(2))
+        line = _strip_trigger_clauses(_pick_concrete_line(style_match.group(2)))
         if line:
             return line
     style_inline = _STYLE_INLINE_RE.search(persona_text)
     if style_inline:
         line = style_inline.group(1).strip()
         if line and "[SLOT:" not in line:
-            return line
+            line = _strip_trigger_clauses(line)
+            if line:
+                return line
 
     # Tone Markers: 块形式优先，回退行内形式
     tone_match = _TONE_BLOCK_RE.search(persona_text)
@@ -317,10 +322,7 @@ def extract_compact_persona(persona_text: str) -> str:
     return "\n".join(sections)
 
 
-# voice_anchor 显式手调入口的文件名。
-# 不再放进 ``config.json`` —— 后者由 ``StringConfig`` 用严格的 ``Dict[str, GSC]``
-# schema 加载, 任何非结构化字段会直接触发 ``update_config -> repair_config``
-# 死循环 (历史上早柚的 voice_anchor 裸字符串就栽过这个坑)。
+# voice_anchor 显式配置独立存储为文本文件，避免破坏 config.json 结构体校验。
 _VOICE_ANCHOR_FILENAME = "voice_anchor.txt"
 
 
@@ -456,7 +458,7 @@ def get_voice_anchor(persona_name: Optional[str]) -> str:
 
     解析优先级：
     1. ``voice_anchor.txt`` 显式手调入口（最高优先级；与 persona 可变配置
-       物理解耦, 不会被 ``StringConfig`` 当成结构化项校验）。
+       物理解耦, 不会被 ``StringConfig`` 当成结构化项校验）。返回前丢掉触发句。
     2. 字段缺失时，从同目录 ``persona.md`` 用正则提取最有用的一行
        （``Style (风格):`` > ``Tone Markers (语气词):`` > ``Identity:``）。
     3. 两者都拿不到 → 返回空串（``handle_ai.py`` 会跳过锚点注入）。
@@ -468,7 +470,7 @@ def get_voice_anchor(persona_name: Optional[str]) -> str:
     if persona_name in _voice_anchor_cache:
         return _voice_anchor_cache[persona_name]
 
-    anchor = _load_voice_anchor_from_disk(persona_name)
+    anchor = _strip_trigger_clauses(_load_voice_anchor_from_disk(persona_name))
     _voice_anchor_cache[persona_name] = anchor
     return anchor
 
@@ -497,9 +499,13 @@ async def save_persona(char_name: str, profile_content: str) -> None:
         profile_content: 角色资料内容（Markdown格式）
     """
     persona = Persona(char_name)
+    existed = persona.exists()
     await persona.save_content(profile_content)
-    # persona.md 变更后，可能改变正则兜底出的口吻锚点，清缓存让下次重读
     invalidate_voice_anchor_cache(char_name)
+    if not existed:
+        from gsuid_core.ai_core.meme.pack_model import mount_default_pack
+
+        await mount_default_pack(char_name)
 
 
 async def load_persona(char_name: str) -> str:
@@ -595,7 +601,7 @@ def allocate_copy_name(source_name: str, occupied: set[str]) -> str | None:
     return None
 
 
-def copy_persona(source_name: str) -> str:
+async def copy_persona(source_name: str) -> str:
     """复制整个人格目录（含 md / 媒体 / config.json / persona.json）。
 
     新目录名为 ``{源名}2`` 起的第一个空位。副本 ``scope`` 强制 ``disabled``，
@@ -631,11 +637,14 @@ def copy_persona(source_name: str) -> str:
     cfg = persona_config_manager.get_config(dest_name)
     if not cfg.set_config("scope", "disabled"):
         logger.warning(t("log.persona.persona_copy_scope_fail", persona_name=dest_name))
+    from gsuid_core.ai_core.meme.pack_model import mount_default_pack
+
+    await mount_default_pack(dest_name)
     logger.info(t("log.persona.persona_copied", source=source_name, dest=dest_name))
     return dest_name
 
 
-def delete_persona(char_name: str) -> bool:
+async def delete_persona(char_name: str) -> bool:
     """
     删除角色资料和相关文件
 
@@ -661,9 +670,13 @@ def delete_persona(char_name: str) -> bool:
     except (ValueError, PathEscapeError):
         return False
     deleted = persona.delete()
-    if deleted:
-        invalidate_voice_anchor_cache(char_name)
-    return deleted
+    if not deleted:
+        return False
+    from gsuid_core.ai_core.meme.pack_model import PackStore
+
+    await PackStore.delete_binds_for_persona(char_name)
+    invalidate_voice_anchor_cache(char_name)
+    return True
 
 
 def get_persona_metadata(char_name: str) -> dict:

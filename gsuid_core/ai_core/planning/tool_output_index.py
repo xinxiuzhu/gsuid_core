@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence
 
-from qdrant_client.models import (
+from gsuid_core.ai_core.rag.qmodels import (
     Filter,
     Distance,
     Modifier,
@@ -47,9 +47,7 @@ async def ensure_tool_output_collection() -> None:
     try:
         dim = get_strict_dimension() or get_dimension()
         exists = await client.collection_exists(TOOL_OUTPUT_COLLECTION)
-        # 维度不符必须重建：只按「存在就跳过」会让旧维度集合长期留着，运行时
-        # 每次检索都撞 "expected dim: 512, got 768" 并降级为空。工具产物向量是
-        # 「落盘文件 + SQL」的可再生产物，重建后由索引流程重新写入。
+        # 向量维度不符时重建集合，工具产物向量可从落盘文件重新索引写入。
         if exists and await collection_vector_mismatched(TOOL_OUTPUT_COLLECTION, dim, TOOL_OUTPUT_DENSE):
             logger.warning(t("log.ai.tool_output_index_dimension_mismatch_rebuild", p0=dim))
             await force_recreate_collection(
@@ -116,8 +114,7 @@ async def search_tool_outputs(
     # fail-closed：无 owner 不扫全局向量
     if not owner_user_id:
         return []
-    dense_list = list(await embedding_model.aembed([query]))
-    dense = dense_list[0]
+    dense = await embedding_model.aembed_query(query)
     sparse = await sparse_embed_single(query)
     must_conditions: list = [
         FieldCondition(key="owner_user_id", match=MatchValue(value=owner_user_id)),
@@ -152,7 +149,7 @@ async def delete_tool_output_index(record_ids: Sequence[str]) -> None:
     if client is None or not ids:
         return
     try:
-        from qdrant_client.models import MatchAny
+        from gsuid_core.ai_core.rag.qmodels import MatchAny
 
         await client.delete(
             collection_name=TOOL_OUTPUT_COLLECTION,

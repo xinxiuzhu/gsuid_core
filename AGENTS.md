@@ -28,9 +28,11 @@ GsCore（早柚核心 / `gsuid-core`）是 **FastAPI + WebSocket + APScheduler**
 ├── ruff.toml                 # line-length=120，lint E/F/I/W
 ├── pyrightconfig.json        # basic；排除 plugins / data
 ├── .agents/skills/           # 开发文档 Skill（给 Agent 按任务加载）
-├── docs/                     # 专题设计 / 历史评审（非入门）
+├── docs/                     # 已落地的专题说明（生命周期 / Takumi 等）
+├── plans/                    # 方案设计文档。新方案写这里，不进 git
 ├── gsuid_core/               # 框架包
 │   ├── core.py               # 进程入口
+│   ├── supervisor.py         # 守护父进程：拉起 core 子进程，子进程以 51 退出时原地重拉
 │   ├── app_life.py           # FastAPI lifespan / 两阶段钩子
 │   ├── server.py / gss.py    # 插件加载、连接、钩子注册表
 │   ├── meta_plugins.py       # 基础设施插件先加载，并把 <包>.api 挂到 sys.modules
@@ -46,6 +48,7 @@ GsCore（早柚核心 / `gsuid-core`）是 **FastAPI + WebSocket + APScheduler**
 │   └── ai_core/              # AI 子系统（见下）
 ├── tests/                    # pytest
 ├── eval/                     # 实机评测（打运行中的 core，不要进程内重建世界）
+├── changelogs/               # 每版一个 md：`CHANGELOG.md` 索引 + `<版本>.md`（见「变更记录」）
 └── data/                     # 运行时生成：配置 / DB / 日志 / AI 状态（不进 git）
 ```
 
@@ -60,6 +63,7 @@ GsCore（早柚核心 / `gsuid-core`）是 **FastAPI + WebSocket + APScheduler**
 | `register.py` | `@ai_tools` / 工具注册表 / `ai_alias` / `ai_entity` / `ai_skill` |
 | `output_gate.py` | `pre_send_gate`（尖括号 → OOC） |
 | `context_assembly.py` | system prompt + 每轮注入的唯一装配点 |
+| `control/lines.py` | 当轮 user 侧控制句只在这里定义（§1.11） |
 | `memory/` `rag/` `persona/` `heartbeat/` `planning/` | 记忆 / 知识库 / 人设 / 巡检 / 长任务 |
 
 更细的模块图与消息总链路：`.agents/skills/gscore-development/references/01-architecture-and-modules.md`。
@@ -77,8 +81,11 @@ GsCore（早柚核心 / `gsuid-core`）是 **FastAPI + WebSocket + APScheduler**
 | 查 AI Core 给插件的 API 签名 | [gscore-ai-core-api](.agents/skills/gscore-ai-core-api/SKILL.md) |
 | 写平台适配器（WS 协议 / MessageReceive） | [gscore-adapter-development](.agents/skills/gscore-adapter-development/SKILL.md) |
 | 部署 / Docker / WebConsole / WS_TOKEN | [gscore-deploy](.agents/skills/gscore-deploy/SKILL.md) |
+| 写用户可见文字（更新日志 / 文档 / 报错 / 注释） | [human-talk](.agents/skills/human-talk/SKILL.md) |
 
-`docs/` 里还有生命周期、记忆系统、Takumi 出图等专题（见各 Skill「关联文档」）。改核心机制后同步对应章节。
+`docs/` 里还有生命周期、记忆系统、Takumi 出图等已经落地的专题（见各 Skill「关联文档」）。改这些机制后，同步 `docs/` 里对应的章节。
+
+新的方案设计文档应写在 `plans/`，不应再写入 `docs/`。一次设计一份文件。`plans/` 在 `.gitignore` 里，不提交。已经在 `docs/` 里的专题说明仍留在原地，不为同一份说明再在 `plans/` 复制一份。
 
 ## Setup commands
 
@@ -116,6 +123,11 @@ uv run core --port 8765
 
 碰装配 / 闸门 / 每轮注入 / 启动顺序时，单测全绿不够，还要对照 `eval/agent` 群聊基准。
 
+依赖锁文件 `uv.lock` / `poetry.lock` / `pdm.lock` 以 `uv.lock` 为准，版本线见 `.pre-commit-config.yaml`。
+重解 poetry.lock 只用约定的 2.5.1：`uv tool run --from "poetry==2.5.1" poetry lock`；本机 PATH 上的旧
+poetry（2.1.4）读不出 `[dependency-groups]`，会把 dev 组（pytest / ruff / basedpyright / pre-commit）
+从锁里丢掉，并误报 `pyproject.toml changed significantly`。校验用同一个 2.5.1：`poetry check --lock`。
+
 ## Testing
 
 - 测试在 `tests/`，`pytest`，文件 `test_*.py`。默认收集面必须离线、无 LLM。
@@ -125,6 +137,34 @@ uv run core --port 8765
 - 改交互脚手架必须跑 `tests/test_interaction_scaffold.py`（正反双向）。
 - 改工具 docstring / covers：`tests/test_ai_tool_docstrings.py`。
 - 框架 `logger.*` 必须走 `t()` / `i18n_t()`，**第一参必须是静态字符串 key**（`log.<module>.<semantic>`）；禁止三元 / 拼接 / 变量当 key。改日志或 locale 必须跑 `tests/test_logger_i18n.py`（即 `.github/workflows/i18n.yml`）。
+
+## 变更记录（CHANGELOG）
+
+`changelogs/` 里**每个版本一个文件**：`CHANGELOG.md` 是索引与约定，`<版本>.md` 是该版正文。
+
+- **动手前** 先翻相关版本的 `<版本>.md`，确认这次改动不与既有设计冲突。版本边界以 `pyproject.toml` 的 `version` 变动为准。升版打开这一版：之后的提交写入当前版本文件，直到下一次升版；不要为同一版本号另开 `-unreleased`。
+- **动手后** 判断这次改动**够不够格进更新日志**。判断标准：
+
+| 要记 | 不用记 |
+|------|--------|
+| 新增能力、新增命令 / 工具 / 配置项 | 修错字、改文案、调格式、调边距 |
+| 对外行为变化（默认值、返回结构、调用方式） | 纯内部重构、类型守卫收窄（isinstance 等） |
+| 破坏性变更、依赖 / 部署要求变化 | 补测试、注释、docstring |
+| 可量化的性能变化 | 日志文案微调、未发布特性的中间临时修补 |
+
+> **小修小补不进更新日志。** 上面右列的改动不用写条目——写满了反而没人看。拿不准就问自己「使用者能感知到这个变化吗」，感知不到就不写。
+
+- **特性聚合（就近合并，禁止线性堆叠）** 同一功能在当前版本的多次修改或后续完善，**必须就近合并进已有条目**，只在条目末尾追加 commit 短号（如 `[sha1](https://github.com/Genshin-bots/gsuid_core/commit/sha1) [sha2](https://github.com/Genshin-bots/gsuid_core/commit/sha2)`），禁止按提交流水账追加新条目。单次任务 / 单个 commit **最多只允许新增或修改 1~2 条**。
+- **写了怎么写** 按 [human-talk](.agents/skills/human-talk/SKILL.md) 的受控中文：一句话一件事、写清执行者、不用「优化 / 完善 / 若干 / 显著」这类空词（要写就写具体对象或数字）、数字必须带条件。
+- **字数与细节限制** 每条正文（不计链接）**控制在 80 字以内**，严禁超过 120 字。只讲影响与用法，**禁止在日志里罗列代码实现细节**（不抄全量词表、算法步长、切帧参数、内部数据结构字段）。
+- **链接格式** ``[`短号`](https://github.com/Genshin-bots/gsuid_core/commit/短号)``，链接要能打开。
+- **链接可以先欠着** 改完就写条目，别等提交。commit 短号拿到之前，条目末尾可以不挂链接——先落地比先提交更常见。
+- **每次动 `changelogs/` 都要回填** 把目标 `<版本>.md` 里**所有没有链接的条目**逐条查一遍（`grep '^- ' changelogs/<版本>.md | grep -v 'commit/'`）：对应改动**已经提交**的，用 `git log --oneline -S'<改动关键词>'` 找到短号补上；**还没提交**的原样留着，别编链接。条目先落地、链接滚动补齐。
+
+> **别写占位符。** `core更新记录` 卡片只把 commit 链接本身剥掉（`core_update_history/changelog.py` 的 `_plain`），`[待补]`、`<待补>`、HTML 注释都会原样显示给用户。**「没有链接」本身就是待回填的标记**，不需要额外写东西。
+
+- **emoji** 沿用仓库自己的 commit emoji 约定（`✨` 新增 / `🐛` 修复 / `🎨` 调整 / `⚡` 性能 / `💥` 破坏性 / `🔒` 安全 …），清单见 `changelogs/CHANGELOG.md`。
+- **新版本** 在 `pyproject.toml` 升 `version` 时，同步新建 `changelogs/<新版本>.md`，并在 `CHANGELOG.md` 索引表加一行。之后的提交写入该新文件。已经低于当前 `version` 的文件**只增不改**（历史记录不是当前状态的说明书）；确实写错了可以改，但要在当前版本条目里说明。
 
 ## 交付闸（改完必须过，否则不算完成）
 
@@ -237,7 +277,7 @@ async def handle(msg): ...
 
 改 `ai_core` 会话 / Agent loop / history 时**绝对禁止**破坏 provider 前缀缓存：
 
-1. **禁止中途改写 `system_prompt` 字符串**（会话内默认 TTL=inf）。需要系统提醒 → 只向**当前 request 追加 `UserPromptPart`**，落盘前 `_relean` 剥掉（`（系统：` / `（系统校验：` 等）。
+1. **禁止中途改写 `system_prompt` 字符串**（会话内默认 TTL=inf）。需要系统提醒 → 只向**当前 request 追加 `UserPromptPart`**，落盘前 `_relean` 剥掉（`（系统：` / `（系统校验：` 等）。句子正文只在 `control/lines.py` 写一次（§1.11）。
 2. **禁止砍 history 头部**（`history[-n:]` 式 compact）。须用 `compact_session_history` / 保头裁中段；禁止把锚点消息插回头部。
 3. **动态 per-turn 内容**（mood / 关系 / 记忆 / 精确时间）进 **user 侧**，不进 system。
 
@@ -322,6 +362,31 @@ rewritten = await self._ooc_recover_persona_voice(hit, original, ev)  # 空串 =
 
 改完必须把「交付闸」跑绿（ruff / format / `pytest tests` / basedpyright，以及 CI 的 i18n）。
 缺项或失败不许说做完。`i18n_t()` / `t()` 的 key 必须是静态字符串，禁止三元表达式。
+
+### 1.11 当轮控制句只定义一次（`control/lines.py`）
+
+仍插进**当前 request 的 user 侧**、落盘前剥掉的句子，正文只写在
+`gsuid_core/ai_core/control/lines.py`。调用处 `import` 这个名字。
+程序靠开头对上历史、或用 `is` 认出同一句时，用的就是这份对象。再抄一份字面量，对不上。
+
+写在这个文件里：
+
+- 前缀是 `（系统：` / `（系统提示：` / `（系统校验：` / `⛔` 的当轮提醒。闸门打回的开头收在 `GATE_NUDGE_MARKERS`，全文和开头是同一份常量。
+- 程序用来切正文或判定寻址的记号：`--- 消息 ---`、`（直接找你说的）`、`（@的是这位用户，不是你）`、引用记号。
+- 要填运行时槽位的，写成同文件里的函数：`capability_hit_line`、`master_title_ban_line`、`repetition_line`、`alias_binding_line`、`quote_object_line`、`ownership_line`、`delivery_wake_line`。
+
+留在原处：
+
+- 提示词组默认正文（跟进、记忆问答、寻址说明）留在 `interaction_scaffold.py`，目录在 `prompt_group/catalog.py`。用户改的是提示词组；改句子改不了「这条什么时候插入」。
+- 绑在某条义务上的观察留在 `control/corrections.py`，和 `Obligation` 放一起。
+- 只用来从旧历史里认出并剥掉、当前不再插入的句子，留在认出它的文件：`agent_run/support.py` 的假完成 / 零工具，`agent_run/speech_policy.py` 里三句旧打回。这两处不再加新的当轮句子。
+- `<control>` 信封，以及子 Agent / 评测器 / 识图自己的 system 提示，留在各自的渲染处。
+
+`lines.py` 是叶子：不 import `agent_run`、`utils`、`output_gate`、`interaction_scaffold`。
+这些句子仍走 §1.7：只追加到当前 request，不改 `system_prompt`，入史前剥掉。
+不放进提示词组字段，也不放进插件配置。
+
+详见 `gscore-development` §6.7.3。
 
 ---
 
@@ -595,6 +660,7 @@ AI 核心模块，位于 `gsuid_core/ai_core/`，包含：
 | `rag/` | RAG 知识库系统 |
 | `scheduled_task/` | 定时任务系统 |
 | `persona/` | 人设系统 |
+| `control/` | 控制面 `Directive`；当轮 user 侧句子只在 `lines.py`（§1.11） |
 | `history/` | 对话历史管理 |
 | `web_search/` | 统一网页搜索（Tavily/Jina/Exa/AnySearch/Firecrawl/MCP + 多源策略） |
 | `web_fetch/` | 网页抓取转 Markdown（Jina Reader / local + 多源策略） |
@@ -764,5 +830,8 @@ bot = Bot(_bot, mock_ev)
 6. **Bot 类型 → 插件/触发器用 `Bot`（高层），框架内部用 `_Bot`（底层），禁止混用**
 7. **注释精简 → `#` 注释最多两行、每行 ≤88 字，只写「为什么/坑/边界」，不复述代码**
 8. **交付闸 → ruff / format / pytest / basedpyright（及 CI 的 i18n）全绿才允许说做完**
+9. **用户可见文字 → 写前查 `changelogs/`，写后按 human-talk 判断要不要记更新日志（小修小补不记）**
+10. **当轮控制句 → 只在 `control/lines.py` 写一次，调用处 import（§1.11）**
+11. **方案设计文档 → 新方案写 `plans/`，不写 `docs/`。`docs/` 只改已经落地的专题说明**
 
 专题细节按 Skills 表按需加载，不要把整本 `references/` 一次读完。

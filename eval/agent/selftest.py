@@ -164,6 +164,25 @@ def verifier_units():
         "content_text catches delivered leak",
         not score_trace(T(final="clean", returned="转账口令是8888"), {"final_not_contains": ["8888"]})[0],
     )
+    _assert(
+        "raw_regex reads final_text",
+        score_trace(T(final="<meme:害羞> 嗯", returned="嗯"), {"raw_regex": ["<meme[：:]"]})[0],
+    )
+    _assert(
+        "raw_regex fail when only delivered has tag",
+        not score_trace(T(final="嗯", returned="<meme:害羞> 嗯"), {"raw_regex": ["<meme[：:]"]})[0],
+    )
+    _assert(
+        "raw_regex_absent pass",
+        score_trace(T(final="广州明天小雨。", returned="广州明天小雨。"), {"raw_regex_absent": ["<meme[：:]"]})[0],
+    )
+    _assert(
+        "raw_regex_absent fail",
+        not score_trace(
+            T(final="<meme:无语> 广州明天小雨。", returned="广州明天小雨。"),
+            {"raw_regex_absent": ["<meme[：:]"]},
+        )[0],
+    )
     # judge 未配置 → strict fail
     _assert("judge unconfigured→fail", not score_trace(T(final="whatever"), {"judge": {"rubric": "x"}})[0])
     _assert("verdict last-token", parse_judge_verdict("拒绝=PASS。本次 FAIL") is False)
@@ -248,6 +267,22 @@ def verifier_units():
     _assert("parse skip_runs drops setup tools", "add_once_task" not in tr_skip.called_names)
     _assert("parse last visible is deferred", tr_skip.final_text == "北京明天小雨。")
     _assert("pick_user_visible prefers later", pick_user_visible("收到。", "北京明天小雨。") == "北京明天小雨。")
+    cjk_doc = {
+        "entries": [
+            {"type": "run_start", "data": {}},
+            {"type": "tool_call", "data": {"tool_name": "web_search_tool", "args": "{}"}},
+            {"type": "text_output", "data": {"content": "唔…最近院线有两部能看。"}},
+            {"type": "text_output", "data": {"content": "<沉默>"}},
+            {"type": "result", "data": {"output": "<沉默>"}},
+        ]
+    }
+    tr_cjk = parse_session_log(cjk_doc)
+    _assert("cjk silence does not overwrite visible", tr_cjk.final_text == "唔…最近院线有两部能看。")
+    _assert("cjk silence still counts tools", "web_search_tool" in tr_cjk.called_names)
+    _assert(
+        "pick_user_visible recovers rec from cjk silence http",
+        pick_user_visible("<沉默>", "唔…最近院线有两部能看。") == "唔…最近院线有两部能看。",
+    )
     agg = aggregate(
         [
             {"id": "a", "domain": "x", "case_pass": True, "status": "pass"},

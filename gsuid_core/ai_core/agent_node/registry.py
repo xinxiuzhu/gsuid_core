@@ -6,6 +6,7 @@
 两类节点经 ``get_node`` / ``list_nodes`` 对外呈现为同一张表。
 """
 
+import re
 import inspect
 from typing import Dict, List, Optional
 from pathlib import Path
@@ -207,7 +208,7 @@ def format_capability_roster(persona_name: str | None = None) -> str:
     nodes: list[AgentNode] = list_persona_capability_nodes(persona_name)
     from gsuid_core.ai_core.configs.ai_config import ai_config
 
-    cap = int(ai_config.get_config("capability_roster_max").data)
+    cap = int(ai_config.get_config("capability_roster_line_max").data)
     lines: list[str] = []
     for node in nodes:
         when = (node.when_to_use or "").strip()
@@ -216,6 +217,11 @@ def format_capability_roster(persona_name: str | None = None) -> str:
 
             logger.warning(t("log.agent.capability_node_missing_when", node=node.node_id))
             when = "专业任务"
+        else:
+            # 提炼核心意图描述：截取首分句，去除出图与交付规则等冗余长套话
+            first_clause = re.split(r"[；;（(。]", when)[0].strip()
+            if first_clause:
+                when = first_clause
         prefix = f"- `{node.node_id}`："
         line = prefix + when
         if cap > 0 and len(line) > cap:
@@ -223,13 +229,9 @@ def format_capability_roster(persona_name: str | None = None) -> str:
         lines.append(line)
     if not lines:
         return ""
-    return (
-        "（可用能力代理——须 "
-        '`create_subagent(agent_profile="<node_id>", task=...)` 委派，'
-        "agent_profile 只填下列 node_id，禁止自造名字：\n"
-        + "\n".join(lines)
-        + "\n提醒的增删改查在主会话；禁止声称没有对应工具。）"
-    )
+    from gsuid_core.ai_core.prompt_group.store import render_prompt
+
+    return render_prompt(persona_name, "roster_wrap", lines="\n".join(lines))
 
 
 def owning_nodes_of_tools(tool_names: List[str]) -> Dict[str, List[str]]:

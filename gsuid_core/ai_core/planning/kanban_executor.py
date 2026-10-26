@@ -34,7 +34,14 @@ from gsuid_core.ai_core.control.directive import Directive
 
 from . import kanban
 from .models import AIAgentTask, AIAgentTaskLog, AIAgentArtifact
-from .runtime import PlanRunContext, bind_plan_context, reset_plan_context
+from .runtime import (
+    PlanRunContext,
+    bind_plan_context,
+    bind_delivery_root,
+    reset_plan_context,
+    reset_delivery_root,
+    current_delivery_root_id,
+)
 from .workspace import put_artifact, ensure_workspace
 
 _VALID_USER_TYPES = ("group", "direct", "channel", "sub_channel")
@@ -376,7 +383,7 @@ async def _persona_relay(
                 "「交给谁发」、流程说明。"
             )
 
-        base: str = await build_persona_prompt(task.persona_name)
+        base: str = await build_persona_prompt(task.persona_name, include_meme_protocol=False)
         # 启用 SubAgent 日志：转译过程要进 generator_log_files，由 emitter
         # 挂到主 session 的 linked_agents 上做事后审计。
         relay_session_id: str = f"kanban_relay_{task.id[:8]}_{int(time.time())}"
@@ -427,8 +434,7 @@ async def _persona_relay(
         logger.debug(t("log.ai.kanban_persona_rendition_code_fail", e=e))
         return _sanitize_for_user(raw_result), relay_log_files
     finally:
-        # 无论成功 / 异常，关闭转译 SubAgent logger；relay_log_files 在 return 表达式求值后才被 append（list 是引用
-        # append 对返回值同样可见）。
+        # 无论成功或异常，均记录并关闭转译 SubAgent 的 logger。
         if relay_logger is not None:
             relay_log_files.append(str(relay_logger._file_path))
             relay_logger.close()
@@ -563,9 +569,12 @@ def _format_delivery_for_main_agent(task: AIAgentTask, raw_result: str, arts: Li
         primary = arts[0].id
         primary_is_image = bool((arts[0].mime or "").startswith("image/"))
 
+    owner = (task.owner_user_id or "").strip()
     parts = [
         f"【子任务交付】任务#{task.ordinal}「{task.display_name}」已完成。",
     ]
+    if owner:
+        parts.append(f"发起人：`@{owner}`。本帧产物只发给该发起人，禁止改 user_id，禁止发送其它任务的句柄。")
     if cards:
         parts.append("产物句柄卡：")
         parts.extend(cards)
@@ -580,6 +589,53 @@ def _format_delivery_for_main_agent(task: AIAgentTask, raw_result: str, arts: Li
 _delivery_pending: dict[str, tuple[AIAgentTask, str]] = {}
 _delivery_flush_tasks: dict[str, asyncio.Task] = {}
 _DELIVERY_COALESCE_SEC = 0.45
+_DELIVERY_WAKE_WINDOW_SEC = 180.0
+_DELIVERY_WAKE_MAX = 2
+_delivery_wake_hits: dict[str, list[float]] = {}
+
+
+def _delivery_wake_key(session_id: str, root_id: str) -> str:
+    return f"{session_id}|{root_id}"
+
+
+def _prune_delivery_wake_hits(key: str, now: float) -> list[float]:
+    hits = _delivery_wake_hits[key] if key in _delivery_wake_hits else []
+    kept = [ts for ts in hits if now - ts <= _DELIVERY_WAKE_WINDOW_SEC]
+    if kept:
+        _delivery_wake_hits[key] = kept
+    elif key in _delivery_wake_hits:
+        del _delivery_wake_hits[key]
+    return kept
+
+
+def record_delivery_wake(session_id: str, root_id: str, *, now: float | None = None) -> int:
+    """记下这条任务根的一次回灌，返回窗口内次数。"""
+    sid = (session_id or "").strip()
+    rid = (root_id or "").strip()
+    if not sid or not rid:
+        return 0
+    ts = now if now is not None else time.time()
+    key = _delivery_wake_key(sid, rid)
+    kept = _prune_delivery_wake_hits(key, ts)
+    kept.append(ts)
+    _delivery_wake_hits[key] = kept
+    return len(kept)
+
+
+def should_block_nested_delegate(session_id: str, root_id: str, *, now: float | None = None) -> bool:
+    """同一条任务根在短窗内第 N 次回灌禁止再委派。别的根不共享次数。"""
+    sid = (session_id or "").strip()
+    rid = (root_id or "").strip()
+    if not sid or not rid:
+        return False
+    ts = now if now is not None else time.time()
+    kept = _prune_delivery_wake_hits(_delivery_wake_key(sid, rid), ts)
+    return len(kept) >= _DELIVERY_WAKE_MAX
+
+
+def delivery_wake_blocks_new_delegate(session_id: str) -> bool:
+    """本回灌帧是否已用完这条任务根的嵌套委派次数。"""
+    return should_block_nested_delegate(session_id, current_delivery_root_id())
 
 
 async def _wake_main_agent_for_delivery(task: AIAgentTask, raw_result: str) -> None:
@@ -616,7 +672,7 @@ async def _wake_main_agent_for_delivery(task: AIAgentTask, raw_result: str) -> N
             if item is not None:
                 await _wake_main_agent_for_delivery_now(item[0], item[1])
         except Exception as e:
-            logger.debug(t("log.ai.delivery_coalesce_flush_skip", e=e))
+            logger.warning(t("log.ai.delivery_coalesce_flush_skip", e=e))
             _delivery_flush_tasks.pop(key, None)
             _delivery_pending.pop(key, None)
 
@@ -640,6 +696,7 @@ async def _wake_main_agent_for_delivery_now(task: AIAgentTask, raw_result: str) 
         session = await get_ai_session(ev)
 
     if session is None or bot is None:
+        # 兜底通知没有跑主人格，不能占用本窗的委派次数。
         logger.warning(
             t(
                 "log.ai.kanban_deferred_wake_fallback_relay",
@@ -657,6 +714,7 @@ async def _wake_main_agent_for_delivery_now(task: AIAgentTask, raw_result: str) 
                 )
         return
 
+    root_id = (task.root_task_id or task.id).strip()
     owner = (task.owner_user_id or "").strip()
     at_hint = f"收尾时 @发起人 `@{owner}`。" if owner else ""
     title_ban = ""
@@ -668,15 +726,22 @@ async def _wake_main_agent_for_delivery_now(task: AIAgentTask, raw_result: str) 
             title = get_master_title(task.persona_name or "")
             if title:
                 title_ban = f"发起人不是主人，禁止称「{title}」。"
-    frame_text = f"[框架·任务完成]\n{delivery}\n（系统：一句收尾；有图就发出；要出图委派 render。{at_hint}{title_ban}）"
-    await session.run(
-        user_message=frame_text,
-        bot=bot,
-        ev=ev,
-        return_mode="by_bot",
-        has_active_task=True,
-        is_framework_injection=True,
-    )
+    from gsuid_core.ai_core.control.lines import delivery_wake_line
+
+    frame_text = delivery_wake_line(delivery, at_hint, title_ban)
+    record_delivery_wake(session_id, root_id)
+    root_token = bind_delivery_root(root_id)
+    try:
+        await session.run(
+            user_message=frame_text,
+            bot=bot,
+            ev=ev,
+            return_mode="by_bot",
+            has_active_task=True,
+            is_framework_injection=True,
+        )
+    finally:
+        reset_delivery_root(root_token)
     logger.info(t("log.ai.kanban_deferred_main_delivery_done", task=task.id[:8]))
 
 
