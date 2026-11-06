@@ -50,18 +50,13 @@ from gsuid_core.ai_core.const import (
     _CONTENT_REJECT_HINTS,
     ERROR_QUOTA_EXHAUSTED,
 )
+from gsuid_core.ai_core.models import PendingImage
 from gsuid_core.utils.image.convert import convert_img
 from gsuid_core.utils.resource_manager import RM
+from gsuid_core.ai_core.angle_bracket_guard import MEME_TAG_PATTERN
 
 if TYPE_CHECKING:
     from gsuid_core.ai_core.content_guard import GuardFlags
-
-# 表情包标记正则：兼容全角/半角冒号，以及前后任意数量的反引号包裹
-# 例如：<meme: 困>  `<meme：困>`  ``<meme: 开心>``
-MEME_TAG_PATTERN = re.compile(
-    r"`*<meme[：:]\s*([^>]+?)>`*",
-    re.IGNORECASE,
-)
 
 # 表情没有字数，按 7 个字计，间隔是 1 秒。
 MEME_PAUSE_CHARS = 7
@@ -88,14 +83,18 @@ SILENCE_MARKERS: frozenset[str] = frozenset(
         "<no_tool_call>",
         "<沉默>",
         "[沉默]",
+        "&lt;SILENCE&gt;",
+        "&lt;沉默&gt;",
+        "＜SILENCE＞",
+        "＜沉默＞",
     }
 )
 
 # 协议标签（开/闭/自闭合）。代码块内字面量不剥，避免教学回复被当成沉默。
-# 模型常把 <SILENCE> 写成 CJK「<沉默>」；不认会当正文发出并盖掉本轮已写好的答复。
+# 模型常把 <SILENCE> 写成 CJK「<沉默>」或转义为 &lt;SILENCE&gt;。
 _PROTOCOL_TAG_RE = re.compile(
-    r"<\s*/?\s*(?:silence|end_turn|no_tool_call|沉默)\s*/?\s*>"
-    r"|\[\s*(?:silence|沉默)\s*\]",
+    r"(?:<|&lt;|&#60;|&#x3c;|＜|\\<)\s*/?\s*(?:silence|end_turn|no_tool_call|沉默)\s*/?\s*(?:>|&gt;|&#62;|&#x3e;|＞|\\>)"
+    r"|(?:(?:\[|\\\[)\s*(?:silence|沉默)\s*(?:\]|\\\]))",
     re.IGNORECASE,
 )
 _PROTOCOL_CODE_SPAN_RE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
@@ -103,9 +102,39 @@ _BARE_SILENCE_RE = re.compile(r"^\s*silence\s*$", re.IGNORECASE)
 _PROTOCOL_EMPTYISH_RE = re.compile(r"^[\s\-–—.,，。！？!?、；;：:\u3000·•…]*$")
 # 截断残片：ILENCE> / SILENCE> / <SILENCE / 沉默> / <沉默。裸「沉默」是可见台词。
 _SILENCE_FRAGMENT_RE = re.compile(
-    r"^\s*(?:ilence>|silence>?|<silence/?|沉默>|<沉默/?)\s*$",
+    r"^\s*(?:ilence>|silence>?|<silence/?|沉默>|<沉默/?|"
+    r"&lt;silence/?|silence&gt;|＜silence/?|silence＞)\s*$",
     re.IGNORECASE,
 )
+
+# 框架控制/协议标签白名单名（转义还原仅匹配此类，避免误伤业务代码）
+_CONTROL_TAG_NAMES_PATTERN = r"(?:/?\s*(?:silence|end_turn|no_tool_call|沉默|think|tool_calls?)\s*/?|meme[：:].*?)"
+_ESCAPED_CONTROL_TAG_RE = re.compile(
+    r"(?:&lt;|&#60;|&#x3c;|＜|\\<)\s*(" + _CONTROL_TAG_NAMES_PATTERN + r")\s*(?:&gt;|&#62;|&#x3e;|＞|\\>)",
+    re.IGNORECASE,
+)
+_ESCAPED_TAG_HINTS: tuple[str, ...] = ("&lt;", "&#60;", "&#x3c;", "＜", "\\<")
+_CONTROL_WORD_HINTS: tuple[str, ...] = ("silence", "沉默", "think", "tool_call", "no_tool_call", "end_turn", "meme")
+
+
+def normalize_escaped_control_tags(text: str) -> str:
+    """还原模型输出的转义特殊控制标签，反引号代码块受保护保留。"""
+    if not text or not any(h in text for h in _ESCAPED_TAG_HINTS):
+        return text
+    lower = text.lower()
+    if not any(k in lower for k in _CONTROL_WORD_HINTS):
+        return text
+    held: list[str] = []
+
+    def _hold(m: re.Match[str]) -> str:
+        held.append(m.group(0))
+        return f"\x00{len(held) - 1}\x00"
+
+    protected = _PROTOCOL_CODE_SPAN_RE.sub(_hold, text)
+    normalized = _ESCAPED_CONTROL_TAG_RE.sub(r"<\1>", protected)
+    for i, chunk in enumerate(held):
+        normalized = normalized.replace(f"\x00{i}\x00", chunk)
+    return normalized
 
 
 def remainder_after_protocol_tags(text: str) -> str:
@@ -133,6 +162,7 @@ def is_silence_marker(text: str) -> bool:
     raw = (text or "").strip()
     if not raw:
         return False
+    raw = normalize_escaped_control_tags(raw)
     if _BARE_SILENCE_RE.match(raw) is not None:
         return True
     if _SILENCE_FRAGMENT_RE.match(raw) is not None:
@@ -209,6 +239,14 @@ def split_protocol_hold(buf: str, *, force: bool = False) -> tuple[str, str]:
 # 同一组常量做前缀/子串判断，文案微调不再让嗅探点静默失效（评审修复 E11）。
 ERROR_RESULT_PREFIX = "执行出错"
 ERROR_CONTENT_REJECTED = "内容被模型安全策略拒绝"
+
+
+def is_agent_error_text(text: str) -> bool:
+    """上游 agent 的错误回执（``执行出错: …``）或网关超时回显，不得当正常产出消费。"""
+    stripped = (text or "").strip()
+    return stripped.startswith(ERROR_RESULT_PREFIX) or "Request timed out" in stripped
+
+
 ERROR_TIMEOUT_TEXT = "请求超时"
 NO_RESULT_TEXT = "Agent 执行完成，但未返回有效结果"
 
@@ -307,6 +345,7 @@ def _strip_tool_call_artifacts(text: str) -> str:
     """
     if "tool_call" not in text.lower():
         return text
+    text = normalize_escaped_control_tags(text)
     cleaned = _TOOL_CALL_BLOCK_PATTERN.sub("", text)
     cleaned = _strip_unclosed_tool_call_json(cleaned)
     cleaned = _TOOL_CALL_TAG_PATTERN.sub("", cleaned)
@@ -347,17 +386,17 @@ def _strip_special_control_tokens(text: str) -> str:
 # 内部资源句柄（纯内部寻址 ID，绝不该进正文；
 # hex）、models.py 出 res_（12 位 hex）。
 _RESOURCE_HANDLE_RE = re.compile(
-    r"`*\b(?:res|img|aud|vid)_[0-9a-fA-F]{6,}\b`*"
+    r"`*\b(?:res|img|aud|vid|fil)_[0-9a-fA-F]{6,}\b`*"
     r"|`*\bdlg_[0-9a-fA-F-]{8,}\b`*"
 )
-_RESOURCE_HANDLE_HINTS = ("res_", "img_", "aud_", "vid_", "dlg_")
+_RESOURCE_HANDLE_HINTS = ("res_", "img_", "aud_", "vid_", "fil_", "dlg_")
 
 
 def _strip_resource_handles(text: str) -> str:
     """剥离泄漏进用户可见文本里的内部资源句柄（``res_xxx`` / ``img_xxx`` 等）。
 
     ``create_subagent`` / kanban 完成回执会带 ``res_deb5b2e0d2a4`` 这类句柄，供主人格用
-    ``send_message_by_ai(image_id=res_xxx)`` 发图 / 发文件。弱模型有时不发内容、反而把
+    ``send_message_by_ai(image_ids=res_xxx)`` 发图 / ``file_ids=res_xxx`` 发文件。弱模型有时不发内容、反而把
     **句柄本身**写进正文（"详细的放那里面了 res_xxx 自己看吧"）——用户看到一串没意义的
     内部 ID，既无用又出戏。这些句柄是纯内部寻址、用户永远不该看到，命中即抹掉。
 
@@ -831,6 +870,7 @@ async def prepare_content_payload(
     task_level: Literal["high", "low"] = "high",
     *,
     quoted_tome: bool = False,
+    pending_unread_images: Optional[Sequence[PendingImage]] = None,
 ) -> Tuple[Sequence[UserContent], "GuardFlags"]:
     """
     准备消息内容列表给AI看, 包含文本、图片ID、文件内容、事件对象
@@ -898,8 +938,9 @@ async def prepare_content_payload(
         text += body
 
     is_pure_image_quote = bool((ev.reply_id or quoted_tome) and not ev.reply and ev.image_id_list)
-    if ev.reply or is_pure_image_quote:
-        reply_body = ev.reply if ev.reply else "[引用图片消息]"
+    has_quote = bool(ev.reply or ev.reply_id or quoted_tome)
+    if has_quote:
+        reply_body = ev.reply if ev.reply else ("[引用图片消息]" if is_pure_image_quote else "[引用消息]")
         text += f"\n--- 引用消息 ---\n{reply_body}\n"
         from gsuid_core.ai_core.outbound import resolve_quote
 
@@ -926,10 +967,9 @@ async def prepare_content_payload(
     if ev.image_id_list:
         if lazy_image_read:
             if is_pure_image_quote:
-                text += "\n--- 被引用消息中的图片(未展开, 仅在需要查看原图细节时调用 read_image(图片ID)) ---"
+                text += "\n--- 被引用消息中的图片(未展开, 需要分析或评价图内内容时请调用 read_image(图片ID)) ---"
             else:
-                # 惰性模式：只给图片ID + 一行调用指引，图片本体留在 RM，需要看时再 read_image
-                text += "\n--- 用户发送了图片(未展开, 需要查看内容时调用 read_image(图片ID)) ---"
+                text += "\n--- 用户发送了图片(未展开, 需要查看内容时请调用 read_image(图片ID)) ---"
             for i in ev.image_id_list:
                 text += f"\n图片ID: {i}"
             text += "\n"
@@ -939,6 +979,14 @@ async def prepare_content_payload(
                     text += f"\n--- 被引用消息图片ID: {i} ---\n"
                 else:
                     text += f"\n--- 用户上传图片ID: {i} ---\n"
+
+    if pending_unread_images and not (ev.image_id_list or ev.image_id):
+        from gsuid_core.ai_core.control.lines import pending_unread_image_guide_line
+
+        text += "\n--- 当前说话人刚发出的待讨论图片（尚未读取） ---\n"
+        for p_img in pending_unread_images:
+            text += f"- [{p_img.time_str}] 配文：「{p_img.text}」 | 待读图片ID: {p_img.img_id}\n"
+            text += f"{pending_unread_image_guide_line(p_img.img_id)}\n"
 
     if hasattr(ev, "audio_id") and ev.audio_id:
         text += f"\n--- 用户上传音频ID: {ev.audio_id} ---\n"
@@ -1556,7 +1604,6 @@ async def _try_render_markdown_image(
     return True
 
 
-_NICK_AT_RE = re.compile(r"@(?!\d)([^\s@，。！？、,.!?]{1,16})")
 _MENTION_LABEL_RE = re.compile(r"([^\s()（）\n]{1,16})\(用户ID:([^)]+)\)")
 
 
@@ -1590,18 +1637,23 @@ def rewrite_nickname_mentions(
     *,
     already_at: str | None = None,
 ) -> str:
-    """@昵称 收成 @用户ID。已经在 @ 的人去掉重复；对不上的 @昵称 删掉。"""
+    """<@昵称> 收成 <@用户ID>。已经在提醒的人去掉重复；对不上的括号删掉。裸 @ 保留。"""
+    from gsuid_core.ai_core.outbound import sub_mentions, is_mention_id, normalize_mention_token
 
     def _repl(match: re.Match[str]) -> str:
-        name = match.group(1)
-        uid = names[name] if name in names else ""
-        if not uid:
+        token = normalize_mention_token(match.group(1))
+        if not token:
             return ""
-        if already_at and uid == already_at:
-            return ""
-        return f"@{uid} "
+        uid = names[token] if token in names else ""
+        if uid:
+            if already_at and uid == already_at:
+                return ""
+            return f"<@{uid}>"
+        if is_mention_id(token):
+            return f"<@{token}>"
+        return ""
 
-    return _NICK_AT_RE.sub(_repl, text)
+    return sub_mentions(text, _repl)
 
 
 def _persona_max_bubbles(ev: Event | None) -> int:
@@ -1655,9 +1707,9 @@ async def send_chat_result(
     """
     解析并发送聊天结果，支持：
     - 按换行分割多条消息
-    - @用户ID 语法 → MessageSegment.at(user_id)
+    - <@用户ID> 或 <@昵称> → MessageSegment.at。裸 @ 不解析
     - at_user_id：框架强制前置 @（任务交付回灌等，不依赖模型自觉）
-    - <meme: 情绪> 标记（可带反引号）→ 触发表情包发送（需传入 ev）
+    - <meme: 情绪> 标记（可带反引号；尖括号和冒号旁边的空格也认）→ 触发表情包发送（需传入 ev）
     - extra_metadata：透传到 ``Bot.send`` 的 ``extra_metadata``，最终落到
       ``message_history`` 记录上（如主动消息的 ``proactive=True / source / reason``）
     - ooc_check：出戏防火墙开关。gs_agent 自判产物已走过系统提醒，传 False 放行
@@ -1719,7 +1771,7 @@ async def send_chat_result(
 
     # <br> 漏网已在 sanitize 落成换行；再统一其它 HTML 换行写法
     text = _normalize_html_linebreaks(text)
-    from gsuid_core.ai_core.outbound import rewrite_cq_at
+    from gsuid_core.ai_core.outbound import rewrite_cq_at, strip_mention_tags
 
     text = rewrite_cq_at(text)
     _names = mention_names_from_event(ev)
@@ -1836,9 +1888,10 @@ async def send_chat_result(
             if not kept:
                 continue
             segments = kept
+        segments = _ensure_at_trailing_space(segments)
 
-        # 计算纯文本长度
-        plain_text = re.sub(r"@\d+", "", block)
+        # 停顿按台词算，括号提醒不计入
+        plain_text = strip_mention_tags(block)
 
         await asyncio.sleep(bubble_pause(len(plain_text)))
 
@@ -1909,31 +1962,39 @@ async def _send_meme_from_tag(tag: str, bot: Bot, ev: Event) -> None:
             reset_outbound_image_label(label_token)
 
 
-def _parse_at_segments(text: str) -> list[Message]:
-    """
-    将含有 @用户ID 的文本解析为 MessageSegment 列表。
+def _ensure_at_trailing_space(segments: list[Message]) -> list[Message]:
+    """确保 at 消息段后紧跟的 text 消息段以空格开头，防止各平台粘连。"""
+    result = list(segments)
+    for i in range(len(result) - 1):
+        if result[i].type == "at" and result[i + 1].type == "text":
+            txt = str(result[i + 1].data or "")
+            if txt and not txt.startswith((" ", "\t", "\n")):
+                result[i + 1] = MessageSegment.text(" " + txt)
+    return result
 
-    规则：
-    - @后跟纯数字（QQ号格式）才会被解析为 at segment
-    - 其余文本保持为 text segment
-    - 示例输入："好哦 @100000001 你来看"
-    - 示例输出：[Text("好哦 "), At(100000001), Text(" 你来看")]
-    """
-    from gsuid_core.ai_core.outbound import rewrite_cq_at
+
+def _parse_at_segments(text: str) -> list[Message]:
+    """把 <@用户ID> 解析成 at 段。认转义尖括号和多余空格。裸 @ 留在文本里。"""
+    from gsuid_core.ai_core.outbound import (
+        is_mention_id,
+        iter_mentions,
+        rewrite_cq_at,
+        normalize_mention_token,
+    )
 
     text = rewrite_cq_at(text)
-    # 匹配 @数字，前后允许空格（空格属于分隔符，不计入文本内容）
-    pattern = re.compile(r"\s*@(\d+)\s*")
     segments: list[Message] = []
     last_end = 0
 
-    for match in pattern.finditer(text):
-        # 匹配前的普通文本
+    for match in iter_mentions(text):
+        token = normalize_mention_token(match.group(1))
+        if not is_mention_id(token):
+            continue
         before = text[last_end : match.start()]
         if before:
             segments.append(MessageSegment.text(before))
 
-        segments.append(MessageSegment.at(match.group(1)))
+        segments.append(MessageSegment.at(token))
 
         last_end = match.end()
 
@@ -1946,7 +2007,7 @@ def _parse_at_segments(text: str) -> list[Message]:
     if not segments:
         return [MessageSegment.text(text)]
 
-    return segments
+    return _ensure_at_trailing_space(segments)
 
 
 # GsCoreAIAgent 运行期的无状态消息/历史工具
@@ -2011,9 +2072,9 @@ def _collect_tool_call_return_ids(messages: Sequence[ModelMessage]) -> tuple[Set
 
 
 def _has_orphan_tool_returns(messages: Sequence[ModelMessage]) -> bool:
-    """保留集里是否存在「有 return 无 call」的断裂配对。"""
+    """保留集里是否存在断裂的工具调用或返回配对。"""
     call_ids, return_ids = _collect_tool_call_return_ids(messages)
-    return bool(return_ids - call_ids)
+    return bool((return_ids - call_ids) or (call_ids - return_ids))
 
 
 def _truncate_history_keep_prefix(
@@ -2022,16 +2083,7 @@ def _truncate_history_keep_prefix(
     *,
     prefix_ratio: float = 0.35,
 ) -> List[ModelMessage]:
-    """前缀稳定截断：永不丢头部，只裁中段，保留近期尾部。
-
-    Provider 前缀缓存依赖 message_history **从左起**字节不变。旧策略
-    ``history[-n:]`` 每轮砍头 → 整段前缀失效。本函数保证
-    ``history[:prefix_n]`` 在历次 compact 间对象序列不变，只丢掉
-    ``prefix_n .. tail_start`` 的中段。
-
-    工具配对：若尾部有孤立 ToolReturn，向左吞并中段直至配对完整；
-    仍无法配对则放弃裁剪、原样返回（安全阀）。
-    """
+    """前缀稳定截断：永不丢头部，只裁中段，保留近期尾部。"""
     if len(history) <= max_keep:
         return history
     if max_keep <= 1:
@@ -2039,10 +2091,16 @@ def _truncate_history_keep_prefix(
 
     prefix_n = max(2, int(max_keep * prefix_ratio))
     prefix_n = min(prefix_n, max_keep - 1)
+    # 若 prefix_n 切在未闭合 tool call，向前收缩至完整轮次（防悬空 call 引发 400）
+    while prefix_n > 1:
+        p_calls, p_rets = _collect_tool_call_return_ids(history[:prefix_n])
+        if not (p_calls - p_rets):
+            break
+        prefix_n -= 1
+
     tail_budget = max_keep - prefix_n
     tail_start = len(history) - tail_budget
 
-    # 尾段向左扩展以补齐工具 call/return；绝不侵入 prefix（保头）
     while tail_start > prefix_n:
         retained = history[:prefix_n] + history[tail_start:]
         if not _has_orphan_tool_returns(retained):
@@ -2057,7 +2115,6 @@ def _truncate_history_keep_prefix(
             return retained
         tail_start -= 1
 
-    # tail 已顶到 prefix：无法在保头前提下安全裁中段
     if not _has_orphan_tool_returns(history):
         logger.warning(i18n_t("log.ai.cannot_safely_truncate_history", p0=len(history)))
     return history
@@ -2243,12 +2300,11 @@ def _drop_orphan_tool_results(history: List[ModelMessage]) -> List[ModelMessage]
 
 
 def _strip_remote_images_from_history(history: List[ModelMessage]) -> int:
-    """把历史里残留的「远程图片 URL」剥离成文字占位，返回剥离处数量。
+    """剥离 history 中已过期的远程图片 URL（http/https）。
 
-    推理端报「Failed to download image」基本都是早先入历史的远程图片 URL
-    （如 QQ 带 rkey 的临时链接）已过期。不清掉的话，后续每一轮把它重发给
-    推理端都会 500，整个会话被永久卡死。这里把过期的远程 ``ImageUrl`` 替换为
-    文字占位，让下一轮自动恢复。base64 DataURI 不会过期，保留不动。
+    远程图片在若干小时后其临时 URL 会失效，导致 provider 重试下载抛 500。
+    发现该错误时就地将 http/https ImageUrl 替换为纯文本占位符，避免卡死后续全部请求。
+    base64 DataURI 与 BinaryContent 不依赖外部下载，保留不动。
     """
     removed = 0
     for msg in history:
@@ -2996,3 +3052,21 @@ def _sanitize_tool_call_artifacts_in_parts(
     if not kept:
         return [TextPart(content="")]
     return kept
+
+
+def normalize_escaped_control_tags_in_parts(
+    parts: Sequence[ModelResponsePart],
+) -> List[ModelResponsePart]:
+    """规范化 TextPart 内泄漏的转义控制标签（如 &lt;SILENCE&gt; / &lt;think&gt;）。"""
+    result: List[ModelResponsePart] = []
+    for part in parts:
+        if not isinstance(part, TextPart):
+            result.append(part)
+            continue
+        normalized = normalize_escaped_control_tags(part.content)
+        if normalized == part.content:
+            result.append(part)
+        else:
+            part.content = normalized
+            result.append(part)
+    return result

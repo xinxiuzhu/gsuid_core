@@ -109,11 +109,6 @@ async def _send_persona_meme(
     persona_name: str,
     mood: str = "",
 ) -> bool:
-    from gsuid_core.ai_core.meme.config import meme_config
-
-    if not meme_config.get_config("meme_enable").data:
-        return False
-
     from gsuid_core.ai_core.meme.selector import pick
     from gsuid_core.ai_core.buildin_tools.meme_tools import send_meme_record
 

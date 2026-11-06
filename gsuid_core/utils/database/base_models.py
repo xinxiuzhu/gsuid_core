@@ -69,6 +69,12 @@ db_type: str = database_config.get_config("db_type").data
 
 db_driver: str = database_config.get_config("db_driver").data
 
+_sqlite_cache_size_cfg = database_config.get_config("sqlite_cache_size")
+sqlite_cache_size: int = _sqlite_cache_size_cfg.data if _sqlite_cache_size_cfg is not None else -64000
+
+_sqlite_sync_cfg = database_config.get_config("sqlite_synchronous")
+sqlite_synchronous: str = _sqlite_sync_cfg.data if _sqlite_sync_cfg is not None else "NORMAL"
+
 _db_type = db_type.lower()
 db_config = {
     "pool_recycle": db_pool_recycle,
@@ -199,7 +205,8 @@ def _enable_sqlite_wal(db_path: str) -> None:
     try:
         conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_MS}")
         row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
-        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute(f"PRAGMA synchronous={sqlite_synchronous}")
+        conn.execute(f"PRAGMA cache_size={sqlite_cache_size}")
         conn.commit()
     finally:
         conn.close()
@@ -280,7 +287,8 @@ def sqlite_consistent_snapshot(src: Path, dest: Path) -> None:
 def _set_sqlite_connect_pragmas(dbapi_connection: sqlite3.Connection, _connection_record: object) -> None:
     cursor = dbapi_connection.cursor()
     cursor.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_MS}")
-    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute(f"PRAGMA synchronous={sqlite_synchronous}")
+    cursor.execute(f"PRAGMA cache_size={sqlite_cache_size}")
     cursor.close()
 
 
@@ -1401,16 +1409,20 @@ class Bind(BaseModel):
         if result is None:
             return None
 
-        uid = getattr(result, cls.get_gameid_name(game_name))
-        if uid is None:
-            return None
-        else:
-            uid_list = uid.split("_")
+        # 兼容非标 Bind 子类：未指定游戏名且缺默认 uid 字段时视为无绑定
+        if not game_name or game_name == "gs":
+            if not hasattr(result, "uid"):
+                return None
+        col_name = cls.get_gameid_name(game_name)
 
-        if uid_list:
-            return uid_list
-        else:
+        if not hasattr(result, col_name):
             return None
+
+        raw_uid = getattr(result, col_name)
+        if not isinstance(raw_uid, str) or not raw_uid:
+            return None
+        uid_list = [u for u in raw_uid.split("_") if u]
+        return uid_list if uid_list else None
 
     @classmethod
     async def get_uid_by_game(

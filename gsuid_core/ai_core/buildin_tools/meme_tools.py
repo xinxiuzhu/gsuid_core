@@ -15,7 +15,7 @@ from gsuid_core.segment import MessageSegment
 from gsuid_core.ai_core.register import ai_tools
 from gsuid_core.ai_core.meme.config import meme_config
 from gsuid_core.ai_core.meme.library import MemeLibrary, _read_file, get_memes_base_path
-from gsuid_core.ai_core.meme.selector import PICK_COOLDOWN, PICK_EXHAUSTED, pick
+from gsuid_core.ai_core.meme.selector import PICK_COOLDOWN, PICK_DISABLED, PICK_EXHAUSTED, pick
 from gsuid_core.ai_core.meme.database_model import AiMemeRecord
 from gsuid_core.ai_core.buildin_tools.visibility import visible_to_capability_only
 
@@ -90,9 +90,6 @@ async def send_meme(
         >>> await send_meme(mood="开心", scene="庆祝")
         >>> await send_meme(mood="无语")
     """
-    if not meme_config.get_config("meme_enable").data:
-        return "表情包模块未启用"
-
     session_id = ev.session_id
     persona_name = _get_persona_for_event(ev)
 
@@ -106,6 +103,8 @@ async def send_meme(
 
     if record is None:
         # 区分"现在不能发"和"库里没有"，避免 LLM 误判后无意义重试或向用户致歉
+        if reason == PICK_DISABLED:
+            return "当前人格未开启表情回复，本次跳过，不要重试"
         if reason == PICK_COOLDOWN:
             return "表情包发送冷却中（库中可能有匹配的图），本次跳过即可，不要重试"
         if reason == PICK_EXHAUSTED:
@@ -261,8 +260,9 @@ async def record_meme(
         origin: 出处（可选）。
         usage: 接法范式（可选）。
     """
-    from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+    from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key, self_scope_key
     from gsuid_core.ai_core.cognition.types import CogKind
+    from gsuid_core.ai_core.persona.settings import persona_name_from_event
     from gsuid_core.ai_core.cognition.remember import MemoryWrite, remember
     from gsuid_core.ai_core.meme.database_model import AiMemeKnowledge
 
@@ -285,7 +285,7 @@ async def record_meme(
         MemoryWrite(
             kind=CogKind.MEME_KNOWLEDGE,
             ref=str(row.id),
-            scope_key=scope_key or f"self:{ev.bot_id}",
+            scope_key=scope_key or self_scope_key(ev.bot_id, persona_name_from_event(ev) or ""),
             owner_user_id=ev.user_id,
             title=name,
             summary=gloss[:120],

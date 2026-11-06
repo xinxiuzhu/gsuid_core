@@ -124,8 +124,14 @@ def test_full_ai_capacity_does_not_queue_or_send_fallback(monkeypatch) -> None:
     assert [record.content for record in history.get_history(ev)] == ["<互动：戳了你一下>"]
 
 
-def test_failed_ai_releases_slot_and_uses_persona_fallback(monkeypatch) -> None:
+def test_failed_ai_releases_slot_and_uses_persona_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    from gsuid_core.ai_core.meme import selector
+    from gsuid_core.ai_core.meme.config import meme_config
+    from gsuid_core.ai_core.buildin_tools import meme_tools
+    from gsuid_core.ai_core.meme.database_model import AiMemeRecord
+
     _reset_state()
+    monkeypatch.delitem(meme_config.config, "meme_enable", raising=False)
     ev = _event(group_id="fallback")
     config = SimpleNamespace(get_config=lambda _key: SimpleNamespace(data=True))
     manager = SimpleNamespace(
@@ -137,13 +143,38 @@ def test_failed_ai_releases_slot_and_uses_persona_fallback(monkeypatch) -> None:
         manager,
     )
     monkeypatch.setattr(poke, "_generate_reaction", AsyncMock(return_value=None))
-    fallback = AsyncMock(return_value=True)
-    monkeypatch.setattr(poke, "_send_persona_meme", fallback)
+    selected = AiMemeRecord(meme_id="a" * 16, file_path="common/test.png")
+    sent: list[tuple[str, str, bool]] = []
+
+    async def pick(mood: str, scene: str, persona: str | None, session_id: str) -> tuple[AiMemeRecord | None, str]:
+        assert persona == "Sayu"
+        assert session_id == ev.session_id
+        return selected, "ok"
+
+    async def send_record(
+        bot: Bot,
+        event: Event,
+        record: AiMemeRecord,
+        *,
+        mood: str,
+        scene: str,
+        persona_name: str | None,
+        interaction: str,
+        observe_memory: bool,
+    ) -> bool:
+        assert record is selected
+        assert event is ev
+        assert persona_name == "Sayu"
+        sent.append((scene, interaction, observe_memory))
+        return True
+
+    monkeypatch.setattr(selector, "pick", pick)
+    monkeypatch.setattr(meme_tools, "send_meme_record", send_record)
 
     bot = Bot(_Bot("yunzai"), ev)
     _run(poke.handle_persona_poke(bot, ev))
 
-    fallback.assert_awaited_once_with(bot, ev, "Sayu")
+    assert sent == [("戳一戳互动", "poke_meme", False)]
     assert poke._active_ai_requests == 0
 
 

@@ -28,4 +28,4 @@ jobs:
         run: python -m pip install pytest==9.0.2
 
       - name: Check logger i18n and locales
-        run: python -m pytest tests/test_logger_i18n.py -p no:cacheprovider
+        run: python -m pytest tests/test_logger_i18n.py --noconftest -p no:cacheprovider

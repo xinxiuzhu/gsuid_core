@@ -2,10 +2,18 @@
 
 import time
 import uuid
+import asyncio
 
+from gsuid_core.i18n import t
+from gsuid_core.logger import logger
 from gsuid_core.models import Event
 from gsuid_core.ai_core.autonomy.tools import GuardState, bind_guard, reset_guard, build_autonomy_tools
-from gsuid_core.ai_core.autonomy.models import AutonomyStepTrace, ObservationDigest
+from gsuid_core.ai_core.autonomy.models import (
+    GroupObservation,
+    AutonomyStepTrace,
+    ObservationDigest,
+    CareTargetSnapshot,
+)
 from gsuid_core.ai_core.agent_run.support import TraceKind
 from gsuid_core.ai_core.autonomy.verifier import output_is_failed
 
@@ -21,11 +29,15 @@ class AutonomyReport:
         steps: list[AutonomyStepTrace],
         duration_ms: int,
         session_id: str = "",
+        last_sent_user_id: str = "",
+        last_sent_group_id: str = "",
     ) -> None:
         self.text = text
         self.steps = steps
         self.duration_ms = duration_ms
         self.session_id = session_id
+        self.last_sent_user_id = last_sent_user_id
+        self.last_sent_group_id = last_sent_group_id
 
 
 class TraceCollector:
@@ -73,11 +85,10 @@ async def run_autonomy_agent(
     def _on_trace(kind: TraceKind, text: str) -> None:
         collector.observe(kind, text)
 
-    # 不传 max_iterations：走全局「最多允许AI思考轮数」。
+    # 思考轮走任务档 task_max_iterations（create_by=Autonomy）。
     session_id = f"autonomy:{digest.persona_name}:{uuid.uuid4()}"
     agent = GsCoreAIAgent(
         system_prompt=system_prompt,
-        max_iterations=None,
         persona_name=digest.persona_name,
         max_history=1,
         create_by="Autonomy",
@@ -97,28 +108,46 @@ async def run_autonomy_agent(
         text=user_prompt[:200],
         raw_text=user_prompt[:200],
     )
-    token = bind_guard(_guard(digest))
+    guard = _guard(digest, now=time.time())
+    token = bind_guard(guard)
     started = time.perf_counter()
     try:
-        result = await agent.run(
-            user_prompt,
-            ev=event,
-            tools=build_autonomy_tools(),
-            return_mode="return",
-            budget_gate=True,
-            is_framework_injection=True,
+        result = await asyncio.wait_for(
+            agent.run(
+                user_prompt,
+                ev=event,
+                tools=build_autonomy_tools(),
+                return_mode="return",
+                budget_gate=True,
+                is_framework_injection=True,
+            ),
+            timeout=240.0,
         )
+    except asyncio.TimeoutError:
+        logger.warning(t("log.ai.autonomy_run_fail", persona_name=digest.persona_name, e="timeout"))
+        result = ""
     finally:
         reset_guard(token)
+        agent._session_logger.close()
     text = result if isinstance(result, str) else ""
     duration_ms = int((time.perf_counter() - started) * 1000)
-    return AutonomyReport(text, collector.steps, duration_ms, session_id)
+    return AutonomyReport(
+        text,
+        collector.steps,
+        duration_ms,
+        session_id,
+        last_sent_user_id=guard.last_sent_user_id,
+        last_sent_group_id=guard.last_sent_group_id,
+    )
 
 
-def _guard(digest: ObservationDigest) -> GuardState:
+def _guard(digest: ObservationDigest, now: float = 0.0) -> GuardState:
     sessions: dict[str, tuple[str | None, str, str, str]] = {}
+    allowed_users: dict[str, CareTargetSnapshot] = {}
     for target in digest.care_targets:
         sessions[target.user_id] = (target.group_id, target.bot_id, target.bot_self_id, target.ws_bot_id)
+        allowed_users[target.user_id] = target
+    allowed_groups: dict[str, GroupObservation] = {g.group_id: g for g in digest.group_digests}
     return GuardState(
         persona_name=digest.persona_name,
         whitelist=frozenset(target.user_id for target in digest.care_targets),
@@ -126,6 +155,9 @@ def _guard(digest: ObservationDigest) -> GuardState:
         bot_id=digest.bot_id,
         bot_self_id=digest.bot_self_id,
         ws_bot_id=digest.ws_bot_id,
+        allowed_groups=allowed_groups,
+        allowed_users=allowed_users,
+        now=now,
     )
 
 

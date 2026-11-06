@@ -27,10 +27,12 @@ from gsuid_core.utils.plugins_config.models import (
     GsColorConfig,
     GsFloatConfig,
     GsImageConfig,
+    GsButtonConfig,
     GsListStrConfig,
     GsFileUploadConfig,
     GsFilesUploadConfig,
     GsRepeatGroupConfig,
+    button_state_view,
 )
 from gsuid_core.utils.plugins_update._plugins import PLUGINS_PATH, get_plugin_commit, get_local_plugins_list
 from gsuid_core.utils.plugins_config.gs_config import all_config_list
@@ -68,7 +70,7 @@ def _read_plugin_icon(plugin_name: str) -> Optional[str]:
 
 
 def _is_secret_gsc(config: GSC) -> bool:
-    if isinstance(config, (GsDivider, GsColorConfig)):
+    if isinstance(config, (GsDivider, GsColorConfig, GsButtonConfig)):
         return False
     return bool(config.secret)
 
@@ -89,6 +91,8 @@ def _group_item_values(item: Dict[str, GSC]) -> Dict[str, Any]:
             out[key] = [_group_item_values(sub) for sub in field.data]
         elif isinstance(field, GsDivider):
             continue
+        elif isinstance(field, GsButtonConfig):
+            out[key] = button_state_view(field.data)
         else:
             out[key] = field.data
     return out
@@ -107,6 +111,23 @@ def _build_config_item(config: GSC, key: str = "") -> Dict[str, Any]:
             "value": [_group_item_values(row) for row in config.data],
             "default": [],
             "template": {k: _build_config_item(v, k) for k, v in config.template.items()},
+        }
+
+    if isinstance(config, GsButtonConfig):
+        state = button_state_view(config.data)
+        return {
+            "type": config_type,
+            "title": config.title,
+            "desc": config.desc,
+            "value": state,
+            "default": state,
+            "endpoint": config.endpoint,
+            "label": config.label,
+            "level": config.level,
+            "confirm": config.confirm,
+            "status_fields": [{"key": row.key, "label": row.label} for row in config.status_fields],
+            "show_progress": config.show_progress,
+            "poll_ms": config.poll_ms,
         }
 
     # GsDivider 作为前端分割线，data 为可选标题
@@ -363,6 +384,8 @@ async def get_plugin_detail(request: Request, plugin_name: str, _user: Dict[str,
         "area": plugin.area,
         "black_list": plugin.black_list,
         "white_list": plugin.white_list,
+        "bot_white_list": plugin.bot_white_list,
+        "bot_black_list": plugin.bot_black_list,
         "prefix": plugin.prefix,
         "force_prefix": plugin.force_prefix,
         "disable_force_prefix": plugin.disable_force_prefix,
@@ -830,6 +853,8 @@ async def update_plugin_service_field(
         "area",
         "black_list",
         "white_list",
+        "bot_white_list",
+        "bot_black_list",
         "prefix",
         "force_prefix",
         "disable_force_prefix",
@@ -979,19 +1004,34 @@ async def reload_plugin_api(request: Request, plugin_name: str, _user: Dict[str,
 
 
 @app.get("/api/plugin-store/list", summary="获取插件商店列表", tags=PLUGINS)
-async def get_plugin_store_list(request: Request, _user: Dict[str, Any] = Depends(require_auth)):
+async def get_plugin_store_list(
+    request: Request,
+    _user: Dict[str, Any] = Depends(require_auth),
+    tab: Optional[str] = Query(None, description="页签筛选：all / installed / updates / fun / tool / adapter"),
+    search: Optional[str] = Query(None, description="按插件名/描述/标签模糊匹配"),
+    limit: Optional[int] = Query(None, ge=1, le=200, description="单页条数；不传=全量"),
+    offset: int = Query(0, ge=0, description="偏移量"),
+):
     """
     获取远程插件商店的插件列表
 
     从远程服务器获取可用插件列表，并与本地已安装插件进行比对。
 
+    **页签筛选 / 搜索 / 分页都在服务端做**，翻页不会漏条目。`limit` **不传**时返回
+    全量（旧契约不变），此时 `plugins` 就是完整列表。
+
     Args:
         request: FastAPI 请求对象
         _user: 认证用户信息
+        tab: 页签筛选
+        search: 搜索关键词
+        limit: 单页条数；不传=全量
+        offset: 偏移量
 
     Returns:
         status: 0成功，1失败
-        data: 包含 plugins、fun_plugins、tool_plugins 的对象
+        data: 包含 plugins、fun_plugins、tool_plugins、adapter_plugins、plugin_groups 的对象
+            + count（筛选后总数）/ total_count（全量）/ counts（各页签总数）
     """
     import httpx
 
@@ -1003,8 +1043,10 @@ async def get_plugin_store_list(request: Request, _user: Dict[str, Any] = Depend
             response.raise_for_status()
             plugin_data = response.json()
 
-        # Get plugins data structure
+        # Get plugins data structure（远端 JSON 不可控：plugins 非 dict 时降级为空，不让列表接口 500）
         plugins_dict = plugin_data.get("plugins", {})
+        if not isinstance(plugins_dict, dict):
+            plugins_dict = {}
 
         # Get installed plugins
         installed_plugins = await get_local_plugins_list()
@@ -1014,6 +1056,9 @@ async def get_plugin_store_list(request: Request, _user: Dict[str, Any] = Depend
         formatted_plugins = []
 
         for plugin_id, plugin_info in plugins_dict.items():
+            # 条目畸形（非 dict）时按空信息展示，不让单个坏条目拖垮整个列表
+            if not isinstance(plugin_info, dict):
+                plugin_info = {}
             is_installed = plugin_id.lower() in installed_ids
 
             # Determine status
@@ -1045,17 +1090,73 @@ async def get_plugin_store_list(request: Request, _user: Dict[str, Any] = Depend
                 }
             )
 
-        # Get fun_plugins and tool_plugins from the remote data
+        # Get fun_plugins / tool_plugins / adapter_plugins from the remote data
         fun_plugins = plugin_data.get("fun_plugins", [])
         tool_plugins = plugin_data.get("tool_plugins", [])
+        adapter_plugins = plugin_data.get("adapter_plugins", [])
+        fun_ids = set(fun_plugins)
+        tool_ids = set(tool_plugins)
+        adapter_ids = set(adapter_plugins)
+        # 其余 *_plugins 分组原样透传：远端新增分组（如 xxx_plugins）无需改接口即可被前端使用
+        plugin_groups = {
+            key: value for key, value in plugin_data.items() if key.endswith("_plugins") and isinstance(value, list)
+        }
+
+        # 页签计数（前端页签徽标用）：对**全量**统计，不受页签/搜索/分页影响
+        counts = {
+            "all": len(formatted_plugins),
+            "installed": sum(1 for p in formatted_plugins if p["installed"]),
+            "updates": sum(1 for p in formatted_plugins if p["hasUpdate"]),
+            "fun": sum(1 for p in formatted_plugins if p["id"] in fun_ids),
+            "tool": sum(1 for p in formatted_plugins if p["id"] in tool_ids),
+            "adapter": sum(1 for p in formatted_plugins if p["id"] in adapter_ids),
+        }
+
+        # 先筛后切：页签 + 搜索都在服务端过滤完再分页
+        selected = formatted_plugins
+        if tab == "installed":
+            selected = [p for p in selected if p["installed"]]
+        elif tab == "updates":
+            selected = [p for p in selected if p["hasUpdate"]]
+        elif tab == "fun":
+            selected = [p for p in selected if p["id"] in fun_ids]
+        elif tab == "tool":
+            selected = [p for p in selected if p["id"] in tool_ids]
+        elif tab == "adapter":
+            selected = [p for p in selected if p["id"] in adapter_ids]
+
+        keyword = (search or "").strip().lower()
+        if keyword:
+            selected = [
+                p
+                for p in selected
+                if keyword in p["id"].lower()
+                or keyword in p["description"].lower()
+                or any(keyword in str(tag).lower() for tag in p["tags"])
+            ]
+
+        # 停止维护的插件排最后——分页前排，切出来的每一页才不会出现「维护中的夹在正常插件中间」
+        selected.sort(key=lambda p: p["type"] == "danger" and p["content"] == "停止维护")
+
+        total_count = len(formatted_plugins)
+        count = len(selected)
+        page_items = selected[offset:] if limit is None else selected[offset : offset + limit]
 
         return {
             "status": 0,
             "msg": "ok",
             "data": {
-                "plugins": formatted_plugins,
+                "plugins": page_items,
                 "fun_plugins": fun_plugins,
                 "tool_plugins": tool_plugins,
+                "adapter_plugins": adapter_plugins,
+                "plugin_groups": plugin_groups,
+                "count": count,
+                "total_count": total_count,
+                "counts": counts,
+                "limit": limit,
+                "offset": offset,
+                "has_more": offset + len(page_items) < count,
             },
         }
     except Exception as e:

@@ -738,6 +738,7 @@ class GsServer:
             if not _fut.done():
                 _fut.set_result(None)
         bot._recall_waiters.clear()
+        bot._echo_records.clear()
         bot._recall_timeout_streak = 0
 
         # 同步唤醒并清空数据请求回执（如群成员列表）的 future

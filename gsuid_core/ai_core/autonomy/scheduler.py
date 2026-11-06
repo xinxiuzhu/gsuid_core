@@ -27,6 +27,7 @@ from gsuid_core.ai_core.autonomy.models import (
     DriveKind,
     DeliveryPin,
     DeliveryPlan,
+    DeliveryDecision,
     AutonomyStepTrace,
     ObservationDigest,
 )
@@ -36,7 +37,7 @@ from gsuid_core.ai_core.database.models import AIAutonomyActivity
 from gsuid_core.ai_core.persona.persona import Persona
 from gsuid_core.ai_core.autonomy.dispatch import STAGE_TTL_SECONDS, stage_text, route_delivery
 from gsuid_core.ai_core.autonomy.observer import build_observation
-from gsuid_core.ai_core.autonomy.verifier import fact_summary, parse_footer, extract_facts
+from gsuid_core.ai_core.autonomy.verifier import fact_summary, parse_footer, extract_facts, output_is_failed
 from gsuid_core.ai_core.configs.ai_config import ai_config
 from gsuid_core.ai_core.prompt_group.store import render_prompt
 from gsuid_core.ai_core.heartbeat.dispatcher import get_dispatcher, make_target_key
@@ -95,10 +96,11 @@ class AutonomyScheduler:
             return await self.run_persona(persona_name, force=True)
 
     async def pick_persona(self) -> str | None:
-        """单次只挑最早到期的一个。聊天占着模型槽时整轮让路。"""
+        """单次只挑最早到期的一个。聊天或子任务回灌占着时整轮让路。"""
         from gsuid_core.ai_core.handle_ai import interactive_llm_in_use
+        from gsuid_core.ai_core.planning.kanban_executor import has_pending_interactive_deliveries
 
-        if interactive_llm_in_use():
+        if interactive_llm_in_use() or has_pending_interactive_deliveries():
             return None
         ranked: list[tuple[float, str]] = []
         for name in persona_config_manager.get_all_configs():
@@ -172,6 +174,20 @@ class AutonomyScheduler:
         )
         parsed = parse_footer(report.text)
         facts = extract_facts(report.steps)
+        from gsuid_core.ai_core.persona.config import read_drive_traits
+        from gsuid_core.ai_core.persona.presence import record_offscreen
+        from gsuid_core.ai_core.autonomy.verifier import take_is_grounded
+        from gsuid_core.ai_core.autonomy.micro_arc import (
+            prune_arcs,
+            advance_arc,
+            strip_markup,
+            load_micro_arcs,
+            save_micro_arcs,
+            normalize_topic_key,
+        )
+        from gsuid_core.ai_core.persona.homeostasis import touch_topic, load_homeostasis, save_homeostasis
+        from gsuid_core.ai_core.interaction_scaffold import is_persistent_style_rule
+
         decision = route_delivery(
             _plan(
                 digest,
@@ -187,22 +203,72 @@ class AutonomyScheduler:
         )
         mode = decision.mode
         pin = decision.pin
-        if mode == "immediate_push" and pin is not None:
-            sent = await _emit(pin, decision.summary[:400], persona_name)
-            if not sent:
+        tool_sent = any(
+            step.tool_name == "send_message_by_ai" and not step.is_error and not output_is_failed(step.output_text)
+            for step in report.steps
+        )
+        if tool_sent:
+            mode = "immediate_push"
+            sent_pin = _pin_for_tool_send(digest, report.last_sent_user_id, report.last_sent_group_id)
+            if sent_pin is not None:
+                pin = sent_pin
+                decision = DeliveryDecision(decision.drive, "immediate_push", pin, decision.summary)
+        else:
+            if mode == "immediate_push":
                 mode = "staged_merge"
-        if mode == "staged_merge" and pin is not None:
-            text = stage_text(facts)
+        if not tool_sent and mode == "staged_merge" and pin is not None:
+            text = stage_text(decision.summary, facts)
             if text:
                 get_dispatcher().stage_merge_context(
                     make_target_key(pin.group_id, pin.user_id or None),
                     text,
                     ttl_seconds=STAGE_TTL_SECONDS,
                     source="autonomy",
+                    persona_name=persona_name,
                 )
             else:
                 mode = "silent_only"
                 pin = None
+        traits = read_drive_traits(persona_config_manager.get_config(persona_name))
+        topic_key = normalize_topic_key(parsed.topic)
+        if topic_key:
+            _hs = await load_homeostasis(persona_name)
+            touch_topic(_hs, topic_key, now)
+            await save_homeostasis(persona_name, _hs)
+        arcs = await load_micro_arcs(persona_name)
+        take = parsed.take if not is_persistent_style_rule(parsed.take) else ""
+        arcs, arc = advance_arc(
+            arcs,
+            topic_key=parsed.topic,
+            intent=parsed.summary,
+            origin=parsed.drive,
+            outcome=parsed.outcome,
+            fact=parsed.fact,
+            take=take,
+            target_group_id=pin.group_id if pin and pin.group_id else "",
+            target_user_id=pin.user_id if pin and pin.user_id else "",
+            max_hops=traits.arc_persistence,
+            now=now,
+            arc_id=report.session_id[-12:],
+        )
+        arcs = prune_arcs(arcs, now)
+        await save_micro_arcs(persona_name, arcs)
+        _arc_ready = arc is not None and arc["stage"] == "ready_to_share" and take_is_grounded(parsed, report.steps)
+        if _arc_ready:
+            if parsed.drive == "care_user":
+                from gsuid_core.ai_core.control.lines import OFFSCREEN_CARE_GENERIC
+
+                await record_offscreen(persona_name, OFFSCREEN_CARE_GENERIC, now)
+            elif take or parsed.fact:
+                await record_offscreen(persona_name, (take or parsed.fact)[:45], now)
+            if mode == "staged_merge" and pin is not None and (parsed.fact or take):
+                get_dispatcher().stage_merge_context(
+                    make_target_key(pin.group_id, pin.user_id or None),
+                    strip_markup(f"{parsed.fact}；{take}"),
+                    ttl_seconds=STAGE_TTL_SECONDS,
+                    source="autonomy",
+                    persona_name=persona_name,
+                )
         plugins = [step.tool_name for step in report.steps if step.tool_name]
         activity_id = await _store(
             digest,
@@ -219,7 +285,8 @@ class AutonomyScheduler:
             created_at=time.time(),
         )
         if facts.has_substantive_outcome and decision.drive != "rest":
-            await _remember(persona_name, digest, pin, facts, activity_id)
+            memo = f"{take}（{parsed.fact[:120]}）" if (_arc_ready and take) else decision.summary
+            await _remember(persona_name, digest, pin, memo, facts, activity_id)
         self._advance(persona_name)
         logger.info(
             t(
@@ -233,6 +300,7 @@ class AutonomyScheduler:
 
     async def _blocked(self, persona_name: str, *, force: bool) -> str:
         from gsuid_core.ai_core.handle_ai import interactive_llm_in_use
+        from gsuid_core.ai_core.planning.kanban_executor import has_pending_interactive_deliveries
 
         config = persona_config_manager.get_config(persona_name)
         runtime = read_autonomy_runtime(config)
@@ -249,7 +317,7 @@ class AutonomyScheduler:
             mode_on=AUTONOMY_MODE in mode_list,
             scope_enabled=scope != "disabled",
             within_hours=within,
-            chat_busy=interactive_llm_in_use(),
+            chat_busy=interactive_llm_in_use() or has_pending_interactive_deliveries(),
             due=due,
             budget_ok=await _budget_ok(persona_name),
             force=force,
@@ -288,7 +356,9 @@ def _plan(
     quota: set[str] = set()
     gap: set[str] = set()
     for key in _keys(care, groups):
-        if not dispatcher.should_suppress_by_rate(key, max_per_hour=hour_cap, max_per_day=day_cap):
+        if not dispatcher.should_suppress_by_rate(
+            key, max_per_hour=hour_cap, max_per_day=day_cap, persona_name=digest.persona_name
+        ):
             quota.add(key)
         if dispatcher.should_suppress_heartbeat(key):
             gap.add(key)
@@ -326,14 +396,56 @@ async def _budget_ok(persona_name: str) -> bool:
     return decision.allowed
 
 
-async def _emit(pin: DeliveryPin, message: str, persona_name: str) -> bool:
+def _pin_for_tool_send(digest: ObservationDigest, user_id: str, group_id: str) -> DeliveryPin | None:
+    """审计钉记实际发出的会话。私聊不沿用关心对象最近待过的群。"""
+    care, groups = pins_from_digest(digest)
+    user_pin = next((item for item in care if item.user_id == user_id), None) if user_id else None
+    group_pin = next((item for item in groups if item.group_id == group_id), None) if group_id else None
+    if group_id:
+        if group_pin is None:
+            return None
+        if user_pin is None:
+            return group_pin
+        return DeliveryPin(
+            user_id=user_pin.user_id,
+            group_id=group_id,
+            is_master=user_pin.is_master,
+            zone_value=user_pin.zone_value,
+            bot_id=group_pin.bot_id or user_pin.bot_id,
+            bot_self_id=group_pin.bot_self_id or user_pin.bot_self_id,
+            ws_bot_id=group_pin.ws_bot_id or user_pin.ws_bot_id,
+            session_key=f"group:{group_id}",
+            last_human_ts=group_pin.last_human_ts,
+            last_assistant_ts=group_pin.last_assistant_ts,
+            preferences=user_pin.preferences,
+        )
+    if user_pin is None:
+        return None
+    return DeliveryPin(
+        user_id=user_pin.user_id,
+        group_id=None,
+        is_master=user_pin.is_master,
+        zone_value=user_pin.zone_value,
+        bot_id=user_pin.bot_id,
+        bot_self_id=user_pin.bot_self_id,
+        ws_bot_id=user_pin.ws_bot_id,
+        session_key=f"private:{user_pin.user_id}",
+        last_human_ts=user_pin.last_human_ts,
+        last_assistant_ts=user_pin.last_assistant_ts,
+        preferences=user_pin.preferences,
+    )
+
+
+async def _emit(pin: DeliveryPin, message: str, persona_name: str, source_group_id: str = "") -> bool:
     from gsuid_core.models import Event
     from gsuid_core.ai_core.proactive.emitter import emit_proactive_message
 
     if not message.strip():
         return False
+    bot_id = pin.bot_id or "Bot"
     event = Event(
-        bot_id=pin.bot_id or "Bot",
+        bot_id=bot_id,
+        real_bot_id=bot_id,
         bot_self_id=pin.bot_self_id,
         user_id=pin.user_id,
         user_pm=6,
@@ -347,6 +459,9 @@ async def _emit(pin: DeliveryPin, message: str, persona_name: str) -> bool:
         source="autonomy",
         trigger_reason=f"{persona_name} 自主行动",
         suppress_when_heartbeat_recent=True,
+        at_user_id=pin.user_id if (pin.group_id and pin.user_id) else None,
+        persona_name=persona_name,
+        source_group_id=source_group_id or pin.group_id or "",
     )
 
 
@@ -354,17 +469,22 @@ async def _remember(
     persona_name: str,
     digest: ObservationDigest,
     pin: DeliveryPin | None,
+    decision_summary: str,
     facts: FactPack,
     activity_id: int,
 ) -> None:
-    from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+    from gsuid_core.ai_core.memory.scope import self_scope_key
     from gsuid_core.ai_core.cognition.types import CogKind
     from gsuid_core.ai_core.cognition.remember import MemoryWrite, remember
 
     bot_self = pin.bot_self_id if pin is not None and pin.bot_self_id else digest.bot_self_id
     if not bot_self:
         bot_self = "core"
-    summary = fact_summary(facts)[:500]
+    obs = fact_summary(facts)
+    if decision_summary.strip():
+        summary = f"{decision_summary.strip()}；{obs}"[:500] if obs else decision_summary.strip()[:500]
+    else:
+        summary = obs[:500]
     if not summary:
         return
     ref = f"autonomy:{activity_id}" if activity_id else f"autonomy:{persona_name}:{int(time.time())}"
@@ -372,7 +492,7 @@ async def _remember(
         MemoryWrite(
             kind=CogKind.SELF_NOTE,
             ref=ref,
-            scope_key=make_scope_key(ScopeType.SELF, bot_self),
+            scope_key=self_scope_key(bot_self, persona_name),
             title=f"{persona_name} 自主行动",
             summary=summary,
             source="autonomy",

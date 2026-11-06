@@ -56,7 +56,9 @@ async def build_stable_context(event: Event, persona_name: str = "") -> str:
         from gsuid_core.ai_core.self_cognition import build_self_cognition_context
 
         # include_relationship=False：关系是 per-user，群 session 共享稳定前缀
-        return await build_self_cognition_context(bot_id=event.bot_id, scope_key=scope_key, include_relationship=False)
+        return await build_self_cognition_context(
+            bot_id=event.bot_id, persona_name=persona_name, scope_key=scope_key, include_relationship=False
+        )
 
     async def _group_profile_block() -> str:
         if not event.group_id:
@@ -224,7 +226,7 @@ async def assemble_dynamic_context(
     )
     from gsuid_core.ai_core.self_cognition import load_speaker_preference_tail
 
-    tail = await load_speaker_preference_tail(bot_id, user_id)
+    tail = await load_speaker_preference_tail(bot_id, persona_name or "", user_id)
     if tail:
         text = f"{text}\n\n{tail}" if text else tail
     from gsuid_core.ai_core.entity_index import strip_surfaces, format_alias_bindings
@@ -285,6 +287,7 @@ _ADDRESSED_FULL_BLOCKS: frozenset[str] = frozenset(
     {
         "voice_anchor",
         "mood",
+        "presence",
         "relationship",
         "task",
         "plan_hint",
@@ -292,19 +295,28 @@ _ADDRESSED_FULL_BLOCKS: frozenset[str] = frozenset(
         "memory",
         "history",
         "plugin_hints",
+        "group_context",
+        "chitchat_style",
+        "transaction_priority",
+        "report_titles",
     }
 )
-# 点名 suffix 产品块合计帽。voice_anchor 与历史线程在帽外。
+# 点名 suffix 产品块合计帽。voice_anchor、history 与单独预算的 memory 在帽外。
 _SUFFIX_PRODUCT_CAP = 400
 _SUFFIX_EXEMPT_BLOCKS: frozenset[str] = frozenset({"voice_anchor", "history"})
+_CAP_EXEMPT_BLOCKS: frozenset[str] = frozenset({"voice_anchor", "history", "memory"})
 _SUFFIX_KEEP_ORDER: tuple[str, ...] = (
     "task",
     "plan_hint",
     "relationship",
     "mood",
-    "memory",
+    "presence",
+    "group_context",
     "soft_trigger",
     "plugin_hints",
+    "chitchat_style",
+    "transaction_priority",
+    "report_titles",
 )
 
 
@@ -327,7 +339,7 @@ def suffix_allowed_blocks(ctx: "AgentHookContext") -> frozenset[str] | None:
 
 def _cap_group_suffix_blocks(blocks: Dict[str, str], cap: int) -> None:
     kept: Dict[str, str] = {}
-    for name in _SUFFIX_EXEMPT_BLOCKS:
+    for name in _CAP_EXEMPT_BLOCKS:
         if name not in blocks:
             continue
         text = blocks[name].strip()

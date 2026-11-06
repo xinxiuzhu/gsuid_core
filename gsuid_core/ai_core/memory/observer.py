@@ -217,7 +217,13 @@ _LOW_TIER_MAX_LEN = 10
 _PENDING_EPISODE_CAP = 8
 
 
-def _schedule_meme_knowledge_write(bot_id: str, group_id: str | None, term: str, meaning: str) -> None:
+def _schedule_meme_knowledge_write(
+    bot_id: str,
+    group_id: str | None,
+    term: str,
+    meaning: str,
+    persona_name: str = "",
+) -> None:
     """群友解释写入梗词典（后台，不挡 observe）。``bot_id`` 是平台 ID，与检索侧一致。"""
     if not bot_id:
         return
@@ -229,7 +235,7 @@ def _schedule_meme_knowledge_write(bot_id: str, group_id: str | None, term: str,
         return
 
     async def _write() -> None:
-        from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
+        from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key, self_scope_key
         from gsuid_core.ai_core.cognition.types import CogKind
         from gsuid_core.ai_core.cognition.remember import MemoryWrite, remember
         from gsuid_core.ai_core.meme.database_model import AiMemeKnowledge
@@ -249,7 +255,7 @@ def _schedule_meme_knowledge_write(bot_id: str, group_id: str | None, term: str,
             MemoryWrite(
                 kind=CogKind.MEME_KNOWLEDGE,
                 ref=str(row.id),
-                scope_key=scope_key or f"self:{bot_id}",
+                scope_key=scope_key or self_scope_key(bot_id, persona_name),
                 owner_user_id="",
                 title=term,
                 summary=meaning[:120],
@@ -372,6 +378,12 @@ def _gate(
     if _INJECTION_RE.search(stripped):
         logger.trace(t("log.memory.observer_injection_signature_filter_inject", p0=stripped[:30]))
         return None
+    # 凭据命令 / 凭据形态整条丢弃：token 绝不进记忆抽取管道
+    from gsuid_core.ai_core.mcp.pii import has_credential_form, is_credential_command
+
+    if is_credential_command(stripped) or has_credential_form(stripped):
+        logger.trace(t("log.memory.observer_credential_filtered"))
+        return None
     # 复读 / 刷屏检测
     if _is_repeat(scope_key, stripped):
         logger.trace(t("log.memory.observer_repetition_filter_matched", p0=stripped[:30]))
@@ -391,6 +403,7 @@ async def observe(
     *,
     force_scope_key: Optional[str] = None,
     bot_id: str = "",
+    persona_name: str = "",
 ) -> None:
     """向观察队列投递一条消息记录。
 
@@ -409,7 +422,7 @@ async def observe(
     SELF 轻量路由——回放语料里的 assistant 是对话内容而非"本机 Bot 戏言"，半数事实
     不应被丢进 ``self:`` 跳过抽取（否则探针召回不到 assistant 侧事实）。
     """
-    from .scope import ScopeType, make_scope_key
+    from .scope import ScopeType, make_scope_key, self_scope_key
 
     # force_scope_key 给定即视为评测回放：assistant 也当普通会话摄入，跳过 C6 SELF 路由
     is_self_speech = force_scope_key is None and speaker_id.startswith(_ASSISTANT_PREFIX)
@@ -420,7 +433,7 @@ async def observe(
         stripped = content.strip()
         if not stripped:
             return
-        scope_key = make_scope_key(ScopeType.SELF, bot_self_id)
+        scope_key = self_scope_key(bot_self_id, persona_name)
         value_tier = "LOW"
     else:
         # 普通用户消息：先按 GROUP / USER_GLOBAL 计算 scope（force_scope_key 优先），再过门控
@@ -435,6 +448,12 @@ async def observe(
         if tier is None:
             return
         value_tier = tier
+        # 群 scope 摄入前打码：群记忆全员可召回，PII 不落群记忆（私聊不掩——
+        # 用户私有记忆记手机号/地址是合法能力）。
+        if group_id:
+            from gsuid_core.ai_core.mcp.pii import mask_pii
+
+            content = mask_pii(content)
         # 程序性记忆门控（默认开）：命中纠错/偏好意图 → 强制 HIGH（确保进 high_records
         # 被偏好蒸馏消费）+ 标记 is_correction。纯规则、零 LLM，符合不变量 #1。
         if memory_config.enable_preference_memory and detect_correction_intent(content):
@@ -444,7 +463,7 @@ async def observe(
             value_tier = "HIGH"
             parsed = parse_meme_explain(content)
             if parsed is not None:
-                _schedule_meme_knowledge_write(bot_id, group_id, parsed[0], parsed[1])
+                _schedule_meme_knowledge_write(bot_id, group_id, parsed[0], parsed[1], persona_name)
         elif value_tier == "HIGH":
             from gsuid_core.ai_core.memory.lifecycle.predict_calibrate import should_downgrade_high
 

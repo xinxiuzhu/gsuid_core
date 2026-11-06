@@ -264,7 +264,7 @@ def expand_query_with_aliases(query: str, term_mappings: Dict[str, str]) -> str:
         return query
     appended: List[str] = []
     for alias, formal in term_mappings.items():
-        if alias and alias in query and formal and formal not in query:
+        if alias and len(alias) >= 2 and alias in query and formal and formal not in query:
             appended.append(formal)
     if not appended:
         return query

@@ -110,14 +110,19 @@ def structural_zero_tool_directive(*, tool_pool_size: int) -> Directive:
     )
 
 
-def framework_idle_deliver_directive() -> Directive:
+def framework_idle_deliver_directive(*, allow_render: bool = True) -> Directive:
     """交付回灌零工具却对用户报进度或念大表格。纠正去出图/发图，进度句不放行。"""
+    render_hint = (
+        '只有复杂长表格/大对照表才必须 create_subagent(agent_profile="render_agent") 出图。'
+        if allow_render
+        else "当前人格未启用出图委派：长结果直接用角色口吻概括交付给用户，禁止委派 render_agent。"
+    )
     return Directive(
         kind="correction",
         reason_code="framework_idle_deliver",
         observation=(
             "这是任务交付回灌。简短事实（如版本号、轻量状态）可以直接用角色口吻概括交付给用户；"
-            '只有复杂长表格/大对照表才必须 create_subagent(agent_profile="render_agent") 出图。'
+            f"{render_hint}"
             "有图就 send_message_by_ai 发出。切勿只输出「在查/别催」等废话进度句。"
         ),
         obligations=(
@@ -207,6 +212,24 @@ def premature_claim_directive() -> Directive:
             ),
         ),
         evidence=Evidence(tool_calls=0, detail="出站话术闸拦下了完成态"),
+    )
+
+
+def inflight_wait_directive() -> Directive:
+    """在途多说被拦、用户没看到。还没放过等待时，改成一句等待。"""
+    return Directive(
+        kind="correction",
+        reason_code="silence_only_or_async",
+        observation=(
+            "任务还在进行，你上一段没有发出。改成一句等待，不要讲进度、结果或内部步骤。不要只输出 <SILENCE>。"
+        ),
+        obligations=(
+            Obligation(
+                must="deliver",
+                satisfied_by=("user_visible_sent",),
+            ),
+        ),
+        evidence=Evidence(tool_calls=0, detail="在途台词被拦，还没有放过等待"),
     )
 
 

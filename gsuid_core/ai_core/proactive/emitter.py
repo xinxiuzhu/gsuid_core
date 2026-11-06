@@ -23,6 +23,7 @@ Kanban 子任务转译 / Kanban 失败播报 / 工具主动发送等）。它在
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Literal, Optional
 from pathlib import Path
 
@@ -84,7 +85,15 @@ async def _sync_to_main_session(
     session: Optional[GsCoreAIAgent] = registry.get_ai_session(session_id)
 
     if session is None:
-        # 主 session 不在内存时走磁盘回退路径，使用临时 logger 续写对应窗口日志。
+        try:
+            from gsuid_core.ai_core.ai_router import get_ai_session
+
+            session = await get_ai_session(event)
+        except Exception:
+            session = None
+
+    if session is None:
+        # 主 session 无法创建时走磁盘回退路径，使用临时 logger 续写对应窗口日志。
         AISessionLogger.log_standalone_proactive(
             session_id=session_id,
             source=source,
@@ -125,6 +134,9 @@ async def emit_proactive_message(
     generator_log_files: Optional[List[str]] = None,
     bot: Optional[Bot] = None,
     suppress_when_heartbeat_recent: bool = True,
+    at_user_id: Optional[str] = None,
+    persona_name: Optional[str] = None,
+    source_group_id: str = "",
 ) -> bool:
     """统一主动消息出口。
 
@@ -183,13 +195,19 @@ async def emit_proactive_message(
     from gsuid_core.ai_core.output_gate import GateDecision, pre_send_gate
     from gsuid_core.ai_core.persona.settings import persona_name_from_event
 
-    pname = persona_name_from_event(event)
+    pname = persona_name or persona_name_from_event(event)
     out_msg = rewrite_cq_at(message)
     if out_msg:
         _bag: Dict[str, object] = {}
         if pname:
             _bag["persona_name"] = pname
-        _gr = pre_send_gate(out_msg, _bag, user_text="", channel="main")
+        _gr = pre_send_gate(
+            out_msg,
+            _bag,
+            user_text="",
+            channel="main",
+            is_group=bool(event.group_id),
+        )
         if _gr.decision is GateDecision.FUSE:
             logger.warning(t("log.ai.firewall_result_hit_ooc_red", p0="fuse", p1="proactive"))
             return False
@@ -207,7 +225,21 @@ async def emit_proactive_message(
             out_msg = _gr.send_text
             if not out_msg:
                 return False
-    await send_chat_result(bot, out_msg, ev=event, extra_metadata=extra_metadata)
+        elif _gr.send_text:
+            out_msg = _gr.send_text
+    from gsuid_core.ai_core.persona.speaking_ctx import set_speaking_persona, reset_speaking_persona
+
+    _speaking_token = set_speaking_persona(pname or "")
+    try:
+        await send_chat_result(
+            bot,
+            out_msg,
+            ev=event,
+            extra_metadata=extra_metadata,
+            at_user_id=at_user_id,
+        )
+    finally:
+        reset_speaking_persona(_speaking_token)
 
     await record_outbound(
         ev=event,
@@ -215,11 +247,24 @@ async def emit_proactive_message(
         text=out_msg,
         image_id="",
         topic="",
-        target_user=proactive_directed_target(event, out_msg),
+        target_user=at_user_id or proactive_directed_target(event, out_msg),
         target_name="",
     )
 
     # 4) 同步到用户主 session（pydantic_ai 历史 + session_logger）
+    if not event.group_id and event.user_id and pname:
+        from gsuid_core.ai_core.database.models import UserFavorability
+        from gsuid_core.ai_core.proactive.dm_lease import grant_dm_lease
+
+        grant_dm_lease(
+            user_id=event.user_id,
+            persona_name=pname,
+            bot_id=event.bot_id or "",
+            source_group_id=source_group_id,
+        )
+        # 互惠退避记账：只 UPDATE 既有行，不建行
+        await UserFavorability.record_proactive_dm_sent(event.user_id, event.bot_id or "", pname, int(time.time()))
+
     await _sync_to_main_session(
         event=event,
         message=out_msg,
@@ -236,7 +281,24 @@ async def emit_proactive_message(
     else:
         legacy_source = "task"
     summary: str = out_msg if source in ("scheduled_task", "heartbeat", "autonomy") else ""
-    dispatcher.register_send(target_key, legacy_source, summary)
+    dispatcher.register_send(target_key, legacy_source, summary, persona_name=pname or "")
+
+    # 存在感：记录主动发信回响 + 本轮发言耗能（按人格分桶）。
+    # echo 只记 heartbeat/autonomy——定时任务与 Kanban 播报是通知而非搭话，
+    # 没人回复不该喂冷肩冲击。
+    if pname:
+        from gsuid_core.ai_core.persona.config import read_drive_traits, persona_config_manager as _pcm
+        from gsuid_core.ai_core.persona.presence import record_echo
+        from gsuid_core.ai_core.persona.homeostasis import apply_turn_shock, load_homeostasis, save_homeostasis
+
+        if source in ("heartbeat", "autonomy"):
+            _is_priv = event.user_type == "direct"
+            _tkey = f"private:{event.user_id}" if _is_priv else str(event.group_id or "")
+            await record_echo(pname, _tkey, _is_priv, out_msg[:36], time.time())
+        _traits = read_drive_traits(_pcm.get_config(pname))
+        _hs = await load_homeostasis(pname)
+        apply_turn_shock(_hs, _traits, time.time())
+        await save_homeostasis(pname, _hs)
 
     logger.info(
         t(

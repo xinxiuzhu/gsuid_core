@@ -25,12 +25,15 @@ from gsuid_core.models import (
 from gsuid_core.server import on_core_shutdown
 from gsuid_core.trigger import Trigger, dispatch_sort_key
 from gsuid_core.global_val import get_platform_val, mark_command_dirty
-from gsuid_core.ai_core.hooks import AgentHookPoint, AgentHookContext, fire_hooks, should_fire
 from gsuid_core.trigger_index import get_trigger_index
 from gsuid_core.utils.cooldown import cooldown_tracker
-from gsuid_core.message_history import get_history_manager
+from gsuid_core.message_history import (
+    segments_preview,
+    get_history_manager,
+    segments_from_event,
+    node_items_to_history,
+)
 from gsuid_core.utils.database.models import CoreUser, CoreGroup, Subscribe
-from gsuid_core.ai_core.persona.config import persona_config_manager
 from gsuid_core.utils.resource_manager import RM
 from gsuid_core.ai_core.followup_window import (
     note_hard_trigger,
@@ -44,7 +47,6 @@ from gsuid_core.utils.plugins_config.gs_config import (
     log_config,
 )
 from gsuid_core.utils.database.global_val_models import DataType
-from gsuid_core.buildin_plugins.core_command.core_ai_control.state import is_scope_banned
 
 
 @dataclass
@@ -59,8 +61,8 @@ class _SoftDebounceItem:
 
 _soft_debounce_map: dict[str, _SoftDebounceItem] = {}
 
-# handle_ai、command_aside.runner、statistics、startup 仍在函数内导入。
-# 它们会拉起 Agent 运行时；提到这里会让 import handler 在启动前加载这套栈。
+# hooks / persona.config / approval / handle_ai / startup 都在 enable_ai 分支内导入。
+# 提到模块顶层会让 import handler 在关 AI 时仍拉起工具注册与审批栈。
 
 # 读循环不 await 这条。预算要长于写闸门排队，好让超时先变成失败而不是取消到一半。
 _INBOUND_BUDGET_S = 30.0
@@ -291,7 +293,7 @@ async def _flush_user_buffer_on_shutdown():
 
 
 def _sv_authorized(_sv: SV, event: Event, user_pm: int) -> bool:
-    """复刻命令循环中的 Plugins/SV 级联鉴权（pm / 黑白名单 / area / enabled）。
+    """复刻命令循环中的 Plugins/SV 级联鉴权（pm / 黑白名单 / Bot 白名单 / area / enabled）。
 
     全局 BlackList 由调用方在循环外统一判断，这里只做 plugin/sv 级。
     命令路径与 meta 路径共用，保证两处鉴权口径一致、不漂移。
@@ -314,6 +316,13 @@ def _sv_authorized(_sv: SV, event: Event, user_pm: int) -> bool:
     if _plugins.white_list and _plugins.white_list != [""]:
         if event.user_id not in _plugins.white_list and event.group_id not in _plugins.white_list:
             return False
+    # 插件级 Bot 账号过滤：空项不生效，两个名单都填时黑名单优先
+    bot_black = [b for b in _plugins.bot_black_list if b]
+    if bot_black and event.bot_self_id in bot_black:
+        return False
+    bot_white = [b for b in _plugins.bot_white_list if b]
+    if bot_white and event.bot_self_id not in bot_white:
+        return False
     if not _sv.enabled:
         return False
     if user_pm > _sv.pm:
@@ -406,11 +415,50 @@ async def handle_meta_event(ws: _Bot, msg: MessageReceive) -> None:
             break
 
 
+def _sender_snapshot(event: Event) -> Dict[str, str]:
+    """入站发送者的最小快照，控制台拿它渲染昵称 / 头像 / 群身份。"""
+    sender = event.sender or {}
+    snapshot: Dict[str, str] = {"user_id": event.user_id or ""}
+    for src, dst in (
+        ("nickname", "nickname"),
+        ("card", "card"),
+        ("avatar", "avatar"),
+        ("role", "role"),
+        ("title", "title"),
+        ("openid", "openid"),
+        ("unionid", "unionid"),
+        ("group_name", "group_name"),
+        ("group_icon", "group_icon"),
+    ):
+        value = sender.get(src)
+        if isinstance(value, str) and value:
+            snapshot[dst] = value
+    return snapshot
+
+
+_RICH_SEGMENT_TYPES = frozenset(
+    {
+        "card",
+        "ark",
+        "buttons",
+        "template_buttons",
+        "markdown",
+        "template_markdown",
+        "record",
+        "video",
+        "file",
+        "face",
+    }
+)
+
+
 def _record_inbound_history(event: Event) -> None:
     """入站写入 HistoryManager。无配文纯图也记，后面的轮次才能看见上一张。"""
     has_text = bool(event.raw_text and event.raw_text.strip())
     has_image = bool(event.image_id or event.image_id_list)
-    if not (has_text or event.at_list or has_image):
+    has_node = event.node is not None
+    has_rich = any(isinstance(item, Message) and item.type in _RICH_SEGMENT_TYPES for item in (event.content or []))
+    if not (has_text or event.at_list or has_image or has_node or has_rich or event.is_tome):
         return
 
     user_name = None
@@ -420,10 +468,12 @@ def _record_inbound_history(event: Event) -> None:
     if event.sender and "avatar" in event.sender:
         user_avatar = event.sender["avatar"]
 
+    segments = segments_from_event(event)
     metadata: dict[str, object] = {
         "msg_id": event.msg_id,
         "bot_id": event.bot_id,
         "user_type": event.user_type,
+        "sender": _sender_snapshot(event),
     }
     if event.image_id_list:
         metadata["image_id_list"] = event.image_id_list
@@ -455,16 +505,45 @@ def _record_inbound_history(event: Event) -> None:
 
     if event.at_list:
         metadata["at_list"] = event.at_list
+    if event.at_bot:
+        metadata["at_bot"] = True
+    if event.reply_id:
+        metadata["reply_id"] = event.reply_id
+    if event.reply:
+        metadata["reply_preview"] = str(event.reply)[:120]
+    if event.audio_id_list:
+        metadata["audio_id_list"] = event.audio_id_list
+    elif event.audio_id:
+        metadata["audio_id_list"] = [event.audio_id]
+    if event.video_id_list:
+        metadata["video_id_list"] = event.video_id_list
+    elif event.video_id:
+        metadata["video_id_list"] = [event.video_id]
     if event.file:
-        metadata["file_id"] = event.file
+        file_desc = str(event.file)
+        if "|" in file_desc:
+            file_desc = file_desc.split("|", 1)[0]
+        metadata["file_id"] = file_desc
+
+    content = event.raw_text.strip()
+    if has_node:
+        metadata["node"] = node_items_to_history(event.node or [])
+        # 纯转发消息没有 raw_text，用摘要兜底，文本视图和 AI 上下文才不会是空串
+        if not content:
+            content = format_node_preview(event.node or [])
+    elif not content:
+        # 纯图 / 纯 at / 纯表情也没有 raw_text，不兜底摘要的话内存里 record.content
+        # 是空串，控制台从内存还原时只能显示「空消息」
+        content = segments_preview(segments)
 
     get_history_manager().add_message(
         event=event,
         role="user",
-        content=event.raw_text.strip(),
+        content=content,
         user_name=user_name if isinstance(user_name, str) else None,
         user_avatar=user_avatar if isinstance(user_avatar, str) else None,
         metadata=metadata,
+        segments=segments,
     )
 
 
@@ -491,11 +570,17 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
     if show_receive:
         logger.info(t("log.handler.event_received"), event_payload=event)
 
-    ai_scope_banned = is_scope_banned(event.session_id)
+    ai_scope_banned = False
+    if enable_ai:
+        from gsuid_core.buildin_plugins.core_command.core_ai_control.state import is_scope_banned
+
+        ai_scope_banned = is_scope_banned(event.session_id)
 
     # ====== H00 入站观察扇出（记忆 / 表情 / 图片记忆）======
     # 只观察，**不挡**命令/AI 分流；要拦 AI 走 H01。失败 fail-open。
     if enable_ai and not ai_scope_banned:
+        from gsuid_core.ai_core.hooks import AgentHookPoint, AgentHookContext, fire_hooks, should_fire
+
         if should_fire(AgentHookPoint.ON_INBOUND):
             inbound_ctx = AgentHookContext(
                 point=AgentHookPoint.ON_INBOUND,
@@ -542,6 +627,13 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
         temp_gid = uid
 
     session_id = f"{bid}%%%{temp_gid}%%%{uid}"
+
+    # 确认码先于问答等待器。AI 关闭时不导入审批模块、不查 AI 表。
+    if enable_ai and event.user_type == "direct" and event.raw_text:
+        from gsuid_core.ai_core.approval import match_confirm_message
+
+        if await match_confirm_message(event):
+            return
 
     instances = Bot.get_instances()
     mutiply_instances = Bot.get_mutiply_instances()
@@ -713,6 +805,8 @@ async def handle_event(ws: _Bot, msg: MessageReceive, is_http: bool = False):
         group_in_white_list = event.group_id is not None and event.group_id in ai_white_list
         if ai_white_list and not (user_in_white_list or group_in_white_list):
             return
+
+        from gsuid_core.ai_core.persona.config import persona_config_manager
 
         # 使用 Event.session_id 属性获取标准格式的 session_id
         session_id = event.session_id
@@ -898,6 +992,7 @@ async def msg_process(msg: MessageReceive) -> Event:
             # 下游"@的不是你"标注（history_format/utils）就会反向压制真正的 @Bot 消息
             if str(_msg.data) == str(event.bot_self_id):
                 event.is_tome = True
+                event.at_bot = True
                 continue
             else:
                 event.at = str(_msg.data)

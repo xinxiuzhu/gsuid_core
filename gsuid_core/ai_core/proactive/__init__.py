@@ -13,9 +13,22 @@
    ``ModelMessage``），让下一轮 LLM 看得到自己说过什么；
 4. 写入该用户 session 的 ``AISessionLogger``（新增 ``proactive_emission``
    entry，可在 webconsole 主动消息时间线里展示）；
-5. C8 网关登记 ``register_send``（保留旧的合并语境策略）。
+5. C8 网关登记 ``register_send``（保留旧的合并语境策略）；
+6. 私聊场景同步签发私聊亲和契约（``grant_dm_lease``），保证 72 小时内原人格跟进。
 """
 
 from gsuid_core.ai_core.proactive.emitter import emit_proactive_message
+from gsuid_core.ai_core.proactive.dm_lease import (
+    grant_dm_lease,
+    renew_dm_lease,
+    revoke_dm_lease,
+    get_active_dm_lease,
+)
 
-__all__ = ["emit_proactive_message"]
+__all__ = [
+    "emit_proactive_message",
+    "grant_dm_lease",
+    "get_active_dm_lease",
+    "renew_dm_lease",
+    "revoke_dm_lease",
+]

@@ -47,6 +47,12 @@ async def _init_persona():
     await init_default_personas()
 
 
+async def _init_persona_scope_migration():
+    from gsuid_core.ai_core.migrations.persona_scope_v1 import migrate_legacy_persona_scopes
+
+    await migrate_legacy_persona_scopes()
+
+
 async def _init_scheduled_task():
     from gsuid_core.ai_core.scheduled_task.startup import init_scheduled_tasks
 
@@ -54,10 +60,23 @@ async def _init_scheduled_task():
 
 
 async def _init_approval():
-    from gsuid_core.ai_core.approval import prime_pending, register_builtin_categories
+    from gsuid_core.aps import scheduler
+    from gsuid_core.ai_core.approval import expire_due, prime_pending, register_builtin_categories
 
     register_builtin_categories()
     await prime_pending()
+
+    async def _expire_job() -> None:
+        await expire_due()
+
+    scheduler.add_job(
+        func=_expire_job,
+        trigger="interval",
+        seconds=30,
+        id="approval_expire_due",
+        name="审批确认码过期",
+        replace_existing=True,
+    )
 
 
 async def _init_planning():
@@ -73,6 +92,7 @@ async def _init_memory():
 
 
 async def _init_mcp_tools():
+    from gsuid_core.ai_core.mcp import bind_command as _mcp_bind_command  # noqa: F401
     from gsuid_core.ai_core.mcp.startup import init_mcp_tools
 
     await init_mcp_tools()
@@ -198,6 +218,7 @@ _INIT_STEPS = [
     ("Agent 套件", _init_agent_kits),
     ("RAG", _init_rag),
     ("Persona", _init_persona),
+    ("多人格隔离迁移", _init_persona_scope_migration),
     ("审批中心", _init_approval),
     ("定时任务", _init_scheduled_task),
     ("长任务编排", _init_planning),

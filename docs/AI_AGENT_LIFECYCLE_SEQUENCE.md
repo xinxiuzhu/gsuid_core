@@ -1488,7 +1488,6 @@ agent.iter(message_history=self.history + 本轮 user)   # loop.py
         · 墙钟软预算（等待中：角色短句或 SILENCE）/ 同工具 thrash fuse
         · 输出闸 REWRITE feedback（上一轮 Text 被打回）
         · 输出闸 FUSE 提示（熔断后最多注入一次）
-        · **交付终局 SILENCE 指令**（DELIVERED 后只注入一次，取代 POST_TOOL）
         · 计划一行 / 引用对象 / 口癖配额（user 侧，_relean 剥除或瘦身）
       请求侧 ToolReturn 处理：
         · is_tech_dump → TECH_DUMP_TOOL_SHIELD（主人格）
@@ -1500,7 +1499,7 @@ agent.iter(message_history=self.history + 本轮 user)   # loop.py
             Capability 非 render → 事实包；禁嵌套 create_subagent/render
             render_agent → 单次 render_html_to_image；只登记 artifact
             失败 → 对应 FAIL 契约
-            **DELIVERED 终局** → 改注入 POST_DELIVERY_SILENCE（禁再注入 POST_TOOL）
+            发送工具交付之后仍注入 POST_TOOL，模型可以自己决定要不要再说话
     CallToolsNode → _run_once_on_call_tools
       清洗：embedded thinking / tool_call 伪影 / 参数规范化 / thrash 剥重复 call
       **先扫**本响应是否有 create_subagent(render_agent)：有则立刻
@@ -1703,7 +1702,17 @@ API 错误字面量 → 角色短句替换
 
 session_log entries（磁盘，可稍后刷）：
 
-`run_start` → `user_input` → `tools_list` → `thinking_effort` → `thinking`* → (`tool_call`/`tool_return`)* → `text_output`* → `result` → `token_usage` → `run_end`
+`run_start` → `user_input` → `tools_list` → `tools_change`? → `thinking_effort` → `thinking`* → (`tool_call`/`tool_return`/`tools_change`)* → `step_usage`* → `text_output`* → `result` → `token_usage` → `run_end`
+
+> `tools_change` 只在有变化时落：装配处记与上一轮名单的 added/removed 差分和 hinted
+> （本轮只提示未挂载的种子）；`find_tools` 返回处记本次新挂载名（`source=find_tools`，
+> 带 tool_call_id）。渐进式暴露开启时本轮种子不再进 schema——以 hinted 形式写进
+> 当轮 user 提示，由模型 `find_tools(need="确切工具名")` 挂载，保证工具列表稳定
+> （前缀缓存不失效、快照不超顶）。
+>
+> `step_usage` 在每个 CallToolsNode 响应结算处（TTFT/TPS 算完、`first_event_at`
+> 复位前）落一条：该次模型请求的 input/output/cache_read/cache_write、model_name、
+> ttft_ms、tps、tool_calls。`token_usage` 仍是整 run 的权威总量，两者并存。
 
 > 注：`text_output` 记录的是模型**原始**台词（可含后被 gate 拦下的 `<bubble/>` 等）；是否真正出站看 gate + `send_chat_result`。熔断/scrub 改的是 **B 轨 `self.history`**，不一定回写 session_log 已落条目。
 

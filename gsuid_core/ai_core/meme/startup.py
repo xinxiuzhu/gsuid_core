@@ -45,7 +45,6 @@ async def init_meme_module():
         logger.warning(t("log.meme.qdrant_collection_initialization_non", e=e))
     await finish_pack_payload()
 
-    # 3. 启动后台打标与安全删除 worker
     try:
         from gsuid_core.ai_core.meme.tagger import start_tag_worker
         from gsuid_core.ai_core.meme.deletion import recover_delete_operations
@@ -55,6 +54,10 @@ async def init_meme_module():
         logger.info(t("log.meme.tagging_worker_startup"))
     except Exception as e:
         logger.error(t("log.meme.tagging_worker_startup_2", e=e))
+
+    from gsuid_core.ai_core.meme.observer import start_collect_worker
+
+    start_collect_worker()
 
     # 4. 处理 inbox 中遗留的待打标图片（仅在 VLM 打标启用时；关闭时由 worker/scanner
     #    在网页控制台开启 meme_vlm_enable 后自动补回 pending 记录）
@@ -84,7 +87,9 @@ async def shutdown_meme_module():
     try:
         from gsuid_core.ai_core.meme.tagger import stop_tag_worker
         from gsuid_core.ai_core.meme.deletion import stop_delete_worker
+        from gsuid_core.ai_core.meme.observer import stop_collect_worker
 
+        await stop_collect_worker()
         await stop_tag_worker()
         await stop_delete_worker()
     except Exception:

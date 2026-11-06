@@ -15,8 +15,8 @@
 
 失败处理：默认 ``notify_persona`` 策略——子任务失败时不级联整树失败，而是用人格
 口吻把 ``failure_reason`` 转告主人格，由主人格调 ``respawn_subtask`` /
-``fail_task_tree`` 二选一；超过重派上限会自动挂为 ``waiting_approval``，由主人通过
-webconsole 或对话回复审批（统一转达工具 ``respond_approval``）。
+``fail_task_tree`` 二选一；超过重派上限会自动挂为 ``waiting_approval``。主人用
+私聊确认码或审批中心批准。群里说「同意」不会通过。
 """
 
 import re
@@ -240,7 +240,8 @@ def _format_subtask_prompt(
         "\n- 真实文件落地产物（PNG / PDF / CSV / 二进制等）必须用"
         ' `artifact_put(file_path="workspace 内文件名", summary=...)` 登记；'
         '**不要**用 `artifact_put(payload=\'{"file": "..."}\')` 这种 JSON 元数据冒充文件——'
-        "只有真实文件 artifact 才能被上游作为图片/文件发出。"
+        "只有真实文件 artifact 才能被主人格经 `send_message_by_ai` 作为图片/文件发出"
+        "（图片用 image_ids，文件用 file_ids，单文件 ≤10MB）。"
         '\n- 纯文本结论 / 报告正文：`artifact_put(payload="...", summary="...")`。'
         "\n- 持久化业务数据（签到名单、流水、任务条目等）：用 `record_put` / "
         "`record_append` / `record_update` 写入框架统一的 `record:<集合名>` 集合，"
@@ -308,8 +309,7 @@ async def _persona_relay(
 ) -> Tuple[str, List[str]]:
     """人格转译：能力代理结果再过一遍主人格口吻。
 
-    ``is_approval_request=True`` 时按"请求主人审批"口吻转译（请主人回复同意/拒绝），
-    而非"任务已完成"的进展播报。
+    ``is_approval_request=True`` 时只说明在等私聊确认，不说任务已完成。
 
     把本子任务登记的 ``workspace_file`` / ``output`` artifact 显式列在转译 prompt
     里——否则主人格转译时看不到 ``res_xxx`` 句柄，主人事后追问"刚才那张图呢"
@@ -498,6 +498,11 @@ _INTERACTIVE_RELAY_ROOTS: set[str] = set()
 _DEFERRED_MAIN_DELIVERY_ROOTS: set[str] = set()
 
 
+def has_pending_interactive_deliveries() -> bool:
+    """进程内是否仍有等待回灌给主人格的交互式子任务。"""
+    return bool(_DEFERRED_MAIN_DELIVERY_ROOTS or _delivery_pending or _delivery_flush_tasks)
+
+
 def mark_interactive_relay_root(root_id: str) -> None:
     """登记「主人格转述、执行体静默」的交互式叶子根。"""
     _INTERACTIVE_RELAY_ROOTS.add(root_id)
@@ -539,7 +544,13 @@ def _consume_deferred_main_delivery(root_id: str) -> bool:
     return False
 
 
-def _format_delivery_for_main_agent(task: AIAgentTask, raw_result: str, arts: List[AIAgentArtifact]) -> str:
+def _format_delivery_for_main_agent(
+    task: AIAgentTask,
+    raw_result: str,
+    arts: List[AIAgentArtifact],
+    *,
+    allow_render: bool = True,
+) -> str:
     """拼给主人格的交付包：与 PersistedHandleCard 同形，禁止全文塞 prompt。"""
     _ = raw_result
     from gsuid_core.ai_core.planning.tool_output_protocol import PersistedHandleCard
@@ -560,6 +571,7 @@ def _format_delivery_for_main_agent(task: AIAgentTask, raw_result: str, arts: Li
             read_tool="read_handle",
             long_structured=not is_img,
             speech_expand=False,
+            render_allowed=allow_render,
         )
         cards.append(card.format())
         if is_img and not primary:
@@ -590,7 +602,7 @@ _delivery_pending: dict[str, tuple[AIAgentTask, str]] = {}
 _delivery_flush_tasks: dict[str, asyncio.Task] = {}
 _DELIVERY_COALESCE_SEC = 0.45
 _DELIVERY_WAKE_WINDOW_SEC = 180.0
-_DELIVERY_WAKE_MAX = 2
+_DELIVERY_WAKE_MAX = 4
 _delivery_wake_hits: dict[str, list[float]] = {}
 
 
@@ -682,7 +694,10 @@ async def _wake_main_agent_for_delivery(task: AIAgentTask, raw_result: str) -> N
 async def _wake_main_agent_for_delivery_now(task: AIAgentTask, raw_result: str) -> None:
     """实际唤醒主人格（合并后单次）。"""
     arts = await AIAgentArtifact.list_for_task(task.id)
-    delivery = _format_delivery_for_main_agent(task, raw_result, arts)
+    from gsuid_core.ai_core.agent_node.registry import persona_allows_capability_agent
+
+    allow_render = persona_allows_capability_agent(task.persona_name, "render_agent")
+    delivery = _format_delivery_for_main_agent(task, raw_result, arts, allow_render=allow_render)
     ev = _build_event(task)
     bot = _get_bot(task, ev)
 
@@ -716,7 +731,10 @@ async def _wake_main_agent_for_delivery_now(task: AIAgentTask, raw_result: str) 
 
     root_id = (task.root_task_id or task.id).strip()
     owner = (task.owner_user_id or "").strip()
-    at_hint = f"收尾时 @发起人 `@{owner}`。" if owner else ""
+    # 私聊（direct）里消息只会发给发起人本人，@ 没有提醒意义、反而污染台词；
+    # 只在群聊/频道场景注入 @提示（user_type 口径与 _build_event 一致）。
+    _user_type = task.user_type if task.user_type in _VALID_USER_TYPES else "direct"
+    at_hint = f"收尾时 @发起人 `@{owner}`。" if owner and _user_type != "direct" else ""
     title_ban = ""
     if owner:
         from gsuid_core.ai_core.utils import _is_master_user
@@ -728,7 +746,7 @@ async def _wake_main_agent_for_delivery_now(task: AIAgentTask, raw_result: str) 
                 title_ban = f"发起人不是主人，禁止称「{title}」。"
     from gsuid_core.ai_core.control.lines import delivery_wake_line
 
-    frame_text = delivery_wake_line(delivery, at_hint, title_ban)
+    frame_text = delivery_wake_line(delivery, at_hint, title_ban, allow_render=allow_render)
     record_delivery_wake(session_id, root_id)
     root_token = bind_delivery_root(root_id)
     try:
@@ -860,6 +878,7 @@ async def _run_one_task_node(root: AIAgentTask, child: AIAgentTask) -> None:
                 ev=ev,
                 bot=bot,
                 session_id_suffix=f"kanban_{root.id[:6]}_{fresh.id[:6]}",
+                persona_name=fresh.persona_name or root.persona_name or "",
             )
         except Exception as e:
             logger.exception(t("log.ai.kanban_subtask_raised_fail", e=e))
@@ -881,8 +900,10 @@ async def _run_one_task_node(root: AIAgentTask, child: AIAgentTask) -> None:
             # 纯标记输出也要留档，下游依赖本节点 artifact 时不至于拿到空上游
             raw_result = "（本轮无值得播报的进展）"
 
-        # 4) 没产出 artifact 时用 raw_result 兜底写一份 text
+        # 4) 挂起不留档、不叫醒主人格。批准后的回灌另走调用会话。
         latest = await AIAgentTask.get_by_id(fresh.id)
+        if latest is not None and latest.status == "waiting_approval":
+            return
         output_id = latest.output_artifact_id if latest and latest.output_artifact_id else ""
         if not output_id and raw_result:
             art = await put_artifact(
@@ -912,18 +933,7 @@ async def _run_one_task_node(root: AIAgentTask, child: AIAgentTask) -> None:
             CAPABILITY_AGENT_ERROR_PREFIX,
         )
 
-        # 交互 / 有主 session → 回灌主人格；绝不 Kanban_Relay
-        if latest is not None and latest.status == "waiting_approval":
-            body = latest.failure_reason or raw_result
-            await _finish_capability_delivery(
-                root=root,
-                child=fresh,
-                raw_result=body,
-                bot=bot,
-                no_broadcast=no_broadcast,
-                is_approval=True,
-            )
-        elif (raw_result or "").startswith(CAPABILITY_AGENT_ERROR_PREFIX):
+        if (raw_result or "").startswith(CAPABILITY_AGENT_ERROR_PREFIX):
             await kanban.mark_subtask_failed(fresh, raw_result[:1000])
             await _finish_capability_delivery(
                 root=root,

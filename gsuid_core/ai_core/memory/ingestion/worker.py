@@ -725,7 +725,7 @@ async def _extract_and_upsert_from_episode(
     """
     # Step 3: 抽取仅使用 HIGH 价值消息，并在喂给 LLM 前折叠无实体信息行以省 Token（Fix-7）
     extract_dialogue = _compact_high_records_dialogue(high_records)
-    if not extract_dialogue.strip():
+    if not extract_dialogue.strip() or (len(high_records) < 3 and len(extract_dialogue.strip()) < 40):
         logger.debug(i18n_t("log.memory.scope_key_extraction_empty", scope_key=scope_key))
         return
 

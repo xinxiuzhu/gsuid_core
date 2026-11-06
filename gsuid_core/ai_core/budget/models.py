@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
-from gsuid_core.utils.database.base_models import BaseIDModel, with_session
+from gsuid_core.utils.database.base_models import BaseIDModel, with_session, with_read_session
 
 # 规则维度合法值；group_each 是抽象规则维度，不用于 reset / 具体 scope 查询。
 SCOPE_TYPES = ("global", "group_each", "group", "member", "user")
@@ -63,7 +63,7 @@ class AIBudgetRule(BaseIDModel, table=True):
         return int(obj.id)
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_all_rules(cls, session: AsyncSession) -> List["AIBudgetRule"]:
         """获取全部规则（按优先级倒序、id 正序，便于稳定展示）。"""
         stmt = select(cls).order_by(col(cls.priority).desc(), col(cls.id).asc())
@@ -71,7 +71,7 @@ class AIBudgetRule(BaseIDModel, table=True):
         return list(result.scalars().all())
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_rule(cls, session: AsyncSession, rule_id: int) -> Optional["AIBudgetRule"]:
         """按 id 获取单条规则。"""
         stmt = select(cls).where(col(cls.id) == rule_id)
@@ -111,7 +111,7 @@ class AIBudgetWhitelist(BaseIDModel, table=True):
         return int(obj.id)
 
     @classmethod
-    @with_session
+    @with_read_session
     async def get_all_entries(cls, session: AsyncSession) -> List["AIBudgetWhitelist"]:
         """获取全部白名单条目。"""
         stmt = select(cls).order_by(col(cls.id).asc())

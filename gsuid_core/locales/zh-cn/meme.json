@@ -7,6 +7,9 @@
   "log.meme.bulk_delete_failed_fallback": "[Meme] 批量删除失败，回退逐条删除: {e}",
   "log.meme.bulk_delete_rowcount_short": "[Meme] 批量删除 rowcount={deleted} < batch={batch}",
   "log.meme.clean_vector_point_continuing": "[Meme] 清理旧向量点失败（继续写入）: {meme_id}: {e}",
+  "log.meme.collect_queue_full_dropping": "[Meme] 采集队列已满（>{p0}），丢弃: {url}",
+  "log.meme.collect_worker_exception": "[Meme] 采集 worker 异常: {e}",
+  "log.meme.collect_worker_started": "[Meme] 采集 worker 已启动",
   "log.meme.collection_name": "[Meme] Collection {MEME_COLLECTION_NAME} 疑似上次迁移/同步未完成，强制重建后从数据库恢复索引",
   "log.meme.collection_name_dense": "[Meme] Collection {MEME_COLLECTION_NAME} 维度/结构变化，强制重建（命名 dense + BM25 稀疏）后基于数据库记录重建索引",
   "log.meme.collection_name_dense_2": "[Meme] Collection {MEME_COLLECTION_NAME} 维度/结构变化，强制重建（命名 dense + BM25 稀疏）后基于数据库记录重建索引",
@@ -93,5 +96,6 @@
   "log.meme.pack_payload_backfill": "[Meme] 回填表情包 payload：{points} 个点，{groups} 组，{calls} 次，{ms} 毫秒",
   "log.meme.pack_migrate_sql": "[Meme] 表情包迁移：快照 {snapshot} 张，期间新插入 {inserted} 张",
   "log.meme.persona_resolve_fail": "[Meme] 解析当前人格失败: {e}",
-  "log.meme.drop_missing_files": "[Meme] 删掉 {count} 条文件已经不在的表情"
+  "log.meme.drop_missing_files": "[Meme] 删掉 {count} 条文件已经不在的表情",
+  "log.meme.bundle_vector_sync_fail": "[Meme] 整包导入表情 {meme_id} 向量补写失败: {e}"
 }

@@ -121,14 +121,16 @@ class Subscribe(BaseModel, table=True):
     ) -> int:
         if force_direct:
             user_type = "direct"
+            group_id = None
         else:
             user_type = self.user_type
+            group_id = self.group_id
         ev = Event(
             bot_id=self.bot_id,
             user_id=self.user_id,
             bot_self_id=self.bot_self_id,
             user_type=user_type,  # type: ignore
-            group_id=self.group_id,
+            group_id=group_id,
             real_bot_id=self.bot_id,
             msg_id=self.msg_id if self.msg_id else "",
         )
@@ -313,6 +315,29 @@ class CoreUser(BaseBotIDModel, table=True):
             await session.commit()
 
         return len(to_delete_ids)
+
+    @classmethod
+    @with_read_session
+    async def get_names_by_ids(
+        cls,
+        session: AsyncSession,
+        user_ids: List[str],
+        bot_id: Optional[str] = None,
+    ) -> Dict[str, str]:
+        """一批 user_id → 昵称。"""
+        if not user_ids:
+            return {}
+
+        statement = select(cls.user_id, cls.user_name).where(col(cls.user_id).in_(user_ids))
+        if bot_id:
+            statement = statement.where(col(cls.bot_id) == bot_id)
+
+        names: Dict[str, str] = {}
+        for user_id, user_name in (await session.execute(statement)).all():
+            text = str(user_name or "").strip()
+            if text and text != "1":
+                names.setdefault(str(user_id), text)
+        return names
 
     @classmethod
     @with_read_session

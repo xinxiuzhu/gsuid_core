@@ -169,8 +169,10 @@ SESSION_ENTRY_TYPES: frozenset[str] = frozenset(
         "tool_call",
         "tool_return",
         "tools_list",
+        "tools_change",
         # 统计 / 节点 / 错误
         "token_usage",
+        "step_usage",
         "node_transition",
         "error",
         # 关联 / 主动消息
@@ -184,6 +186,8 @@ SESSION_ENTRY_TYPES: frozenset[str] = frozenset(
         "prefix_break",
         "outbound_audit",
         "task_ack",
+        # 话术闸 / 收尾拦住的台词。reason 是拦住当时的原因码，不随后续改判定而变。
+        "output_block",
     }
 )
 
@@ -293,6 +297,29 @@ def normalize_user_message_to_text(user_message: Any) -> str:
     else:
         text = str(user_message)
     return externalize_base64_images(text)
+
+
+def _attach_reason_text(data: dict[str, str], reason: str) -> None:
+    """有原因码才写入当时的中文。没有中文的旧日志不补这个字段。"""
+    from gsuid_core.ai_core.control.reason_text import reason_text
+
+    text = reason_text(reason)
+    if text:
+        data["reason_text"] = text
+
+
+def _silence_result_data(output: str, tool_calls: list[str], silence_reason: str) -> dict[str, str | list[str]]:
+    from gsuid_core.ai_core.control.reason_text import reason_text
+
+    data: dict[str, str | list[str]] = {
+        "output": output,
+        "tool_calls": tool_calls,
+        "silence_reason": silence_reason,
+    }
+    text = reason_text(silence_reason)
+    if text:
+        data["reason_text"] = text
+    return data
 
 
 class AISessionLogger:
@@ -617,11 +644,23 @@ class AISessionLogger:
                     p0=self.session_id,
                 )
             )
+        # 落盘脱敏：session_log 会被人工分享/agent 回看，所有文本字段过 mask_pii。
+        from gsuid_core.ai_core.mcp.pii import mask_pii
+
+        def _mask(v: Any) -> Any:
+            if isinstance(v, str):
+                return mask_pii(v)
+            if isinstance(v, list):
+                return [_mask(item) for item in v]
+            if isinstance(v, dict):
+                return {k: _mask(item) for k, item in v.items()}
+            return v
+
         self.entries.append(
             {
                 "type": entry_type,
                 "timestamp": time.time(),
-                "data": data,
+                "data": _mask(data),
             }
         )
         self.updated_at = time.time()
@@ -699,10 +738,14 @@ class AISessionLogger:
         """
         self._add_entry("user_input", {"content": normalize_user_message_to_text(user_message)})
 
-    def log_system_injection(self, content: str, source: str = "kanban_delivery") -> None:
-        """记录框架注入（Kanban 回灌等），不计入 user_input，避免被误认为真人发言。"""
+    def log_system_injection(self, content: str, source: str = "kanban_delivery", *, reason: str = "") -> None:
+        """记录框架注入（Kanban 回灌、纠正轮）。reason 只在纠正轮写入。"""
         norm = normalize_user_message_to_text(content)
-        self._add_entry("system_injection", {"content": norm, "source": source})
+        data: dict[str, str] = {"content": norm, "source": source}
+        if reason:
+            data["reason"] = reason
+            _attach_reason_text(data, reason)
+        self._add_entry("system_injection", data)
 
     def log_thinking(self, content: str) -> None:
         """记录模型思考过程。
@@ -772,6 +815,18 @@ class AISessionLogger:
         """记录模型直接输出的文本"""
         self._add_entry("text_output", {"content": content})
 
+    def log_output_block(self, reason: str, content: str, *, policy: str = "", tool_call_id: str = "") -> None:
+        """记下被拦住的台词、原因码和当时的中文说明。"""
+        preview = content.strip()
+        if len(preview) > 500:
+            preview = preview[:500] + "…"
+        data: dict[str, str] = {"reason": reason, "content": preview, "policy": policy}
+        if tool_call_id:
+            # 挂到这次工具调用上，瀑布才不会把拒发画进上一轮对话。
+            data["tool_call_id"] = tool_call_id
+        _attach_reason_text(data, reason)
+        self._add_entry("output_block", data)
+
     def log_task_ack(self, content: str, *, source: str) -> None:
         """记录 create_subagent 代发的开场句（模型自己写的台词，框架不代写）。"""
         self._add_entry("task_ack", {"content": content, "source": source})
@@ -788,24 +843,11 @@ class AISessionLogger:
         from gsuid_core.ai_core.utils import is_silence_marker
 
         if is_silence_marker(out_str) or not out_str:
-            self._add_entry(
-                "result",
-                {
-                    "output": str(output),
-                    "tool_calls": tool_calls,
-                    "silence_reason": silence_reason or "model_voluntary",
-                },
-            )
+            why = silence_reason or "model_voluntary"
+            self._add_entry("result", _silence_result_data(str(output), tool_calls, why))
             return
         if silence_reason is not None:
-            self._add_entry(
-                "result",
-                {
-                    "output": str(output),
-                    "tool_calls": tool_calls,
-                    "silence_reason": silence_reason,
-                },
-            )
+            self._add_entry("result", _silence_result_data(str(output), tool_calls, silence_reason))
             return
         self._add_entry("result", {"output": str(output), "tool_calls": tool_calls})
 
@@ -907,6 +949,57 @@ class AISessionLogger:
     def log_tools_list(self, tools: List[str]) -> None:
         """记录本次传给 AI 的工具列表（去重后）"""
         self._add_entry("tools_list", {"tools": tools})
+
+    def log_tools_change(
+        self,
+        *,
+        source: Literal["assembly", "find_tools"],
+        added: List[str],
+        removed: List[str],
+        hinted: List[str],
+        total: int,
+        from_find_tools: List[str],
+        tool_call_id: str = "",
+    ) -> None:
+        """本轮工具列表变化：装配 diff 或 find_tools 挂载。"""
+        data: Dict[str, Any] = {
+            "source": source,
+            "added": added,
+            "removed": removed,
+            "hinted": hinted,
+            "total": total,
+            "from_find_tools": from_find_tools,
+        }
+        if tool_call_id:
+            data["tool_call_id"] = tool_call_id
+        self._add_entry("tools_change", data)
+
+    def log_step_usage(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cache_read_tokens: int,
+        cache_write_tokens: int,
+        model_name: str,
+        ttft_ms: float,
+        tps: float,
+        tool_calls: int,
+    ) -> None:
+        """单次模型请求的用量（每 CallToolsNode 响应一条）；run 总量见 token_usage。"""
+        self._add_entry(
+            "step_usage",
+            {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cache_read_tokens": cache_read_tokens,
+                "cache_write_tokens": cache_write_tokens,
+                "model_name": model_name,
+                "ttft_ms": ttft_ms,
+                "tps": tps,
+                "tool_calls": tool_calls,
+            },
+        )
 
     def log_node_transition(self, node_type: str, details: Optional[Dict[str, Any]] = None) -> None:
         """记录 Agent 节点状态转换（如 ModelRequestNode / CallToolsNode / End）"""

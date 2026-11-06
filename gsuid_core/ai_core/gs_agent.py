@@ -117,7 +117,6 @@ from gsuid_core.ai_core.agent_run.support import (  # noqa: E402
     _MAIN_PERSONA_CREATE_BY,
     _THRASH_SAME_TOOL_LIMIT,
     _FAKE_DONE_THIRD_SUBJ_RE,
-    _FIND_TOOLS_THRASH_LIMIT,
     _STRUCTURAL_ZERO_TOOL_NUDGE,
     TraceKind,
     _append_user_text,
@@ -151,7 +150,6 @@ _ = (
     _FAKE_DONE_RE,
     _FAKE_DONE_TASK_NOUN_RE,
     _FAKE_DONE_THIRD_SUBJ_RE,
-    _FIND_TOOLS_THRASH_LIMIT,
     _INTERACTIVE_CREATE_BY,
     _MAIN_PERSONA_CREATE_BY,
     _RENDER_DELEGATE_NUDGE,
@@ -291,6 +289,8 @@ class GsCoreAIAgent(RunOnceMixin):
         self._session_toolset_frozen: Optional[List[str]] = None
         self._session_toolset_tags: Optional[frozenset[str]] = None
         self._session_appended_tools: List[str] = []
+        self._last_logged_tool_names: Optional[List[str]] = None
+        self._last_run_find_tools_names: List[str] = []
         self.max_history = _max_history
         self.system_prompt = system_prompt
         # 稳定前缀构建时刻：ai_router 按 TTL 原地刷新 system_prompt（O-3 慢变上下文防僵化）
@@ -308,7 +308,8 @@ class GsCoreAIAgent(RunOnceMixin):
         self._history_iter_active: bool = False
         # 4.7 supersede 交接语已删：在途根任务由 build_task_context 每轮从库注入。
         self.max_tokens = _max_tokens
-        self.max_iterations = max_iterations  # 自定义迭代次数限制，None时使用配置默认值
+        # 思考轮由 request_limit_for(create_by) 决定，此参数不再生效。
+        self.max_iterations = max_iterations
         # C-4 墙钟软预算(秒)覆写：None=沿用全局 scaffold_wall_clock_budget；<=0=本 Agent 关闭软预算。
         # 长流程入口（编排 / 多轮工具 + 等人确认）必须放宽，否则永远跑不到终态。
         self.wall_clock_budget = wall_clock_budget
@@ -358,6 +359,7 @@ class GsCoreAIAgent(RunOnceMixin):
         self._recent_user_texts: List[str] = []
         # by_bot 单轮已发送文本去重集合：弱模型常跨轮重复同一段最终答复，叠加瞬时 故障重试重发，
         self._run_sent_texts: set[str] = set()
+        self.read_image_ids: set[str] = set()
         # 本用户轮内模型对框架校验的申辩理由（dispute_directive 写，settle 读）。
         # 与 _run_sent_texts 同样同引用透传进纠正轮，使外层能看到内层的申辩。
         self._run_disputes: List[str] = []
@@ -1096,7 +1098,6 @@ class GsCoreAIAgent(RunOnceMixin):
             summary_agent = create_agent(
                 system_prompt="你是一个图片信息提炼助手，只输出精简摘要，不输出多余解释。",
                 max_tokens=500,
-                max_iterations=1,
                 create_by="ImageDescSummary",
                 task_level="low",
                 is_subagent=True,
@@ -1852,6 +1853,9 @@ class GsCoreAIAgent(RunOnceMixin):
             # 本 generation 独立 cancel 事件；上轮 set 过的不得污染本轮
             self._cancel_generation = asyncio.Event()
             self._running_framework = bool(is_framework_injection)
+            from gsuid_core.ai_core.approval.session_ctx import bind_caller_session, reset_caller_session
+
+            caller_token = bind_caller_session(self.session_id)
             try:
                 return await self._run_under_lock(
                     user_message=user_message,
@@ -1871,6 +1875,7 @@ class GsCoreAIAgent(RunOnceMixin):
                     is_framework_injection=is_framework_injection,
                 )
             finally:
+                reset_caller_session(caller_token)
                 self._running_framework = False
 
     async def _run_under_lock(
@@ -2026,7 +2031,7 @@ def create_agent(
         model_name: 模型名称
         system_prompt: 系统提示词
         max_tokens: 最大输出 token 数，None 时使用全局配置默认值
-        max_iterations: 最大迭代次数限制，None 时使用配置默认值
+        max_iterations: 已忽略。思考轮按 create_by 分档，见 request_limit_for。
         persona_name: Persona 名称（用于热重载检测）
         task_level: 任务级别，"high"表示高级任务，"low"表示低级任务
         session_id: 会话 ID，用于关联 session 日志

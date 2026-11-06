@@ -1,7 +1,7 @@
 """
 消息发送工具模块
 
-提供主动向用户发送消息的能力，支持文本消息和图片消息。
+提供主动向用户发送消息的能力，支持文本消息、图片消息和文件消息。
 
 资源 ID 解析：``image_id`` 支持三种来源：
 
@@ -11,8 +11,13 @@
    RM 资源再发，让主人格 / 转译代理可以直接把能力代理产物发给主人，无需关心
    两套存储的区分（详见 ``AI_AGENT_ARCHITECTURE.md`` §3.6）。
 3. ``http://`` / ``https://`` / ``base64://``——直接走 ``MessageSegment.image``。
+
+``file_ids`` 支持两种来源：``fil_xxxxxxxx``（插件经 to_ai 发出、RM 原样登记的
+``"名|payload"`` 数据，``RM.peek`` 直取）与 ``res_xxxxxxxx``（Kanban 落盘文件
+artifact，单个 ≤10MB）。
 """
 
+import os
 import asyncio
 from typing import TYPE_CHECKING, Dict, List, Tuple, Union, Optional
 from pathlib import Path
@@ -26,7 +31,7 @@ from gsuid_core.models import Event, Message
 from gsuid_core.segment import MessageSegment
 from gsuid_core.ai_core.models import ToolContext
 from gsuid_core.ai_core.register import ai_tools
-from gsuid_core.utils.resource_manager import RM
+from gsuid_core.utils.resource_manager import RM, MAX_FILE_BYTES
 
 if TYPE_CHECKING:
     pass
@@ -119,6 +124,28 @@ async def _resolve_kanban_artifact(res_id: str) -> Optional[Union[bytes, str]]:
     return None
 
 
+async def _resolve_file_artifact(res_id: str) -> Tuple[Optional[Path], Optional[str]]:
+    """把 ``res_xxx`` 解析为可发送的落盘文件。(path, None)=可发；(None, 原因)=失败。"""
+    if not res_id.startswith("res_"):
+        return None, "不是 res_ 句柄"
+    from gsuid_core.ai_core.planning.models import AIAgentArtifact
+
+    art = await AIAgentArtifact.get_by_id(res_id)
+    if art is None:
+        return None, "artifact 不存在或已过期"
+    if not art.payload_path:
+        if art.payload_inline:
+            return None, "这是内联文本产物，不是文件，请改用 text 参数发送"
+        return None, "artifact 没有可用载荷"
+    p = Path(art.payload_path)
+    if not await asyncio.to_thread(p.exists):
+        logger.debug(t("log.ai.buildintools_kanban_artifact_res", res_id=res_id, p0=art.payload_path))
+        return None, "落盘文件不存在"
+    if await asyncio.to_thread(os.path.getsize, art.payload_path) > MAX_FILE_BYTES:
+        return None, "超过 10MB 上限"
+    return p, None
+
+
 async def filter_outbound_media_safety(
     ev: Optional[Event],
     media_parts: List[Message],
@@ -155,6 +182,23 @@ def _normalize_image_ids(val: Optional[Union[List[str], str]]) -> List[str]:
     return []
 
 
+def _note_send_block(tool_ctx: ToolContext, reason: str, content: str, *, tool_call_id: str) -> None:
+    """主动发送被拒时，把原文和原因码记到这次工具调用上。"""
+    from gsuid_core.ai_core.agent_run.support import log_output_block_on_session
+
+    sid = tool_ctx.parent_session_id or ""
+    if not sid and tool_ctx.ev is not None and tool_ctx.ev.session_id:
+        sid = str(tool_ctx.ev.session_id)
+    log_output_block_on_session(sid, reason, content, tool_call_id=tool_call_id)
+
+
+def _refuse_outbound(reason: str) -> str:
+    """把拒发原因退回给模型，让它改写后再发。图和字都还没出去。"""
+    from gsuid_core.ai_core.control.reason_text import reason_text
+
+    return f"未发送。{reason_text(reason)}改写后再发。这次的图和字都没有出去。"
+
+
 @ai_tools(category="self", code_callable=False)
 async def send_message_by_ai(
     ctx: RunContext[ToolContext],
@@ -164,20 +208,21 @@ async def send_message_by_ai(
     audio_id: str = "",
     user_id: Optional[str] = None,
     image_id: Optional[Union[List[str], str]] = None,
+    file_ids: Optional[Union[List[str], str]] = None,
 ) -> str:
     """
     主动发送消息给用户
 
-    支持发送文本消息、图片消息（单张或多张组合）、视频消息、音频消息。
-    AI 可以传入 text 和/或 image_ids 和/或 video_id 和/或 audio_id，系统会组合发送。
+    支持发送文本消息、图片消息（单张或多张组合）、视频消息、音频消息、文件消息。
+    AI 可以传入 text 和/或 image_ids 和/或 video_id 和/或 audio_id 和/或 file_ids，系统会组合发送。
 
     **重要**：当其他工具返回 `[视频消息]`/`[图片消息]`/`[语音消息]` 等标记时，
     表示该媒体已由框架自动发送给用户，**无需再调用本工具重复发送**。
     本工具仅用于主动补充发送文字说明或追加媒体时使用。
 
-    **资源 ID 必须来自上下文**：image_ids / video_id / audio_id 只能填本轮对话中
-    实际出现过的 ID（如 `img_xxxxxxxx`、`res_xxxxxxxx`）或图片 URL，**禁止自行构造或猜测**。
-    没有可用资源就只发 text。
+    **资源 ID 必须来自上下文**：image_ids / video_id / audio_id / file_ids 只能填
+    本轮对话中实际出现过的 ID（如 `img_xxxxxxxx`、`res_xxxxxxxx`、`fil_xxxxxxxx`）
+    或图片 URL，**禁止自行构造或猜测**。没有可用资源就只发 text。
 
     Args:
         ctx: 工具执行上下文（包含bot和ev对象）
@@ -187,6 +232,9 @@ async def send_message_by_ai(
         audio_id: 音频资源ID，可选，格式通常为"aud_xxxxxxxx"
         user_id: 可选，目标用户ID，默认为事件关联的用户
         image_id: 可选，兼容旧参数（单个或多个图片资源ID，等同于 image_ids）
+        file_ids: 文件资源ID列表，可选，单次最多 3 个，单个文件 ≤10MB。
+            只接受 ``fil_xxxxxxxx``（插件经 to_ai 发出登记的原始文件）或
+            ``res_xxxxxxxx``（Kanban 落盘文件 artifact；图片请用 image_ids）。
 
     Returns:
         发送结果描述字符串
@@ -209,12 +257,17 @@ async def send_message_by_ai(
         if img not in target_image_ids:
             target_image_ids.append(img)
 
-    if not text and not target_image_ids and not video_id and not audio_id:
-        return "发送失败：text、image_ids、video_id 和 audio_id 至少提供一个"
+    target_file_ids: list[str] = _normalize_image_ids(file_ids)
+
+    if not text and not target_image_ids and not video_id and not audio_id and not target_file_ids:
+        return "发送失败：text、image_ids、video_id、audio_id 和 file_ids 至少提供一个"
 
     # 单次调用图片上限截断至 9 张，避免单条消息超限
     if len(target_image_ids) > 9:
         target_image_ids = target_image_ids[:9]
+    # 文件单次最多 3 个，超出截断
+    if len(target_file_ids) > 3:
+        target_file_ids = target_file_ids[:3]
 
     # 单轮节流：超过 PER_TURN_SEND_MESSAGE_LIMIT 直接拒发，把模型推回正文输出
     throttle_key = _get_send_throttle_key(ctx)
@@ -228,19 +281,16 @@ async def send_message_by_ai(
     extra = tool_ctx.extra
     pol = extra["speech_policy"] if "speech_policy" in extra and isinstance(extra["speech_policy"], str) else ""
     has_st = extra["has_status_tool"] is True if "has_status_tool" in extra else False
-    has_media = bool(target_image_ids or video_id or audio_id)
+    has_media = bool(target_image_ids or video_id or audio_id or target_file_ids)
+    call_id = ctx.tool_call_id or ""
     if pol == "status_ok" and not has_st and not has_media:
         return "⚠️ 用户在追问进度：先 list_my_kanban_tasks / artifact_get_recent 查状态，再发。禁止空口报完成。"
 
     # 统一输出闸门（尖括号 + OOC …）：打回则 return feedback，放行继续发
     if text:
         from gsuid_core.ai_core.output_gate import tool_gate_feedback
-        from gsuid_core.ai_core.agent_run.speech_policy import (
-            strip_open_solicitations,
-            should_block_user_visible_text,
-        )
+        from gsuid_core.ai_core.agent_run.speech_policy import should_block_user_visible_text
 
-        text = strip_open_solicitations(text)
         _ev_text = tool_ctx.ev.raw_text if tool_ctx.ev is not None and tool_ctx.ev.raw_text else ""
         if text:
             from gsuid_core.ai_core.angle_bracket_guard import (
@@ -253,12 +303,11 @@ async def send_message_by_ai(
                 if cleaned:
                     text = cleaned
         if text:
-            _gate_fb = tool_gate_feedback(text, tool_ctx.extra, user_text=_ev_text)
+            _is_group = bool(tool_ctx.ev is not None and tool_ctx.ev.group_id)
+            _gate_fb, text = tool_gate_feedback(text, tool_ctx.extra, user_text=_ev_text, is_group=_is_group)
             if _gate_fb is not None:
-                if has_media:
-                    text = ""
-                else:
-                    return _gate_fb
+                _note_send_block(tool_ctx, "output_gate_tool", text, tool_call_id=call_id)
+                return _gate_fb
         if text:
             _blk, _why = should_block_user_visible_text(
                 pol or "free",
@@ -269,11 +318,8 @@ async def send_message_by_ai(
                 tool_calls_so_far=["send_message_by_ai"],
             )
             if _blk:
-                if has_media:
-                    # 图仍发；被拦的台词不出站（与 TextPart 同一套 should_block）
-                    text = ""
-                else:
-                    return "⚠️ 台词被话术闸拦住。改成角色短句，或只发媒体、不要邀约再问。"
+                _note_send_block(tool_ctx, _why, text, tool_call_id=call_id)
+                return _refuse_outbound(_why)
 
     # 目标用户（§E.3）：默认当前对话者；Event 保证 user_id 存在，不用 getattr 兜底
     ev = tool_ctx.ev
@@ -289,6 +335,7 @@ async def send_message_by_ai(
 
         _ban = non_master_title(target_id, persona_name_from_event(ev))
         if title_mentioned(_ban, text):
+            _note_send_block(tool_ctx, "master_title", text, tool_call_id=call_id)
             return f"⚠️ 接收人不是主人，台词不能出现「{_ban}」。改写后再发，不要用这个称呼。"
     session_id = str(ev.session_id) if ev is not None else (tool_ctx.parent_session_id or "")
 
@@ -302,38 +349,53 @@ async def send_message_by_ai(
 
     occupied_res_ids: list[str] = []
     failed_notes: list[str] = []
+    file_failed_notes: list[str] = []
     valid_image_ids: list[str] = []
+    valid_file_ids: list[str] = []
+
+    async def _claim_res_handle(rid: str, notes: list[str]) -> bool:
+        """res_ 归属 + 二发占位校验；非 res_ 恒放行。拒绝原因写进 notes。"""
+        if not rid.startswith("res_"):
+            return True
+        from gsuid_core.ai_core.outbound import (
+            lookup_res_owner,
+            res_owner_refusal,
+            speaker_may_take_res,
+            try_claim_image_delivery,
+        )
+
+        looked = await lookup_res_owner(rid)
+        speaker = str(ev.user_id) if ev is not None and ev.user_id else ""
+        if not speaker_may_take_res(looked, speaker):
+            logger.warning(
+                t(
+                    "log.ai.delivery_owner_mismatch",
+                    res_id=rid,
+                    owner=looked.owner_user_id,
+                    target=speaker,
+                )
+            )
+            notes.append(res_owner_refusal(looked, speaker))
+            return False
+
+        claim = await try_claim_image_delivery(ev, rid, session_id=session_id)
+        if claim.refuse is not None:
+            notes.append(claim.refuse)
+            return False
+        if claim.occupied:
+            occupied_res_ids.append(rid)
+        return True
 
     for img_id in target_image_ids:
-        if img_id.startswith("res_"):
-            from gsuid_core.ai_core.outbound import (
-                lookup_res_owner,
-                res_owner_refusal,
-                speaker_may_take_res,
-                try_claim_image_delivery,
-            )
+        if await _claim_res_handle(img_id, failed_notes):
+            valid_image_ids.append(img_id)
 
-            looked = await lookup_res_owner(img_id)
-            speaker = str(ev.user_id) if ev is not None and ev.user_id else ""
-            if not speaker_may_take_res(looked, speaker):
-                logger.warning(
-                    t(
-                        "log.ai.delivery_owner_mismatch",
-                        res_id=img_id,
-                        owner=looked.owner_user_id,
-                        target=speaker,
-                    )
-                )
-                failed_notes.append(res_owner_refusal(looked, speaker))
-                continue
-
-            claim = await try_claim_image_delivery(ev, img_id, session_id=session_id)
-            if claim.refuse is not None:
-                failed_notes.append(claim.refuse)
-                continue
-            if claim.occupied:
-                occupied_res_ids.append(img_id)
-        valid_image_ids.append(img_id)
+    for fid in target_file_ids:
+        if not fid.startswith(("fil_", "res_")):
+            file_failed_notes.append(f"❌ file_ids 只接受 fil_ / res_ 句柄：{fid}")
+            continue
+        if await _claim_res_handle(fid, file_failed_notes):
+            valid_file_ids.append(fid)
 
     async def _abort_send(msg: str) -> str:
         if occupied_res_ids:
@@ -402,6 +464,7 @@ async def send_message_by_ai(
                         f"❌ 资源ID: {img_id} 是文本类 Kanban artifact（非图片字节），"
                         f"请用 artifact_get('{img_id}') 取原文后："
                         f"短文用 text 参数发送，长文/多数据用 render_html_to_image 出图。"
+                        f"要原样发文件请改用 file_ids 参数。"
                     )
             else:
                 try:
@@ -443,8 +506,43 @@ async def send_message_by_ai(
                 else:
                     return f"❌ 资源ID: {audio_id} 数据转换失败: {e}"
 
-        if not success_img_ids and target_image_ids and not text and not video_id and not audio_id:
-            return await _abort_send(";\n".join(failed_notes))
+        file_msgs: List[Tuple[str, Message, str]] = []
+        for fid in valid_file_ids:
+            if fid.startswith("fil_"):
+                try:
+                    raw = RM.peek(fid)
+                except ValueError as e:
+                    logger.warning(t("log.ai.buildintools_rm_peek_file_id", file_id=fid, e=e))
+                    file_failed_notes.append(f"❌ 找不到文件资源ID: {fid}，可能已过期或ID不正确。")
+                    continue
+                if not isinstance(raw, str) or "|" not in raw:
+                    file_failed_notes.append(f"❌ 文件资源ID: {fid} 数据形态不支持发送。")
+                    continue
+                file_msgs.append((fid, Message(type="file", data=raw), raw.split("|", 1)[0]))
+            else:
+                path, reason = await _resolve_file_artifact(fid)
+                if path is None:
+                    if fid in occupied_res_ids:
+                        from gsuid_core.ai_core.outbound import release_image_delivery
+
+                        await release_image_delivery(ev, fid)
+                        occupied_res_ids.remove(fid)
+                    file_failed_notes.append(f"❌ 文件资源ID: {fid} 无法发送：{reason}")
+                    continue
+                # 适配器按第一个 | 切文件名，名字里的分隔符先抹掉
+                safe_name = path.name.replace("|", "_").replace("/", "_").replace("\\", "_")
+                file_msg = await asyncio.to_thread(MessageSegment.file, path, safe_name)
+                file_msgs.append((fid, file_msg, safe_name))
+
+        if (
+            not success_img_ids
+            and not file_msgs
+            and not text
+            and not video_id
+            and not audio_id
+            and (target_image_ids or target_file_ids)
+        ):
+            return await _abort_send(";\n".join(failed_notes + file_failed_notes))
 
         # 检查出站安全插槽
         media_parts, success_img_ids = await filter_outbound_media_safety(ev, media_parts, success_img_ids)
@@ -484,6 +582,9 @@ async def send_message_by_ai(
                 )
                 if isinstance(_sent_registry, set):
                     _sent_registry.add(text.strip())
+                # 发给当前对话者之后，主通道不再复述同一轮。
+                if ev is not None and ev.user_id and target_id == str(ev.user_id):
+                    tool_ctx.extra["direct_user_sent"] = True
                 _at_uid = None
 
         if media_parts:
@@ -511,10 +612,18 @@ async def send_message_by_ai(
         elif text:
             sent = True
 
+        success_file_ids: list[str] = []
+        success_file_names: list[str] = []
+        for _fid, _fmsg, _fname in file_msgs:
+            await bot.send(_fmsg, extra_metadata=_meta)
+            sent = True
+            success_file_ids.append(_fid)
+            success_file_names.append(_fname)
+
         if sent:
             from gsuid_core.ai_core.history_format import note_thread_handle
 
-            for hid in (*success_img_ids, video_id, audio_id):
+            for hid in (*success_img_ids, video_id, audio_id, *success_file_ids):
                 if hid:
                     note_thread_handle(tool_ctx, hid)
             if success_img_ids:
@@ -522,11 +631,6 @@ async def send_message_by_ai(
 
         if throttle_key is not None:
             _PER_TURN_SEND_MESSAGE_COUNT[throttle_key] = _PER_TURN_SEND_MESSAGE_COUNT.get(throttle_key, 0) + 1
-
-        from gsuid_core.ai_core.agent_run.speech_policy import should_mark_speech_delivered
-
-        if should_mark_speech_delivered(text=text, has_media=has_media):
-            extra["delivered_with_speech"] = True
 
         content_desc = []
         if text:
@@ -537,6 +641,8 @@ async def send_message_by_ai(
             content_desc.append(f"视频({video_id})")
         if audio_id:
             content_desc.append(f"音频({audio_id})")
+        if success_file_names:
+            content_desc.append(f"文件({','.join(success_file_names)})")
         logger.info(t("log.ai.buildintools_user_target_id", p0="+".join(content_desc), target_id=target_id))
 
         if text and tool_ctx.parent_session_id:
@@ -623,8 +729,12 @@ async def send_message_by_ai(
             )
 
         res_msg = f"消息已发送给用户 {target_id}"
+        if success_file_names:
+            res_msg += f"（文件：{'、'.join(success_file_names)}）"
         if failed_notes:
             res_msg += f"（部分图片未发送：{'; '.join(failed_notes)}）"
+        if file_failed_notes:
+            res_msg += f"（部分文件未发送：{'; '.join(file_failed_notes)}）"
         return res_msg
 
     except Exception as e:

@@ -19,20 +19,19 @@ from gsuid_core.ai_core.control.lines import (
     WEB_ONLY_STALENESS_CAVEAT,
     PENDING_DELEGATION_OPENING,
     POST_DISPUTE_SILENCE_CONTRACT,
-    POST_DELIVERY_SILENCE_CONTRACT,
     POST_TOOL_FAIL_CONTRACT_RENDER,
     POST_TOOL_OUTPUT_CONTRACT_RENDER,
     POST_TOOL_FAIL_CONTRACT_CAPABILITY,
     POST_TOOL_OUTPUT_CONTRACT_CAPABILITY,
     POST_TOOL_OUTPUT_CONTRACT_RENDER_NO_EMBED,
     POST_TOOL_OUTPUT_CONTRACT_RENDER_REQUIRED,
+    capability_hit_line,
 )
 
 __all__ = (
     "DELEGATION_FANOUT_RULE",
     "PENDING_DELEGATION_HOLD",
     "PENDING_DELEGATION_OPENING",
-    "POST_DELIVERY_SILENCE_CONTRACT",
     "POST_DISPUTE_SILENCE_CONTRACT",
     "POST_TOOL_FAIL_CONTRACT",
     "POST_TOOL_FAIL_CONTRACT_CAPABILITY",
@@ -152,6 +151,25 @@ def tool_return_is_delivery_success(content: Any) -> bool:
     return isinstance(content, str) and DELIVERY_SUCCESS_MARK in content
 
 
+# create_subagent 派发前拒绝的统一前缀（对齐工具层软失败文案口径）。
+# 在途 HOLD 以「（系统：」开头，不在此列——那时真有子任务在跑。
+_DELEGATION_REFUSED_PREFIXES: tuple[str, ...] = ("⚠️", "❌", "🚫")
+_DELEGATION_ORIGIN_PREFIX = "（委派原问："
+
+
+def tool_return_is_delegation_refusal(content: Any) -> bool:
+    """create_subagent 未起派的软拒绝：节点未启用/未匹配、风控、嵌套上限、派发失败。
+
+    「委派原问」导语会先剥掉再判前缀；同步交付的事实包不以拒绝前缀开头。
+    """
+    if not isinstance(content, str):
+        return False
+    body = content.lstrip()
+    if body.startswith(_DELEGATION_ORIGIN_PREFIX):
+        body = body.split("\n", 1)[1].lstrip() if "\n" in body else ""
+    return body.startswith(_DELEGATION_REFUSED_PREFIXES)
+
+
 def is_timeless_aggregate(content: str) -> bool:
     """返回体是否呈「无当前时点的均值/气候聚合」形态（逐日序列除外）。"""
     body = (content or "").strip()
@@ -253,6 +271,7 @@ def tool_call_targets_render_agent(
 def inflight_after_create_subagent_return(
     *,
     failed: bool,
+    refused: bool = False,
     async_ack: bool,
     render_done: bool,
     ack_seen: bool,
@@ -263,9 +282,9 @@ def inflight_after_create_subagent_return(
 ) -> tuple[bool, bool, str, bool]:
     """ToolReturn 后的在途静默。(pending, delegated, policy, ack_seen)。
 
-    ToolCall 可能已抢先静默；失败且尚未 ack 则回滚，避免整轮哑火。
+    ToolCall 可能已抢先静默；失败/派发前软拒绝且尚未 ack 则回滚，避免整轮哑火。
     """
-    if failed and not ack_seen:
+    if (failed or refused) and not ack_seen:
         policy = speech_policy
         if speech_policy == "silence_only":
             policy = "framework_deliver" if is_framework else "free"
@@ -273,8 +292,7 @@ def inflight_after_create_subagent_return(
     if render_done:
         return pending_async, True, speech_policy, True
     if async_ack:
-        policy = speech_policy if speech_policy == "delivered" else "silence_only"
-        return True, delegated_render, policy, True
+        return True, delegated_render, "silence_only", True
     return pending_async, delegated_render, speech_policy, ack_seen
 
 
@@ -297,3 +315,26 @@ def post_tool_contracts_for(
             return POST_TOOL_OUTPUT_CONTRACT_RENDER_NO_EMBED, POST_TOOL_FAIL_CONTRACT_RENDER
         return POST_TOOL_OUTPUT_CONTRACT_CAPABILITY, POST_TOOL_FAIL_CONTRACT_CAPABILITY
     return POST_TOOL_OUTPUT_CONTRACT, POST_TOOL_FAIL_CONTRACT
+
+
+def web_search_delegate_line(
+    *,
+    create_by: str,
+    capability_node_id: str,
+    question: str,
+    first_tool: str,
+    already_nudged: bool,
+    any_fail: bool,
+) -> str:
+    """主人格第一步网页检索命中能力节点时，返回改口委派句。执行体返回空串。"""
+    if any_fail or already_nudged or first_tool != "web_search_tool":
+        return ""
+    # 能力代理的用户消息是整段任务书，关键词很容易命中；它也不能再 create_subagent。
+    if create_by == "CapabilityAgent" or (capability_node_id or "").strip():
+        return ""
+    from gsuid_core.ai_core.agent_node.registry import match_capability_node
+
+    nid = match_capability_node(question)
+    if not nid:
+        return ""
+    return capability_hit_line(nid)

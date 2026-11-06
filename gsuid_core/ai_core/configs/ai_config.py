@@ -224,8 +224,8 @@ AI_CONFIG: Dict[str, GSC] = {
         "Agent 运行调参",
     ),
     "multi_agent_lenth": GsIntConfig(
-        "最多允许AI思考轮数",
-        "指定多轮思考调用工具的最大递归深度, 注意: 多轮对话会占用更多的token, 请根据实际情况调整",
+        "主Agent最多思考轮数",
+        "主对话每一轮允许的最大思考次数。子 Agent 与能力代理不读这项。多轮会占用更多 token。",
         20,
         options=[9, 12, 20, 30],
     ),
@@ -320,6 +320,17 @@ AI_CONFIG: Dict[str, GSC] = {
         45,
         options=[45, 60, 80, 120, 200],
     ),
+    "mcp_profile_llm_enable": GsBoolConfig(
+        "MCP 中文介绍 LLM 补全",
+        "注册 MCP 服务后若缺中文描述, 后台调用高级模型生成中文能力说明供路由使用; 关闭则只用拼接文案",
+        True,
+    ),
+    "mcp_profile_llm_timeout_sec": GsIntConfig(
+        "MCP 介绍生成超时(秒)",
+        "MCP 中文介绍单次 LLM 调用超时时间, 超时只影响生成质量, 不影响工具注册",
+        60,
+        options=[30, 60, 90, 120],
+    ),
     "agent_max_run_attempts": GsIntConfig(
         "核心请求重试次数",
         "网络抖动/超时/5xx 等瞬时失败时核心回复请求的最大尝试次数(含首次)。内容审核等永久错误不重试",
@@ -341,10 +352,10 @@ AI_CONFIG: Dict[str, GSC] = {
     ),
     # 任务档预算（AgentNode 统一后节点不再携带预算, 所有能力代理统一走这两项）
     "task_max_iterations": GsIntConfig(
-        "任务代理最大思考轮数",
-        "能力代理(task-mode 节点)单次任务的最大工具调用轮数; 插件开发等重型任务不够用时全局调大",
-        30,
-        options=[12, 20, 30, 40, 60],
+        "子Agent最大思考轮数",
+        "能力代理与子 Agent 单次任务的最大思考轮数，与主对话分开。重型任务不够用时调大。",
+        56,
+        options=[20, 30, 40, 56, 80],
     ),
     "task_max_tokens": GsIntConfig(
         "任务代理单次输出Token上限",

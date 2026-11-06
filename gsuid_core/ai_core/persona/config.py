@@ -74,6 +74,38 @@ def normalize_ai_modes(modes: list[str]) -> list[str]:
     return out
 
 
+@dataclass(frozen=True, slots=True)
+class DriveTraits:
+    """人格驱动四参数（读自 config，坏值回退默认）。"""
+
+    social_initiative: int = 50
+    energy_endurance: int = 50
+    curiosity_focus: str = "balanced"
+    arc_persistence: int = 2
+
+
+_CURIOSITY_VALUES = frozenset({"balanced", "people", "analytical", "whimsical"})
+
+
+def _clamped_int(raw: object, default: int, low: int, high: int) -> int:
+    return min(high, max(low, int(raw))) if isinstance(raw, (int, float)) and not isinstance(raw, bool) else default
+
+
+def read_drive_traits(config: StringConfig) -> DriveTraits:
+    """从人格配置读四参数；老 config.json 缺键或类型不对时全用默认。"""
+    initiative = _clamped_int(config.get_config("social_initiative").data, 50, 0, 100)
+    endurance = _clamped_int(config.get_config("energy_endurance").data, 50, 0, 100)
+    focus_raw = config.get_config("curiosity_focus").data
+    focus = focus_raw if isinstance(focus_raw, str) and focus_raw in _CURIOSITY_VALUES else "balanced"
+    persistence = _clamped_int(config.get_config("arc_persistence").data, 2, 1, 3)
+    return DriveTraits(
+        social_initiative=initiative,
+        energy_endurance=endurance,
+        curiosity_focus=focus,
+        arc_persistence=persistence,
+    )
+
+
 def parse_active_window(text: str) -> tuple[int, int] | None:
     """返回开始、结束的当天分钟数。格式不对则返回 None。"""
     matched = _ACTIVE_WINDOW.fullmatch(text.strip())
@@ -208,6 +240,30 @@ DEFAULT_PERSONA_CONFIG: Dict[str, GSC] = {
         [],
         options=[],
     ),
+    "social_initiative": GsIntConfig(
+        "社交主动度",
+        "0-100，越高越想主动找人搭话",
+        50,
+        options=[],
+    ),
+    "energy_endurance": GsIntConfig(
+        "社交耐力",
+        "0-100，越高连续互动越不容易倦",
+        50,
+        options=[],
+    ),
+    "curiosity_focus": GsStrConfig(
+        "闲时关注点",
+        "自主行动先看人还是先查群聊话题",
+        "balanced",
+        options=["balanced", "people", "analytical", "whimsical"],
+    ),
+    "arc_persistence": GsIntConfig(
+        "单话题跟进轮数",
+        "1-3，自主行动同一话题最多跟进几轮",
+        2,
+        options=[1, 2, 3],
+    ),
     "inspect_interval": GsIntConfig(
         "定时巡检间隔",
         "当AI行动模式包含'定时巡检'时，指定巡检间隔（分钟）。默认60分钟",
@@ -298,9 +354,15 @@ DEFAULT_PERSONA_CONFIG: Dict[str, GSC] = {
     ),
     "meme_frequency": GsIntConfig(
         "表情频率",
-        "只改系统提示里的频率说明：0=少用，50=适中，100=常用。不限流，也不影响选图。",
+        "控制系统提示里的表情触发倾向：0=禁用表情，1-19=极少回敬，20-39=低频点缀，40-64=自然适中，65-84=高频活跃，85-100=极高频必配。同时联动未显式指定时的发图冷却。",
         50,
         options=[0, 25, 50, 75, 100],
+    ),
+    "meme_send_cooldown_sec": GsIntConfig(
+        "表情发送冷却",
+        "同会话表情发送最小间隔（秒）。0 表示跟随表情频率档位自动联动，也可设定大于 0 的具体秒数固定冷却。",
+        0,
+        options=[0, 15, 30, 60, 120, 300],
     ),
 }
 
@@ -500,7 +562,7 @@ class PersonaConfigManager(ConfigSetManager):
         if not self._base_path.exists():
             return configs
 
-        for persona_dir in self._base_path.iterdir():
+        for persona_dir in sorted(self._base_path.iterdir(), key=lambda p: p.name):
             if persona_dir.is_dir():
                 persona_name = persona_dir.name
                 configs[persona_name] = self.get_config(persona_name)
@@ -748,7 +810,7 @@ class PersonaConfigManager(ConfigSetManager):
         return True, "ok"
 
     def set_meme_frequency(self, persona_name: str, value: object) -> tuple[bool, str]:
-        """设置表情频率。0 到 100。只改系统提示里的一句说明。"""
+        """设置表情频率（0 到 100）。0 禁用表情发送；其余档位同时派生默认发图冷却。"""
         from gsuid_core.ai_core.persona.meme_style import MEME_FREQUENCY_MAX, MEME_FREQUENCY_MIN
 
         if isinstance(value, bool) or not isinstance(value, int):
@@ -759,6 +821,18 @@ class PersonaConfigManager(ConfigSetManager):
         if not config.set_config("meme_frequency", value):
             return False, "配置写入失败"
         logger.info(t("log.persona.meme_frequency_set", persona_name=persona_name, value=value))
+        return True, "ok"
+
+    def set_meme_send_cooldown_sec(self, persona_name: str, value: object) -> tuple[bool, str]:
+        """设置表情发送冷却（秒）。0 表示跟随档位自适应，>0 为固定秒数。"""
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False, "表情发送冷却必须是整数"
+        if value < 0 or value > 3600:
+            return False, "表情发送冷却必须在 0 到 3600 秒之间"
+        config = self.get_config(persona_name)
+        if not config.set_config("meme_send_cooldown_sec", value):
+            return False, "配置写入失败"
+        logger.info(t("log.persona.meme_cooldown_set", persona_name=persona_name, value=value))
         return True, "ok"
 
     def set_inspect_interval(self, persona_name: str, inspect_interval: int) -> tuple[bool, str]:
@@ -979,7 +1053,20 @@ class PersonaConfigManager(ConfigSetManager):
         except Exception:
             pass
 
-        for persona_name, config in self.get_all_configs().items():
+        all_configs = self.get_all_configs()
+
+        # 私聊租约优先：主动私聊签约的人格承接后续私聊回复（回复黑洞修复）
+        if is_private_chat and user_id:
+            from gsuid_core.ai_core.proactive.dm_lease import get_active_dm_lease
+
+            bot_id = parts[1] if len(parts) > 1 else ""
+            lease = get_active_dm_lease(user_id, bot_id)
+            if lease is not None and lease.persona_name in all_configs:
+                lease_cfg = all_configs[lease.persona_name]
+                if lease_cfg.get_config("scope").data != "disabled":
+                    return lease.persona_name
+
+        for persona_name, config in all_configs.items():
             scope = config.get_config("scope").data
             target_groups = config.get_config("target_groups").data
 
@@ -1015,6 +1102,7 @@ class PersonaConfigManager(ConfigSetManager):
 
         shape = speech_shape_spec()
         autonomy = read_autonomy_runtime(config)
+        traits = read_drive_traits(config)
         return {
             "ai_mode": normalize_ai_modes(list(config.get_config("ai_mode").data)),
             "scope": config.get_config("scope").data,
@@ -1044,9 +1132,14 @@ class PersonaConfigManager(ConfigSetManager):
             "prompt_group": _effective_prompt_group(persona_name),
             "allow_meme_reply": bool(config.get_config("allow_meme_reply").data),
             "meme_frequency": stored_int(config, "meme_frequency", DEFAULT_MEME_FREQUENCY),
+            "meme_send_cooldown_sec": stored_int(config, "meme_send_cooldown_sec", 0),
             "chat_style": stored_int(config, "chat_style", DEFAULT_CHAT_STYLE),
             "speech_len_soft": stored_int(config, "speech_len_soft", shape["soft_default"]),
             "speech_shape": shape,
+            "social_initiative": traits.social_initiative,
+            "energy_endurance": traits.energy_endurance,
+            "curiosity_focus": traits.curiosity_focus,
+            "arc_persistence": traits.arc_persistence,
         }
 
     def delete_persona_config(self, persona_name: str) -> bool:

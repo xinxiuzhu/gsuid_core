@@ -10,6 +10,9 @@ from gsuid_core.logger import logger
 from gsuid_core.server import on_core_start, on_core_shutdown
 from gsuid_core.utils.image.image_tools import change_ev_image_to_bytes
 
+# 单个文件产物的上限；适配器侧上传体积再各自有平台限制
+MAX_FILE_BYTES = 10 * 1024 * 1024
+
 
 class ResourceManager:
     """资源管理器
@@ -24,11 +27,36 @@ class ResourceManager:
 
     _ttl_seconds: int = 1800  # 默认 30 分钟
     _cleanup_interval: int = 300  # 每 5 分钟检查一次
+    # 总量上限。RM 是全进程共享的媒体缓存，没有上限时群里连续刷大图就能把内存吃满，
+    # 而 TTL 最长要 30 分钟才回收。超了就按写入顺序淘汰最旧的。
+    _max_total_bytes: int = 256 * 1024 * 1024
     _cleanup_task: Optional[asyncio.Task] = None
     _cleanup_running: bool = False
 
     def __init__(self) -> None:
         self._store: Dict[str, tuple[Union[str, bytes], float]] = {}
+        self._total_bytes: int = 0
+
+    @staticmethod
+    def _size_of(data: Union[str, bytes]) -> int:
+        if isinstance(data, bytes):
+            return len(data)
+        if isinstance(data, str):
+            return len(data.encode("utf-8", "ignore"))
+        return 0
+
+    def _put(self, resource_id: str, data: Union[str, bytes]) -> None:
+        """写入并维护总量，超过上限时淘汰最旧的条目。"""
+        self._store[resource_id] = (data, time.time())
+        self._total_bytes += self._size_of(data)
+        # 至少留一条：单个资源就超上限时不该把自己也淘汰掉
+        while self._total_bytes > self._max_total_bytes and len(self._store) > 1:
+            oldest_id = next(iter(self._store))
+            oldest_item = self._store.pop(oldest_id, None)
+            if oldest_item is not None:
+                self._total_bytes -= self._size_of(oldest_item[0])
+        if self._total_bytes < 0:
+            self._total_bytes = 0
 
     def register(self, data: Union[str, bytes, Image.Image]) -> str:
         """存入二进制数据或者base64数据/URL，返回一个 ID
@@ -37,13 +65,13 @@ class ResourceManager:
             data: 图片数据（bytes、base64 字符串、URL 或 PIL Image）
 
         Returns:
-            资源 ID（格式: img_xxxxxxxx）
+            资源 ID（格式: img_xxxxxxxxxxxxxxxx）
         """
-        resource_id = f"img_{uuid.uuid4().hex[:8]}"
+        resource_id = f"img_{uuid.uuid4().hex[:16]}"
         if isinstance(data, Image.Image):
             data = data.tobytes()
 
-        self._store[resource_id] = (data, time.time())
+        self._put(resource_id, data)
         return resource_id
 
     def register_audio(self, data: Union[str, bytes]) -> str:
@@ -53,10 +81,10 @@ class ResourceManager:
             data: 音频数据（bytes、base64 字符串或 URL）
 
         Returns:
-            资源 ID（格式: aud_xxxxxxxx）
+            资源 ID（格式: aud_xxxxxxxxxxxxxxxx）
         """
-        resource_id = f"aud_{uuid.uuid4().hex[:8]}"
-        self._store[resource_id] = (data, time.time())
+        resource_id = f"aud_{uuid.uuid4().hex[:16]}"
+        self._put(resource_id, data)
         return resource_id
 
     def register_video(self, data: Union[str, bytes]) -> str:
@@ -66,10 +94,35 @@ class ResourceManager:
             data: 视频数据（bytes、base64 字符串或 URL）
 
         Returns:
-            资源 ID（格式: vid_xxxxxxxx）
+            资源 ID（格式: vid_xxxxxxxxxxxxxxxx）
         """
-        resource_id = f"vid_{uuid.uuid4().hex[:8]}"
-        self._store[resource_id] = (data, time.time())
+        resource_id = f"vid_{uuid.uuid4().hex[:16]}"
+        self._put(resource_id, data)
+        return resource_id
+
+    def register_file(self, data: str) -> Optional[str]:
+        """登记 ``文件名|payload`` 形态的文件数据，原样存储，返回一个 ID。
+
+        payload 为 ``link://`` 或 http(s) 时不校验大小；其余按 base64 解码后
+        长度估算（去掉可选的 ``base64://`` 前缀），超过 ``MAX_FILE_BYTES``
+        或载荷为空时不登记并返回 None。
+
+        Args:
+            data: ``"文件名|<裸base64|base64://…|link://…|http(s)://…>"``
+
+        Returns:
+            资源 ID（格式: fil_xxxxxxxxxxxxxxxx），失败返回 None
+        """
+        payload = data.split("|", 1)[1] if "|" in data else ""
+        if not payload:
+            return None
+        if not payload.startswith(("link://", "http://", "https://")):
+            b64 = payload[len("base64://") :] if payload.startswith("base64://") else payload
+            size = len(b64) * 3 // 4 - (len(b64) - len(b64.rstrip("=")))
+            if size > MAX_FILE_BYTES:
+                return None
+        resource_id = f"fil_{uuid.uuid4().hex[:16]}"
+        self._put(resource_id, data)
         return resource_id
 
     def peek(self, resource_id: str) -> Union[str, bytes]:
@@ -158,7 +211,11 @@ class ResourceManager:
         expired_ids = [rid for rid, (_, created_at) in self._store.items() if now - created_at > self._ttl_seconds]
 
         for rid in expired_ids:
-            del self._store[rid]
+            item = self._store.pop(rid, None)
+            if item is not None:
+                self._total_bytes -= self._size_of(item[0])
+        if self._total_bytes < 0:
+            self._total_bytes = 0
 
         if expired_ids:
             logger.debug(

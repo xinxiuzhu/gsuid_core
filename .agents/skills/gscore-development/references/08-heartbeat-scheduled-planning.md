@@ -172,8 +172,8 @@ current_task；引用类工具用自然语言句柄（`resolver.resolve_task_ref
 
 ### 能力代理（执行/表达分离）`ai_core/capability_agents/`
 
-调度器派活时**绕过主人格会话**——人格若被设定为"懒惰、回避分析"会让严肃执行抵制空转、人格
-漂移。`run_capability_agent` 按子任务 `agent_profile` 唤醒**无人格能力代理**（不拒绝、不漂移），
+调度器派活时**绕过主人格会话**，不把主会话的框架约束抄进执行体。系统提示词只附
+委派人的人格 ID。需要替这个人做选择或答题时，再读取 persona.md。
 结果经 `_persona_relay` 用人格口吻转译后通知主人。
 
 > 🔁 **交互式 `create_subagent` 不许双份播报**（2026-07-15 修；2026-10 群聊改为派完即走）。
@@ -211,22 +211,23 @@ current_task；引用类工具用自然语言句柄（`resolver.resolve_task_ref
 > 现为**冗余兜底**（timeout 仍转 `asyncio.TimeoutError` 保持上层契约），不必删除，
 > 但**新工具不要再照抄这个平台分支**。
 
-### HITL 人工审批（已收编进统一审批中心，2026-07-07）
+### HITL 人工审批（确认码，2026-10-26）
 
-子任务连续重派达 3 次（`DEFAULT_RESPAWN_LIMIT`）→ 自动 `waiting_approval`，同时
-`kanban.request_subtask_approval` 向 **统一审批中心**（`ai_core/approval/`，
-category=`kanban_subtask`）提交票据；`waiting_approval` 状态从此是**派生视图**
-（看板 Blocked 列渲染用），账本 / 裁决 / 过期全在审批中心。三条审批通路殊途同归：
+需要主人批准时，框架向主人名单里、且订阅了「主人用户」的人私聊一枚 6 位确认码，
+并把当前 agent 轮次立刻结束。未单独指定时限的票 10 分钟失效；命令执行沿用命令配置
+里的审批有效期。主人只回复这一枚码，或在审批中心点批准 / 拒绝。群里说「同意」不会
+通过。模型没有转达工具。
 
-1. **对话回复**：主人说"同意/拒绝"，主人格调统一转达工具
-   `respond_approval(approved, request_ref, note)`（含"主人亲口表态"证据闸门）。
-2. **webconsole 通用**：`POST /api/ai/approvals/{request_id}/resolve`。
-3. **Kanban 看板兼容**：`POST /api/ai/kanban/subtasks/{id}/approve`（内部转中心）。
+同一事项已有待审批时不再开新票、不再发第二条私聊。`check_approval` 只报告状态，
+不返回确认码。`create_subagent(plugin_developer_agent)` 在插件安装还挂着时直接拒绝。
 
-批准→领域回调把子任务退回 `pending` 并 `kick_root`；拒绝→`failed`，主人格再决定
-`fail_task_tree`。插件安装审批（plugin_developer 多步状态机）同属此 category，
-断点续作链路不变。详见
-[`docs/AGENT_NODE_UNIFICATION_20260707.md`](../../../../docs/AGENT_NODE_UNIFICATION_20260707.md)。
+带确认码的新票：批准后领域回调做副作用（复制插件 / 执行冻住的命令或工具体），
+再把续作卡回灌进**提交时的那个会话**（能力代理是 `capagent_…`，不是群会话），
+权限沿用提交时的 `user_pm`。拒绝或超时发关闭通知。副作用失败、续作没有做成，
+或原来的会话已经不在时，关联任务标失败，不回灌。没有确认码哈希的旧票仍走
+原来的 `kick_root`，不私聊、不回灌。
+
+控制台：`POST /api/ai/approvals/{request_id}/resolve`。看板兼容端点内部转同一函数。
 
 ### 追问溯源（决策树强制路径）
 
@@ -250,12 +251,15 @@ APScheduler 任务 `ai_autonomy_tick`，每 5 分钟最多挑一个到期人格�
 表是空的时，首次延迟 10–20 分钟。这些门没过不写审计行。底片是空的则写一行休息，不打模型。
 
 一轮四段：观察底片（好感达到 `autonomy_care_min_zone` 的用户，主人始终留下；群摘要）
-→ 一次性 Agent（`create_by="Autonomy"`，工具表关闭，思考轮数用全局 `multi_agent_lenth`）
+→ 一次性 Agent（`create_by="Autonomy"`，工具表关闭，思考轮数用 `task_max_iterations`）
 → 只认成功工具的事实 → 交付。没做成事、或动力是休息，只记审计。
 
 交付三条：亲近或主人且对方没在说话，立刻把摘要发出去；熟人、配额满或对方正忙，挂到下次开口
 （4 小时，和定时任务的 300 秒合并槽分开）；自我探索只挂槽，不立刻发。模型点名的群或用户不在
 底片里，改成自我探索，不发到那个群。
+
+`send_message_by_ai` 的 `target_type=user` 发私聊。回群用这句发言上标出的群号。
+关心对象最近待过的另一个群不会拿来代替。同时传入 `user_id` 时，群消息才 @ 对方。
 
 代跑命令固定 `user_pm = 6`，对象必须在本轮观察名单。发送工具和高危执行不挂。
 审计表只有 `aiautonomyactivity`。问过模型的一轮把 `session_id` 写进行里，会话日志来源是

@@ -48,6 +48,7 @@ class RunOnceHost:
     turn_clock: datetime | None
     _session_logger: AISessionLogger
     _run_sent_texts: set[str]
+    read_image_ids: set[str]
     _run_disputes: list[str]
     _last_attempt_tool_calls: list[str]
     _last_attempt_delegated_render: bool
@@ -57,6 +58,10 @@ class RunOnceHost:
     _last_attempt_thinking: str
     _session_toolset_frozen: Optional[list[str]]
     _session_appended_tools: list[str]
+    #: 上一轮 log_tools_list 记下的装配名单，tools_change 的 diff 基线
+    _last_logged_tool_names: Optional[list[str]]
+    #: 上一轮 find_tools 挂出的工具名，标 tools_change.from_find_tools 用
+    _last_run_find_tools_names: list[str]
     _cancel_generation: AsyncEvent
     _history_iter_active: bool
     _consecutive_no_tool_rounds: int
@@ -169,5 +174,6 @@ class RunOnceHost:
         turn_graph: Optional[TurnGraph] = None,
         cheap_gate: Optional[CheapGate] = None,
         is_framework_injection: bool = False,
+        injection_reason: str = "",
     ) -> object:
         raise NotImplementedError

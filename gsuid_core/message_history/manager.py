@@ -15,12 +15,45 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Tuple, Literal, Optional
+from itertools import islice
 from threading import Lock
 from collections import deque
 from dataclasses import field, dataclass
 
-from gsuid_core.models import Event
+from gsuid_core.models import Event, Message
+
+
+def node_items_to_history(items: List[Message], *, register_media: bool = True) -> List[Dict[str, Any]]:
+    """node 子项序列化为可 JSON 化的 [{type, data}]，供 metadata 存回放。
+
+    只留 http(s) 直链：图片的本地路径原样留着，前端直接显示路径文本；base64 降级为
+    类型占位
+    """
+    from gsuid_core.utils.image.image_tools import normalize_image_for_history
+
+    result: List[Dict[str, Any]] = []
+    for item in items:
+        msg_type = item.type or "unknown"
+        data = item.data
+        if msg_type in ("image", "record", "video"):
+            raw = data.strip() if isinstance(data, str) else ""
+            if raw.startswith("link://"):
+                raw = raw[len("link://") :]
+            url = normalize_image_for_history(raw)
+            if url:
+                result.append({"type": msg_type, "data": url})
+            elif msg_type == "image" and raw and not raw.startswith("base64://"):
+                result.append({"type": "image", "data": raw})
+            else:
+                label = {"image": "[图片]", "record": "[语音]", "video": "[视频]"}.get(msg_type, f"[{msg_type}]")
+                result.append({"type": "text", "data": label})
+        elif msg_type == "node":
+            # normalize_node_items 已把内层 node 展开，残留的只剩超深占位
+            continue
+        else:
+            result.append({"type": msg_type, "data": "" if data is None else str(data)})
+    return result
 
 
 def _estimate_tokens(text: str) -> int:
@@ -114,6 +147,7 @@ class HistoryManager:
         self._session_metadata: Dict["Event", Dict[str, Any]] = {}
         # Token 计数: {Event: int} 每个 session 的当前 Token 总量
         self._session_tokens: Dict["Event", int] = {}
+        self._msg_id_cache: Dict[Tuple["Event", str], Optional[MessageRecord]] = {}
         self._lock = Lock()
 
     def _get_storage_event(self, event: "Event") -> "Event":
@@ -142,6 +176,7 @@ class HistoryManager:
         user_name: Optional[str] = None,
         user_avatar: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        segments: Optional[List[Dict[str, Any]]] = None,
     ) -> MessageRecord:
         """
         添加一条消息到历史记录
@@ -155,6 +190,8 @@ class HistoryManager:
             user_name: 发送者昵称（可选）
             user_avatar: 发送者头像URL（可选）
             metadata: 可选的元数据
+            segments: 消息段数组。**不进内存**，只随广播和缓存落库，
+                控制台要还原按钮 / 卡片靠它
 
         Returns:
             创建的消息记录
@@ -215,6 +252,32 @@ class HistoryManager:
                 self._session_metadata[storage_event]["last_access"] = now
                 self._session_metadata[storage_event]["history_length"] = len(history)
 
+        # 控制台会话页靠这条实时推送增量，不用轮询
+        try:
+            from gsuid_core.message_history.hub import get_history_hub
+            from gsuid_core.message_history.segments import segments_preview, chat_message_from_record
+
+            message = chat_message_from_record(record, segments)
+            # 列表里那行摘要由后端算，前端不用再写一份（两边口径容易走偏）
+            message["preview"] = segments_preview(message.get("segments") or [])
+            get_history_hub().publish(
+                {
+                    "type": "message",
+                    "session_id": storage_event.session_id,
+                    "message": message,
+                }
+            )
+        except Exception:
+            pass
+
+        # 开了「消息缓存」才落库，只是投递，不阻塞这里
+        try:
+            from gsuid_core.message_history.cache import enqueue, payload_from_record
+
+            enqueue(payload_from_record(storage_event, record, segments))
+        except Exception:
+            pass
+
         return record
 
     def _retain_rolling(self, storage_event: "Event") -> None:
@@ -255,6 +318,45 @@ class HistoryManager:
             records = records[-limit:]
 
         return records
+
+    def get_tail(self, event: "Event", limit: int) -> List[MessageRecord]:
+        """只取最近 N 条，不复制整份 deque。"""
+        if limit <= 0:
+            return []
+        storage_event = self._get_storage_event(event)
+        with self._lock:
+            history = self._histories.get(storage_event)
+            if not history:
+                return []
+            total = len(history)
+            start = max(0, total - limit)
+            return list(islice(history, start, total))
+
+    def get_before(self, event: "Event", before: float, limit: int) -> List[MessageRecord]:
+        """取比 ``before`` 更早的最近 ``limit`` 条（时间正序）。
+
+        控制台往上翻页用：从队尾倒着扫，扫够就停，不用把整份历史复制出来再过滤。
+        ``before <= 0`` 表示不限，等价于 ``get_tail``。
+
+        **同一时间戳的一批必须整批返回**：游标只带时间戳，切开的话下一页用
+        ``timestamp < 游标`` 会把剩下的那几条直接跳过（机器人连发时时间戳会相同）。
+        """
+        if limit <= 0:
+            return []
+        storage_event = self._get_storage_event(event)
+        with self._lock:
+            history = self._histories.get(storage_event)
+            if not history:
+                return []
+            picked: List[MessageRecord] = []
+            for record in reversed(history):
+                if before > 0 and record.timestamp >= before:
+                    continue
+                if len(picked) >= limit and record.timestamp != picked[-1].timestamp:
+                    break
+                picked.append(record)
+        picked.reverse()
+        return picked
 
     def search_recent_for_cognition(
         self,
@@ -312,6 +414,42 @@ class HistoryManager:
             history = self._histories.get(storage_event, deque())
             return len(history)
 
+    def find_by_msg_id(self, event: "Event", msg_id: str) -> Optional[MessageRecord]:
+        """按平台消息 ID 在当前会话滑动窗口中倒序反查单条消息。"""
+        if not msg_id:
+            return None
+        storage_event = self._get_storage_event(event)
+        target_id = str(msg_id).strip()
+        with self._lock:
+            cache_key = (storage_event, target_id)
+            if cache_key in self._msg_id_cache:
+                return self._msg_id_cache[cache_key]
+            history = self._histories.get(storage_event)
+            if not history:
+                return None
+            for record in reversed(history):
+                if record.metadata:
+                    matched = False
+                    if "msg_id" in record.metadata:
+                        val = record.metadata["msg_id"]
+                        if val is not None and str(val).strip() == target_id:
+                            matched = True
+                    if not matched and "msg_id_list" in record.metadata:
+                        m_list = record.metadata["msg_id_list"]
+                        if isinstance(m_list, list) and target_id in m_list:
+                            matched = True
+                    if matched:
+                        if len(self._msg_id_cache) >= 1000:
+                            for k in list(self._msg_id_cache.keys())[:200]:
+                                self._msg_id_cache.pop(k, None)
+                        self._msg_id_cache[cache_key] = record
+                        return record
+            if len(self._msg_id_cache) >= 1000:
+                for k in list(self._msg_id_cache.keys())[:200]:
+                    self._msg_id_cache.pop(k, None)
+            self._msg_id_cache[cache_key] = None
+        return None
+
     def get_last_user_message(self, event: "Event") -> Optional[Dict[str, Any]]:
         """获取指定session中最后一条用户消息
 
@@ -345,7 +483,12 @@ class HistoryManager:
         with self._lock:
             if storage_event in self._histories:
                 self._histories[storage_event].clear()
-            return storage_event in self._histories
+            keys_to_del = [k for k in self._msg_id_cache if k[0] == storage_event]
+            for k in keys_to_del:
+                del self._msg_id_cache[k]
+            existed = storage_event in self._histories
+        self._publish_session_event("cleared", storage_event.session_id)
+        return existed
 
     def delete_session(self, event: "Event") -> bool:
         """删除整个session的历史记录（释放内存）
@@ -363,7 +506,18 @@ class HistoryManager:
             if storage_event in self._session_tokens:
                 del self._session_tokens[storage_event]
 
-            return deleted
+        if deleted:
+            self._publish_session_event("deleted", storage_event.session_id)
+        return deleted
+
+    def _publish_session_event(self, kind: str, session_id: str) -> None:
+        """会话级变化（清空 / 删除）也推给控制台，省得它自己轮询。"""
+        try:
+            from gsuid_core.message_history.hub import get_history_hub
+
+            get_history_hub().publish({"type": kind, "session_id": session_id})
+        except Exception:
+            pass
 
     def list_sessions(self) -> List["Event"]:
         """列出所有活跃的session（返回 Event 列表）"""
@@ -388,6 +542,7 @@ class HistoryManager:
 
             target_history = self._histories.setdefault(target_key, deque())
             merged_records = list(target_history) + list(source_history)
+            merged_records.sort(key=lambda rec: rec.timestamp)
             target_history.clear()
             target_history.extend(merged_records)
             self._session_tokens.pop(source_key, None)
@@ -419,25 +574,6 @@ class HistoryManager:
             del self._histories[source_key]
             return True
 
-    def get_session_info(self, event: "Event") -> Optional[Dict[str, Any]]:
-        """获取指定session的信息"""
-        with self._lock:
-            metadata = self._session_metadata.get(event)
-            if metadata:
-                return {
-                    "session_id": event.session_id,
-                    "created_at": metadata.get("created_at"),
-                    "last_access": metadata.get("last_access"),
-                    "history_length": metadata.get("history_length", 0),
-                    "user_id": event.user_id,
-                    "group_id": event.group_id,
-                    "bot_id": event.bot_id,
-                    "bot_self_id": event.bot_self_id,
-                    "WS_BOT_ID": event.WS_BOT_ID,
-                    "user_type": event.user_type,
-                }
-            return None
-
     def get_all_sessions_info(self) -> Dict[str, Dict[str, Any]]:
         """获取所有session的信息"""
         result = {}
@@ -463,68 +599,6 @@ class HistoryManager:
         with self._lock:
             if storage_event in self._session_metadata:
                 self._session_metadata[storage_event]["last_access"] = time.time()
-
-    def get_all_histories(self) -> Dict[str, List[MessageRecord]]:
-        """
-        获取所有session的历史记录（用于持久化）
-
-        Returns:
-            {session_id_str: [MessageRecord, ...]}
-        """
-        with self._lock:
-            result = {}
-            for ev, history in self._histories.items():
-                result[ev.session_id] = list(history)
-            return result
-
-    def load_histories(
-        self,
-        data: Dict[str, List[Dict[str, Any]]],
-    ) -> None:
-        """
-        批量加载历史记录（用于从持久化恢复）
-
-        Args:
-            data: {session_id_str: [message_dict, ...]}
-            格式: {WS_BOT_ID}:{bot_id}:{bot_self_id}:group:{group_id}
-            或 {WS_BOT_ID}:{bot_id}:{bot_self_id}:private:{user_id}
-        """
-        with self._lock:
-            for key_str, messages in data.items():
-                parts = key_str.split(":", 4)
-                if len(parts) != 5:
-                    continue
-
-                ws_bot_id, bot_id, bot_self_id, target_type, target_id = parts
-                if not ws_bot_id or not bot_id or not bot_self_id or not target_id:
-                    continue
-
-                if target_type == "group":
-                    group_id = target_id
-                    user_id = ""
-                    user_type: Literal["group", "direct", "channel", "sub_channel"] = "group"
-                elif target_type == "private":
-                    group_id = None
-                    user_id = target_id
-                    user_type = "direct"
-                else:
-                    continue
-
-                event_key = Event(
-                    bot_id=bot_id,
-                    bot_self_id=bot_self_id,
-                    group_id=group_id,
-                    user_id=user_id,
-                    user_type=user_type,
-                    WS_BOT_ID=ws_bot_id,
-                )
-                history = deque()
-                for msg_data in messages:
-                    record = MessageRecord.from_dict(msg_data)
-                    history.append(record)
-                self._histories[event_key] = history
-                self._session_tokens[event_key] = sum(_estimate_tokens(rec.content) for rec in history)
-                self._retain_rolling(event_key)
 
     def get_stats(self) -> Dict[str, Any]:
         """

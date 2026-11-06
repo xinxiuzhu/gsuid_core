@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger
-from gsuid_core.utils.database.base_models import async_maker
+from gsuid_core.utils.database import base_models
 from gsuid_core.ai_core.memory.database.models import (
     AIMemEdge,
     AIMemEvent,
@@ -271,7 +271,7 @@ async def clear_memories_for_scope_async(
         }
 
     try:
-        async with async_maker() as session:
+        async with base_models.async_maker() as session:
             if scope_key:
                 scope_keys = [scope_key]
             else:
@@ -377,7 +377,7 @@ async def clear_group_memories(
     try:
         from gsuid_core.ai_core.memory.scope import ScopeType, make_scope_key
 
-        async with async_maker() as session:
+        async with base_models.async_maker() as session:
             all_scope_keys: list[str] = []
 
             # 1. 收集 group 前缀的所有 scope_key

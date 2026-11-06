@@ -13,6 +13,7 @@ from fastapi import Depends
 from gsuid_core.ai_core.statistics import statistics_manager
 from gsuid_core.webconsole.app_app import app
 from gsuid_core.webconsole.web_api import require_auth
+from gsuid_core.ai_core.statistics.price import calculate_model_cost
 
 from ._api_tags import AI_STATS
 
@@ -508,3 +509,29 @@ async def get_statistics_history(
         return {"status": 0, "msg": "ok", "data": result}
     except Exception as e:
         return {"status": 1, "msg": f"获取历史统计失败: {str(e)}", "data": None}
+
+
+@app.get("/api/ai/statistics/estimate-cost", summary="估算单次模型调用费用", tags=AI_STATS)
+async def estimate_model_cost(
+    model: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+    _: Dict[str, Any] = Depends(require_auth),
+) -> Dict[str, Any]:
+    """按价格表（genai-prices + 补充价目）估算一次模型调用费用。
+
+    ``data`` 为 ``{cost, currency}``，cost 单位 USD；模型查不到价目时 cost 为 0。
+    """
+    try:
+        cost = calculate_model_cost(
+            model,
+            max(0, input_tokens),
+            max(0, output_tokens),
+            max(0, cache_read_tokens),
+            max(0, cache_write_tokens),
+        )
+        return {"status": 0, "msg": "ok", "data": {"cost": cost, "currency": "USD"}}
+    except Exception as e:
+        return {"status": 1, "msg": f"估算费用失败: {str(e)}", "data": None}

@@ -41,6 +41,7 @@ from gsuid_core.ai_core.agent_run.support import (
 from gsuid_core.ai_core.configs.ai_config import ai_config
 from gsuid_core.ai_core.control.directive import DISPUTE_EXTRA_KEY, is_control_envelope
 from gsuid_core.ai_core.agent_run.budget_ctx import _current_budget_scope
+from gsuid_core.ai_core.agent_run.request_limit import request_limit_for
 from gsuid_core.ai_core.agent_run.speech_policy import (
     spoken_user_body_len,
     resolve_speech_policy,
@@ -134,7 +135,7 @@ class PreparePhase(RunOnceHost):
         st.saw_structured_return = False
         # 本轮是否已委派 render_agent（勿把 research 的 create_subagent 当成已出图）
         st.delegated_render = False
-        # 同工具空转计数：连续同名工具调用次数；达阈值后注入 thrash fuse（每 run 一次）
+        # 同一调用（工具名 + 参数）连续次数；达阈值后注入 thrash fuse（每 run 一次）
         st.same_tool_streak = 0
         st.same_tool_name = ""
         st.thrash_fused = False
@@ -158,12 +159,8 @@ class PreparePhase(RunOnceHost):
         st.in_flight_short = False
         st.render_ack_seen = False
 
-        # 使用自定义迭代次数限制（如果有），否则使用配置默认值。
-        if self.max_iterations is not None:
-            st.limits = UsageLimits(request_limit=self.max_iterations)
-        else:
-            multi_agent_lenth: int = ai_config.get_config("multi_agent_lenth").data
-            st.limits = UsageLimits(request_limit=multi_agent_lenth)
+        # 思考轮只看 create_by。max_iterations 参数不再改这一限。
+        st.limits = UsageLimits(request_limit=request_limit_for(self.create_by))
 
         # 记录开始时间用于延迟统计
         st.start_time = time.time()
@@ -201,6 +198,7 @@ class PreparePhase(RunOnceHost):
             "turn_id": st.turn_id,
             "agent_run_id": st.turn_id,
             "run_sent_texts": self._run_sent_texts,
+            "read_image_ids": self.read_image_ids,
             # 同引用透传：纠正轮里 dispute_directive 的申辩要能被外层 settle 读到
             DISPUTE_EXTRA_KEY: self._run_disputes,
             "speech_policy": "free",
@@ -208,6 +206,12 @@ class PreparePhase(RunOnceHost):
             "parent_create_by": self.create_by,
             MODEL_DECLARES_VIDEO_KEY: self._model_declares_video(),
         }
+        if st.ev is not None and not (st.ev.image_id_list or st.ev.image_id):
+            from gsuid_core.ai_core.turn_pipeline import extract_pending_unread_images
+
+            _pending = extract_pending_unread_images(st.ev, self.read_image_ids)
+            if _pending:
+                st.run_extra["pending_unread_images"] = _pending
         if self.persona_name:
             st.run_extra["persona_name"] = self.persona_name
         if st.user_turn_id:
@@ -311,6 +315,11 @@ class PreparePhase(RunOnceHost):
                 if st.ev is not None:
                     _ut = str(st.ev.user_type or ("group" if st.ev.group_id else "direct"))
                 _has_reply = bool(st.ev.reply or st.ev.reply_id) if st.ev is not None else False
+                from gsuid_core.ai_core.outbound import inspect_quote_relation
+
+                is_rep_bot, is_bystander_q, is_stale_q = (
+                    inspect_quote_relation(st.ev) if st.ev is not None else (None, False, False)
+                )
                 st.tg = interaction_scaffold.build_turn_graph(
                     _probe or _cur_text,
                     persona_name=self.persona_name or "",
@@ -322,6 +331,10 @@ class PreparePhase(RunOnceHost):
                     followup_max_len=int(ai_config.get_config("scaffold_followup_max_len").data),
                     ambient_max_len=int(ai_config.get_config("scaffold_ambient_max_len").data),
                     has_reply=_has_reply,
+                    at_bot=bool(st.ev.at_bot) if st.ev is not None else False,
+                    is_reply_to_bot=is_rep_bot,
+                    is_bystander_quote=is_bystander_q,
+                    is_stale_quote=is_stale_q,
                 )
             if st.cheap is None:
                 st.cheap = interaction_scaffold.decide_cheap_gate(
@@ -424,7 +437,11 @@ class PreparePhase(RunOnceHost):
         # session logger：框架注入单独记账，不计入 user_input
         self._session_logger.log_run_start()
         if st.fw_msg and isinstance(st.final_user_message, str):
-            self._session_logger.log_system_injection(st.final_user_message, source="framework")
+            self._session_logger.log_system_injection(
+                st.final_user_message,
+                source="framework",
+                reason=st.injection_reason,
+            )
         else:
             self._session_logger.log_user_input(st.final_user_message)
 

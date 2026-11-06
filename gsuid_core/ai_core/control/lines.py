@@ -80,8 +80,8 @@ ITER_WRAP_NUDGE = (
 )
 
 THRASH_FUSE_NUDGE = (
-    "（系统校验：你已跨多轮连续只重复同一工具，仍无新进展。立即停止再连打该工具；"
-    "换另一路径（如 find_tools / 其它工具）或基于已有结果交付结论，禁止空转。）"
+    "（系统校验：同一工具、同一参数已连续调用超过 10 次。"
+    "停止再发这一次完全相同的调用。可以改参数，或基于已有结果交付结论。）"
 )
 
 UNMET_TOOL_REMINDER = (
@@ -125,12 +125,6 @@ POST_TOOL_OUTPUT_CONTRACT = (
 )
 
 POST_TOOL_OUTPUT_CONTRACT_RENDER_REQUIRED = POST_TOOL_OUTPUT_CONTRACT
-
-POST_DELIVERY_SILENCE_CONTRACT = (
-    "（系统：你已通过发送工具完成交付，本轮任务到此终结。"
-    "只输出 <SILENCE>。禁止再输出任何文字——包括「任务已完成 / 图已发送 / "
-    "无需追加发言」这类状态汇报；那是系统日志，不是角色台词。）"
-)
 
 POST_DISPUTE_SILENCE_CONTRACT = "（系统：申辩已记录，本轮控制面结束。只输出 <SILENCE>。禁止再调工具，禁止对用户说话。）"
 
@@ -244,9 +238,45 @@ def ownership_line(ago: str, topic: str, who: str) -> str:
     return f"（系统：{ago}你把「{topic}」发给了{who}。）"
 
 
-def delivery_wake_line(delivery: str, at_hint: str, title_ban: str) -> str:
+def delivery_wake_line(delivery: str, at_hint: str, title_ban: str, allow_render: bool = True) -> str:
     """看板交付回灌。at_hint / title_ban 可为空。"""
-    return f"[框架·任务完成]\n{delivery}\n（系统：一句收尾；有图就发出；要出图委派 render。{at_hint}{title_ban}）"
+    render_hint = (
+        "要出图委派 render。" if allow_render else "未启用出图委派，长结果用一两句概括交付，禁止委派 render_agent。"
+    )
+    return (
+        f"[框架·任务完成]\n{delivery}\n"
+        f"（系统：一句收尾；有图就发出；配文严禁脱离产物摘要臆造细节，未知结论只引导看图；"
+        f"{render_hint}{at_hint}{title_ban}）"
+    )
+
+
+def approval_resume_line(
+    *,
+    task_id: str,
+    ordinal: int,
+    display_name: str,
+    goal_line: str,
+    short_id: str,
+    effect: str,
+    happened: str,
+    phase: str,
+    next_step: str,
+    handle_line: str,
+) -> str:
+    """审批通过后的续作卡。不要用交付帧开头，否则入史会被收成一行。"""
+    goal = " ".join(goal_line.split())[:180]
+    done = " ".join(happened.split())[:1500]
+    return (
+        "审批续作。\n"
+        f"任务：{task_id} #{ordinal} {display_name}\n"
+        f"目标：{goal}\n"
+        f"审批 #{short_id}。批准后：{effect}\n"
+        f"刚刚：{done}\n"
+        f"账本：{phase}\n"
+        f"句柄：{handle_line}\n"
+        f"下一步：{next_step}\n"
+        "不要再 scaffold，不要再提交同一事项的审批。"
+    )
 
 
 AUTONOMY_MERGE_PREFIX = "（系统：你在空闲自主行动时完成了以下探索或关心行动："
@@ -269,3 +299,69 @@ def autonomy_proactive_fact_line(facts: list[str], resources: list[str]) -> str:
         f"{AUTONOMY_PROACTIVE_FACT_PREFIX}{joined_facts}{res_hint}。"
         "你只能基于上述已核验的事实向对方分享或关心，严禁声称完成了上述列表之外的任何操作。）"
     )
+
+
+def turn_seed_hint_line(items: str) -> str:
+    """items 是「`名`：简介」用分号接好的串。必须单行，入史前按前缀剥掉。"""
+    return (
+        "\n\n（系统提示：本轮检索到可能对口、但还没挂载的工具："
+        + items
+        + '。要用时先调 find_tools(need="工具名") 挂上，下一步再调用；用不上就忽略，禁止对用户念工具名。）'
+    )
+
+
+# ── 动态平衡 / 存在感（§多人格 Phase 3）──
+HOMEO_TIRED_LINE = "（你刚连着说了不少话，或者快到休息的点了，现在有点倦，回应简短随性些。）"
+HOMEO_EAGER_LINE = "（你歇了好一阵，正想找人搭话，兴致不错。）"
+OFFSCREEN_CARE_GENERIC = "顺手帮熟人翻了点资料"
+
+
+def presence_offscreen_line(ago: str, doing: str) -> str:
+    return f"（{ago}你闲着时{doing}。）"
+
+
+def presence_echo_line(ago: str, summary: str, answered: bool | None) -> str:
+    tail = "当时有人接了话" if answered is True else ("当时没人接茬" if answered is False else "")
+    return f"（{ago}你在这里主动说过「{summary}」{('，' + tail) if tail else ''}。）"
+
+
+def heartbeat_arc_section(content: str) -> str:
+    return (
+        f"\n\n[你前阵子自己琢磨过的一件小事]\n{content}\n"
+        "只有群里刚好聊到沾边的话题、或者气氛合适能顺嘴带出时才提；话题完全不搭就继续留着，别硬扯。"
+    )
+
+
+def quote_self_line(time_str: str) -> str:
+    """当前说话人引用了自己刚发的消息/图片。"""
+    return f"（被引用内容是当前说话人在 {time_str} 发出的发言/图片，不是你发的）"
+
+
+def quote_other_line(speaker_name: str, time_str: str) -> str:
+    """说话人引用了其他群友的发言。"""
+    return f"（被引用内容是群友 {speaker_name} 在 {time_str} 发出的发言）"
+
+
+def quote_command_card_line(time_str: str) -> str:
+    """说话人引用了群内刚生成的命令回执卡片。"""
+    return f"（被引用内容是群内于 {time_str} 执行命令生成的输出结果/卡片，非你口头发言）"
+
+
+def pending_unread_image_guide_line(img_id: str) -> str:
+    """当前说话人刚发出的挂起未读图片提权引导。"""
+    return f'（对方正在追问上面刚发出的待讨论图片，请先调用 read_image("{img_id}") 查看原图，严禁凭旧话题猜测图内内容）'
+
+
+def quote_bystander_line(time_str: str, target_desc: str) -> str:
+    """他人引用了你回复别人的发言（旁观借楼）。"""
+    return f"（被引用的是你于 {time_str} 回复 {target_desc} 的发言；当前说话人属于旁观借楼）"
+
+
+def quote_stale_line(time_str: str, minutes: int) -> str:
+    """说话人引用了你较早前的发言（翻旧账借楼）。"""
+    return f"（被引用的是你于 {time_str} 发送的较早发言（距今已超 {minutes} 分钟））"
+
+
+def quote_bot_line(time_str: str) -> str:
+    """原受件人正常追问你刚刚发出的发言。"""
+    return f"（被引用的是你于 {time_str} 发出的发言）"

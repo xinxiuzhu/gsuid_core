@@ -14,7 +14,7 @@ from PIL import Image
 from gsuid_core.models import Message
 
 MAX_IMAGE_BYTES = 1_500_000
-MAX_IMAGES = 3
+MAX_IMAGES = 1
 _KIND_LABELS: dict[str, str] = {
     "file": "[文件]",
     "record": "[语音]",
@@ -149,12 +149,20 @@ def _compress_image_data(data: bytes, max_bytes: int = MAX_IMAGE_BYTES) -> tuple
 
             has_alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
             if has_alpha:
-                for q in (85, 75, 60, 45, 30):
+                buf = io.BytesIO()
+                img.save(buf, format="PNG", optimize=True)
+                val = buf.getvalue()
+                if len(val) <= max_bytes:
+                    return val, "image/png"
+                for scale in (0.75, 0.5):
+                    sw = max(1, int(img.width * scale))
+                    sh = max(1, int(img.height * scale))
+                    scaled = img.resize((sw, sh), resample=Image.Resampling.LANCZOS)
                     buf = io.BytesIO()
-                    img.save(buf, format="WEBP", quality=q)
+                    scaled.save(buf, format="PNG", optimize=True)
                     val = buf.getvalue()
                     if len(val) <= max_bytes:
-                        return val, "image/webp"
+                        return val, "image/png"
                 bg = Image.new("RGB", img.size, (255, 255, 255))
                 if img.mode == "RGBA":
                     bg.paste(img, mask=img.split()[3])

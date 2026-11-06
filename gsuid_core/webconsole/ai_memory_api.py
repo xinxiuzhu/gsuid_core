@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 from fastapi import Depends
 from pydantic import Field, BaseModel
-from sqlmodel import col, func, delete, select
+from sqlmodel import col, func, select
 from sqlalchemy import or_
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -39,7 +39,6 @@ from gsuid_core.ai_core.memory.database.models import (
     AIMemPreference,
     AIMemCategoryEdge,
     mem_category_entity_members,
-    mem_episode_entity_mentions,
 )
 from gsuid_core.ai_core.memory.database.clear_ops import (
     clear_group_memories,
@@ -2074,125 +2073,10 @@ async def delete_scope_memory(
         status: 0成功，1失败
         data: 删除的记录数量统计
     """
-    try:
-        async with async_maker() as session:
-            # 统计待删除数量
-            ep_count = (
-                await session.execute(
-                    select(func.count()).select_from(AIMemEpisode).where(AIMemEpisode.scope_key == scope_key)
-                )
-            ).scalar() or 0
-            ent_count = (
-                await session.execute(
-                    select(func.count()).select_from(AIMemEntity).where(AIMemEntity.scope_key == scope_key)
-                )
-            ).scalar() or 0
-            edge_count = (
-                await session.execute(
-                    select(func.count()).select_from(AIMemEdge).where(AIMemEdge.scope_key == scope_key)
-                )
-            ).scalar() or 0
-            cat_count = (
-                await session.execute(
-                    select(func.count()).select_from(AIMemCategory).where(AIMemCategory.scope_key == scope_key)
-                )
-            ).scalar() or 0
-
-            # 删除 Qdrant 向量（按 scope_key 过滤）
-            try:
-                from gsuid_core.ai_core.rag.base import client
-                from gsuid_core.ai_core.rag.qmodels import Filter, MatchValue, FieldCondition
-                from gsuid_core.ai_core.memory.vector.collections import (
-                    MEMORY_EDGES_COLLECTION,
-                    MEMORY_ENTITIES_COLLECTION,
-                    MEMORY_EPISODES_COLLECTION,
-                )
-
-                if client is not None:
-                    for collection in [
-                        MEMORY_EPISODES_COLLECTION,
-                        MEMORY_ENTITIES_COLLECTION,
-                        MEMORY_EDGES_COLLECTION,
-                    ]:
-                        try:
-                            await client.delete(
-                                collection_name=collection,
-                                points_selector=Filter(
-                                    must=[FieldCondition(key="scope_key", match=MatchValue(value=scope_key))]
-                                ),
-                            )
-                        except _RUNTIME_ERRORS:
-                            pass
-            except _RUNTIME_ERRORS:
-                pass
-
-            # 删除数据库记录（按依赖顺序）
-            # 1. 获取该 scope 下的 category IDs
-            cat_ids_result = await session.execute(select(AIMemCategory.id).where(AIMemCategory.scope_key == scope_key))
-            cat_ids = [row[0] for row in cat_ids_result.fetchall()]
-
-            if cat_ids:
-                # 删除 CategoryEdge 关联
-                await session.execute(
-                    delete(AIMemCategoryEdge).where(col(AIMemCategoryEdge.parent_category_id).in_(cat_ids))
-                )
-                await session.execute(
-                    delete(AIMemCategoryEdge).where(col(AIMemCategoryEdge.child_category_id).in_(cat_ids))
-                )
-                # 删除 Category-Entity 关联
-                await session.execute(
-                    mem_category_entity_members.delete().where(mem_category_entity_members.c.category_id.in_(cat_ids))
-                )
-
-            # 2. 获取该 scope 下的 entity IDs
-            ent_ids_result = await session.execute(select(AIMemEntity.id).where(AIMemEntity.scope_key == scope_key))
-            ent_ids = [row[0] for row in ent_ids_result.fetchall()]
-
-            if ent_ids:
-                # 删除 Episode-Entity 关联
-                await session.execute(
-                    mem_episode_entity_mentions.delete().where(mem_episode_entity_mentions.c.entity_id.in_(ent_ids))
-                )
-
-            # 3. 获取该 scope 下的 episode IDs
-            ep_ids_result = await session.execute(select(AIMemEpisode.id).where(AIMemEpisode.scope_key == scope_key))
-            ep_ids = [row[0] for row in ep_ids_result.fetchall()]
-
-            if ep_ids:
-                await session.execute(
-                    mem_episode_entity_mentions.delete().where(mem_episode_entity_mentions.c.episode_id.in_(ep_ids))
-                )
-
-            # 4. 删除主表记录
-            await session.execute(delete(AIMemEdge).where(col(AIMemEdge.scope_key == scope_key)))
-            await session.execute(delete(AIMemEpisode).where(col(AIMemEpisode.scope_key == scope_key)))
-            await session.execute(delete(AIMemEntity).where(col(AIMemEntity.scope_key == scope_key)))
-            await session.execute(delete(AIMemCategory).where(col(AIMemCategory.scope_key == scope_key)))
-
-            # 5. 删除分层图元数据
-            await session.execute(
-                delete(AIMemHierarchicalGraphMeta).where(col(AIMemHierarchicalGraphMeta.scope_key == scope_key))
-            )
-
-            await session.commit()
-
-            return {
-                "status": 0,
-                "msg": "ok",
-                "data": {
-                    "scope_key": scope_key,
-                    "deleted_episodes": ep_count,
-                    "deleted_entities": ent_count,
-                    "deleted_edges": edge_count,
-                    "deleted_categories": cat_count,
-                },
-            }
-    except _RUNTIME_ERRORS as e:
-        return {
-            "status": 1,
-            "msg": f"删除 Scope 记忆失败: {str(e)}",
-            "data": None,
-        }
+    res = await clear_memories_for_scope_async(scope_key=scope_key)
+    if isinstance(res["data"], dict):
+        res["data"]["scope_key"] = scope_key
+    return res
 
 
 # 10. 清空记忆 API（高级批量删除）

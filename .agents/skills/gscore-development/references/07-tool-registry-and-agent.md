@@ -67,7 +67,7 @@ worker 子进程，脚本在那些 worker 里跑，不在 Core 的 Python 解释
 | 分类 | 加载方式 | 典型工具 |
 |------|----------|----------|
 | `self` | 仅主 Agent 可执行；**不一定进通道核** | `send_message_by_ai`；`add_once_task`/`add_interval_task` 钉核，列出/改/删走 L2 或检索（白名单拦插件滥用 `self`） |
-| `buildin` | 可检索；核内只留通道能力 | 核：`search_cognition`、`read_handle`。`web_search_tool` / `get_self_info` / `state_*` 按需 |
+| `buildin` | 可检索；核内只留通道能力 | 核：`search_cognition`、`read_handle`、`read_image`、`read_video`（有对应媒体才下发；视频默认还要本轮模型声明 video。未声明时 `find_tools` 仍能召回，召回后本轮可见）。`web_search_tool` / `get_self_info` / `state_*` 按需 |
 | `common` | 向量检索按需 | `create_subagent`、`collect_meme`、Kanban 管理类、`state_list`/`state_delete`/`state_append`。`search_image`/`search_meme`/`list_persisted_outputs`/`grep_persisted_outputs`/`artifact_get` 对主人格 `visible_to_capability_only`（回想走 `search_cognition`，深读走 `read_handle`） |
 | `media` | 向量检索按需；**主人格 exclusive 剥离** | `render_html_to_image`、`render_card`、`render_markdown_to_image`、**`render_chart_spec`**（声明式 SVG 图表；由 **`render_agent`** 白名单持有） |
 | `by_trigger` | 向量检索按需 | 插件 `to_ai` 自动注册的触发器工具 |
@@ -75,7 +75,7 @@ worker 子进程，脚本在那些 worker 里跑，不在 Core 的 Python 解释
 | `default` | **子 Agent 专属**（`create_subagent` 调） | 文件读写、`execute_file`、`execute_shell_command`、`_get_current_date` |
 | `meta` | **不被向量检索**，由 gs_agent 按门控显式注入 | `find_tools`（见 §7.5） |
 
-> **通道核是固定名单**（`MAIN_AGENT_CORE_TOOLS`，群/私同一份）：发现、回想、委派、发送、一次性/周期提醒入口。
+> **通道核是固定名单**（`MAIN_AGENT_CORE_TOOLS`，群/私同一份）：发现、回想、委派、发送、一次性/周期提醒入口，以及 `read_image` / `read_video`。后两个靠 `visible_when` 隐藏：没图不发 `read_image`；没视频，或本轮模型未声明 video，默认不发 `read_video`。模型没声明 video 时，`find_tools` 仍能按名字或「查看/读取视频」召回它，召回后本轮 schema 打开。
 > `get_main_agent_tools()` 按该名单装配，不再把整个 `self`+`buildin` 分类铺进 schema。
 > 定时任务仍注册为 `self`（仅主人格可执行）；创建入口钉核，列出/改/删经状态信号 / `find_tools` / 本句检索进入附加池。
 >
@@ -274,7 +274,7 @@ step2  RetrievableToolset 读集合 → get_weather 本步"出现"并可调用
 轮不下发其 schema，把保底实下发从 14 压到 ~12。两谓词都**连 `ctx.messages` 一起扫**（不只看
 `ev` 文本）——`web_fetch` 的 URL 常来自 `web_search_tool` 的**工具结果**，只看 `ev` 会在
 "search→fetch"时误隐藏（且 `visible_when` 同样作用于 `find_tools` 动态暴露，隐藏后现拉也救不回）。
-谓词一律**偏可见**。详见 [`docs/AI_CORE_TOOL_RETRIEVAL_UPGRADE_20260619.md`](../../../AI_CORE_TOOL_RETRIEVAL_UPGRADE_20260619.md) §11。
+谓词一律**偏可见**。`read_video` 用 `context_has_video`：默认要有视频句柄且模型声明了 video。`find_tools` 召回后同一轮不再藏。详见 [`docs/AI_CORE_TOOL_RETRIEVAL_UPGRADE_20260619.md`](../../../AI_CORE_TOOL_RETRIEVAL_UPGRADE_20260619.md) §11。
 
 > ⚠️ **约束**：`prepare` 每 step 对每个工具求值，`visible_when` 谓词**必须廉价、内存判定**，
 > 切忌每步查库/发网络。贵的前置条件走 L2 状态驱动（加载时判一次）。
@@ -394,12 +394,23 @@ Persona 与能力代理画像统一为 **AgentNode**（`ai_core/agent_node/`）�
 `gs_agent.dynamic_tools`（None=旧门 / True=装配并合并 / False=永不）；persona 节点
 `tool_names`（config.json 新键）在装配分支被并入保底池。预算不在节点上——统一读
 `ai_config` 的 `task_max_iterations` / `task_max_tokens`。task-mode 系统提示词 =
-节点身份核 + 交付边界叠加（`compose_task_prompt`，节点可 `boundary_override`）。
+节点身份核 + 交付边界叠加（`compose_task_prompt`，节点可 `boundary_override`），
+再附上委派人的人格 ID。需要替这个人做选择或答题时，用
+`get_self_persona_info(info_type="card")` 读 persona.md。不抄主会话的框架约束。
 
 另：`@ai_tools(approval="user"|"master")` 是统一审批中心的**工具策略门**——声明后
 每次调用强制过 `approval.tool_call_gate`（完全访问豁免仅 user 级 / 一次性放行
 grant / 自动提交审批），不依赖 LLM 自觉。详见
 [`docs/AGENT_NODE_UNIFICATION_20260707.md`](../../../../docs/AGENT_NODE_UNIFICATION_20260707.md)。
+
+**MCP 能力节点（2026-11）**：启用且 `register_as_ai_tools` 的 MCP 服务在启动时自动
+注册 `source="mcp"` 的 AgentNode（`node_id = mcp_{config_id}`，`in_roster=False` 固定、
+不进主人格花名册）。`mcp/node_profile.py` 生成基线节点；用户在控制台改的名字/描述/关键词
+以**覆盖层**（`MCPNodeOverlay`，`capability_agents/persistence.py`）落盘并与基线合并；
+generated_profile 由 `mcp/profile_generator.py` 用 `task_level="high"` 异步补全并直接生效。
+`find_tools` 对同一 MCP server 直调工具最多暴露 2 个，命中时对应节点必入专用档
+（`_apply_mcp_tool_quota`），引导走 `create_subagent` 委派。市场安装与 logo 代理见
+`webconsole/mcp_market_api.py` 与 `webconsole/docs/26-mcp-config.md`。
 
 ## 7.12 主 Agent 输出链路：统一输出闸门 `pre_send_gate`（2026-08）
 
@@ -438,13 +449,10 @@ grant / 自动提交审批），不依赖 LLM 自觉。详见
      `machine_dump` / **`delivery_narration`** / **`capability_absence`**（工具/接口+没挂没装，
      或另一个机器人+管/干，never-release）/ **`stale_present`**（同句把过期年月日说成今天/现在的读数）。
 
-**DELIVERED 交付终局态（2026-08-10，P0 OOC 根治）**：在 `pre_send_gate` **之前**还有一道
-`speech_policy.should_block_user_visible_text` 话术闸（`agent_run/speech_policy.py`）。
-`send_message_by_ai` **带台词**成功交付后，本 run 置 `speech_policy="delivered"`，对用户只许
-`<SILENCE>`——杜绝「任务已完成，图已发送给…」这类交付后状态汇报 OOC。media-only 与
-**等待安慰句**不置位，避免「先应一声再干活」被当成终局。状态字段在 `RunOnceState`
-（`delivered_terminal`），信号来自工具侧 `extra["delivered_with_speech"]`（结构信号）。
-`send_message_by_ai` 的 `text=` 与 TextPart 共用 `should_block`（配图被拦则丢掉台词仍发图）。不是第二条说话人。
+**发送之后可以继续说**：`send_message_by_ai` 带台词交付、以及发图之后，模型可以自己接着说，
+包括追问和较长收尾。话术闸不再因交付终局、引导追问或发图过长把台词改成沉默。
+编排词、交付状态汇报、长结构报告体、完成态和在途多说仍然拦截。拦住后先让模型重说一次，重说仍不合格才沉默。已经说过一句等待的在途句，以及纠正轮里再次被拦的话，不再重说。`text=` 与 TextPart 共用 `should_block`。
+配图发送不再把多段说明判成 `report_speech`。`send_message_by_ai` 话术不合格时整次不发，把原因退回给模型改写。不是第二条说话人。
 
 **出图在途（2026-08-16）**：`create_subagent` 的 `agent_profile` 解析到 `render_agent` 时
 （只看 profile 字段），ToolCall 当下即 `silence_only`。失败且未 ack 则回滚。在途默认
@@ -511,7 +519,7 @@ HTTP SSE 的 `: ping` 不是开场句。只有图、模型没写字时直接出 
 
 > 🧹 **内部资源句柄不许泄漏给用户——且要"补发"而非"留断链"**（`_resolve_and_deliver_leaked_handles`，
 > 2026-07-15）。`create_subagent` / kanban 回执带 `res_deb5b2e0d2a4` 这类句柄，供主人格
-> `send_message_by_ai(image_id=res_xxx)` 发图 / 发文件。弱模型有时**不发内容、反而把句柄本身写进
+> `send_message_by_ai(image_ids=res_xxx)` 发图 / `file_ids=res_xxx` 发文件（≤10MB）。弱模型有时**不发内容、反而把句柄本身写进
 > 正文**（"详细的放那里面了 res_xxx 自己看吧"）。**光删 ID 反而更怪**——剩下"放那里面了…自己看"
 > 指向空气；图片句柄更糟：模型压根没发图，删了 ID 用户啥也没有。故：**当正文除句柄外只剩一句短
 > 指路（<120 字，说明模型没真正交付内容）时，把句柄所指资源补发出去**——图片 artifact（`res_` 落盘

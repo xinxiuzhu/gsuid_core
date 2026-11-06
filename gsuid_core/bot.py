@@ -1,7 +1,21 @@
 import time
 import asyncio
 import inspect
-from typing import Any, Dict, List, Union, Literal, Mapping, Optional, Coroutine
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Tuple,
+    Union,
+    Literal,
+    Mapping,
+    Optional,
+    Coroutine,
+)
+
+if TYPE_CHECKING:
+    from gsuid_core.message_history import MessageRecord
 
 from fastapi import WebSocket
 from msgspec import json as msgjson
@@ -10,7 +24,15 @@ from starlette.websockets import WebSocketState
 import gsuid_core.i18n as i18n
 from gsuid_core.i18n import t
 from gsuid_core.logger import logger, trace_collector, bind_trace_context, clear_trace_context
-from gsuid_core.models import Event, Message, MessageSend, TaskContext, MessageReceive
+from gsuid_core.models import (
+    Event,
+    Message,
+    MessageSend,
+    TaskContext,
+    MessageReceive,
+    format_node_preview,
+    normalize_node_items,
+)
 from gsuid_core.segment import (
     MessageSegment,
     to_markdown,
@@ -27,7 +49,7 @@ from gsuid_core.load_template import (
     button_templates,
 )
 from gsuid_core.message_models import Button, ButtonType
-from gsuid_core.message_history import get_history_manager
+from gsuid_core.message_history import get_history_manager, node_items_to_history
 from gsuid_core.ai_core.outbound import get_outbound_image_label
 from gsuid_core.ai_core.wall_clock import pause_wall_clock
 from gsuid_core.utils.image.image_tools import normalize_image_for_history
@@ -95,6 +117,39 @@ def _truncate_for_log(obj: Any, max_str_len: int = 100) -> Any:
     return obj
 
 
+_DIRECT_AT_DEPTH = 8
+
+
+def _without_direct_at(messages: list[Message], depth: int = 0) -> tuple[list[Message], int]:
+    """去掉 at 段。私聊协议不接受 at，嵌在合并转发里的也去掉。"""
+    kept: list[Message] = []
+    dropped = 0
+    for msg in messages:
+        if msg.type == "at":
+            dropped += 1
+            continue
+        raw_items = msg.data
+        if msg.type != "node" or not isinstance(raw_items, list) or depth >= _DIRECT_AT_DEPTH:
+            kept.append(msg)
+            continue
+        inner: list[Message] = []
+        opaque = False
+        for item in raw_items:
+            if not isinstance(item, Message):
+                opaque = True
+                break
+            inner.append(item)
+        if opaque:
+            kept.append(msg)
+            continue
+        cleaned, nested_dropped = _without_direct_at(inner, depth + 1)
+        dropped += nested_dropped
+        if not cleaned:
+            continue
+        kept.append(Message(type="node", data=cleaned) if nested_dropped else msg)
+    return kept, dropped
+
+
 def message_list_to_str(messages: list[Message]) -> str:
     """将 Message 列表转为字符串"""
     s: list[str] = []
@@ -108,7 +163,8 @@ def message_list_to_str(messages: list[Message]) -> str:
         elif m.type == "video":
             s.append("[视频]")
         elif m.type == "file":
-            s.append("[文件]")
+            fname = m.data.split("|", 1)[0] if isinstance(m.data, str) else ""
+            s.append(f"[文件 {fname}]" if fname else "[文件]")
         elif m.type == "node":
             s.append("[合并转发]")
     return "\n".join(s)
@@ -142,6 +198,14 @@ class _Bot:
         # ── 数据请求回执机制（如群成员列表）──
         # echo -> Future[Optional[Any]]，与 _recall_waiters 隔离，避免类型混淆
         self._data_waiters: Dict[str, asyncio.Future] = {}
+        # echo -> MessageRecord 出站消息记录关联表（用于回执异步回写平台 msg_id）
+        self._echo_records: Dict[str, "MessageRecord"] = {}
+
+    def _register_echo_record(self, echo: str, record: "MessageRecord") -> None:
+        if len(self._echo_records) >= 1000:
+            for k in list(self._echo_records.keys())[:200]:
+                self._echo_records.pop(k, None)
+        self._echo_records[echo] = record
 
     def _add_bg_task(self, task: asyncio.Task) -> None:
         """将后台任务加入 bg_tasks，并注册完成时自动移除的回调。
@@ -223,10 +287,20 @@ class _Bot:
             return False
         data = seg.data
         if isinstance(data, dict) and "echo" in data and data["echo"] is not None:
-            fut = self._recall_waiters.pop(str(data["echo"]), None)
+            echo_key = str(data["echo"])
+            fut = self._recall_waiters.pop(echo_key, None)
+            rec = self._echo_records.pop(echo_key, None)
+            _mid = data["id"] if "id" in data else None
+            if rec is not None and rec.metadata is not None and _mid is not None:
+                new_id = str(_mid[0]) if isinstance(_mid, list) else str(_mid)
+                rec.metadata["msg_id"] = new_id
+                if "msg_id_list" not in rec.metadata:
+                    rec.metadata["msg_id_list"] = []
+                m_list = rec.metadata["msg_id_list"]
+                if isinstance(m_list, list) and new_id not in m_list:
+                    m_list.append(new_id)
             if fut is not None and not fut.done():
                 # 消息 ID 统一规范化为 str，多条发送返回的 list 在外层扁平化处理。
-                _mid = data["id"] if "id" in data else None
                 if _mid is None:
                     fut.set_result(None)
                 elif isinstance(_mid, list):
@@ -308,9 +382,10 @@ class _Bot:
             logger.debug(t("log.bot.mute_check_fail", error=e))
 
         # 记录 bot 回复到历史记录
+        # 真正的 add_message 挪到转换之后：控制台要看的是最终发出去的那条
+        _record: Optional["MessageRecord"] = None
+        _hist_pending: Optional[Tuple[Event, str, Dict[str, Any]]] = None
         try:
-            history_manager = get_history_manager()
-
             # 确定 group_id 和 user_id
             if target_type == "direct":
                 _hist_group_id = None
@@ -339,10 +414,15 @@ class _Bot:
                 text_parts = []
                 image_count = 0
                 out_images = []
+                node_items: List[Dict[str, Any]] = []
                 for msg in message:
                     if isinstance(msg, Message):
                         if msg.type == "text":
                             text_parts.append(str(msg.data))
+                        elif msg.type == "node":
+                            # 合并转发：子项进 metadata 供控制台展开，正文落摘要而不是 [node]
+                            node_items.extend(node_items_to_history(normalize_node_items(msg.data)))
+                            text_parts.append(format_node_preview(normalize_node_items(msg.data)))
                         elif msg.type == "image":
                             image_count += 1
                             if msg.data:
@@ -354,11 +434,16 @@ class _Bot:
                                     pass
                         elif msg.type == "at":
                             text_parts.append(f"@{msg.data}")
+                        elif msg.type == "file":
+                            fname = msg.data.split("|", 1)[0] if isinstance(msg.data, str) else ""
+                            text_parts.append(f"[文件 {fname}]" if fname else "[文件]")
                         else:
                             text_parts.append(f"[{msg.type}]")
                     elif isinstance(msg, str):
                         text_parts.append(msg)
                 content = " ".join(text_parts)
+                if node_items:
+                    metadata["node"] = node_items
                 if out_images:
                     metadata["images"] = out_images
                 if image_count > 0:
@@ -371,6 +456,10 @@ class _Bot:
             elif isinstance(message, Message):
                 if message.type == "text":
                     content = str(message.data)
+                elif message.type == "node":
+                    # 合并转发：子项进 metadata，正文落摘要
+                    metadata["node"] = node_items_to_history(normalize_node_items(message.data))
+                    content = format_node_preview(normalize_node_items(message.data))
                 elif message.type == "image":
                     content = get_outbound_image_label() or "[图片]"
                     metadata["type"] = "image"
@@ -381,6 +470,10 @@ class _Bot:
                                 metadata["images"] = [norm]
                         except Exception:
                             pass
+                elif message.type == "file":
+                    fname = message.data.split("|", 1)[0] if isinstance(message.data, str) else ""
+                    content = f"[文件 {fname}]" if fname else "[文件]"
+                    metadata["type"] = "file"
                 else:
                     content = f"[{message.type}]"
 
@@ -412,13 +505,7 @@ class _Bot:
                             sender_id=sender,
                         )
                     )
-                    history_manager.add_message(
-                        event=ev,
-                        role="assistant",
-                        content=content,
-                        user_name="AI",
-                        metadata=metadata,
-                    )
+                    _hist_pending = (ev, content, metadata)
         except Exception as e:
             logger.debug(t("log.bot.record_history_fail", error=e))
 
@@ -434,6 +521,36 @@ class _Bot:
                 None,
                 bot_id,
             )
+
+        # 控制台「会话管理」要还原的是**最终发出去的那条**：转换、markdown 之后，
+        # 连 text2pic、node 拆帧都算完的形态。所以入库与广播都放在这里。
+        if _hist_pending is not None:
+            try:
+                from gsuid_core.message_history import segments_from_messages
+
+                _hist_ev, _hist_content, _hist_meta = _hist_pending
+                # add_message 存的是 event.user_id（提问的人），机器人自己发的那条
+                # 得单独记一份身份，控制台才显示得出头像和昵称
+                _hist_meta["sender"] = {
+                    "user_id": bot_self_id or bot_id,
+                    "nickname": bot_self_id or bot_id or "机器人",
+                }
+                from gsuid_core.ai_core.persona.speaking_ctx import get_speaking_persona
+
+                # 多人格：给 assistant 历史打上「谁在说」，dyadic/回放按人格归因
+                _speaking = get_speaking_persona()
+                if _speaking:
+                    _hist_meta["persona_name"] = _speaking
+                _record = get_history_manager().add_message(
+                    event=_hist_ev,
+                    role="assistant",
+                    content=_hist_content,
+                    user_name="AI",
+                    metadata=_hist_meta,
+                    segments=segments_from_messages(_message),
+                )
+            except Exception as e:
+                logger.debug(t("log.bot.record_history_fail", error=e))
 
         _message_result = []
         message_result: List[List[Message]] = []
@@ -489,6 +606,10 @@ class _Bot:
         _recall_requested: bool = wait_recall and task_event is None
         # _use_recall：在请求基础上，还要确有可发送帧 + 该连接未被判定为不支持，才真正登记 future。
         _use_recall: bool = _recall_requested and bool(message_result) and self._supports_recall is not False
+        # 是否跟踪 echo 关联以回写出站 msg_id（有历史记录待回写且连接未被判定为不支持）
+        _track_echo: bool = (
+            (_record is not None or _use_recall) and bool(message_result) and self._supports_recall is not False
+        )
         # 按帧登记，保持帧序（用于最终按序收集）
         _recall_echos: List[str] = []
         _recall_futs: List[asyncio.Future] = []
@@ -505,15 +626,26 @@ class _Bot:
                 if group_id:
                     mr.append(Message("group", group_id))
 
+                # QQ 私聊收到 at 段会整包解析失败，合并转发内部的 at 一并去掉
+                if target_type == "direct":
+                    mr, dropped_at = _without_direct_at(mr)
+                    if dropped_at:
+                        logger.debug(t("log.bot.drop_direct_at", count=dropped_at))
+                    if not any(seg.type != "group" for seg in mr):
+                        continue
+
                 # 本帧 echo：每帧各一，发前登记，避免回执先于登记到达的竞态
                 _echo: Optional[str] = None
-                if _use_recall:
+                if _track_echo:
                     self._echo_seq += 1
                     _echo = str(self._echo_seq)
-                    _fut: asyncio.Future = asyncio.get_running_loop().create_future()
-                    self._recall_waiters[_echo] = _fut
-                    _recall_echos.append(_echo)
-                    _recall_futs.append(_fut)
+                    if _use_recall:
+                        _fut: asyncio.Future = asyncio.get_running_loop().create_future()
+                        self._recall_waiters[_echo] = _fut
+                        _recall_echos.append(_echo)
+                        _recall_futs.append(_fut)
+                    if _record is not None:
+                        self._register_echo_record(_echo, _record)
 
                 send = MessageSend(
                     content=mr,
@@ -538,6 +670,7 @@ class _Bot:
                 if observe_memory and enable_ai and is_enable_memory and "主动会话" in memory_mode:
                     # memory 包会拉起记忆启动链，且可能再回到 Bot。
                     from gsuid_core.ai_core.memory import observe
+                    from gsuid_core.ai_core.persona.speaking_ctx import get_speaking_persona
 
                     try:
                         task = asyncio.create_task(
@@ -548,6 +681,7 @@ class _Bot:
                                 bot_self_id=bot_self_id,
                                 observer_blacklist=memory_config.observer_blacklist,
                                 message_type="group_msg" if target_type == "group" else "private_msg",
+                                persona_name=get_speaking_persona(),
                             )
                         )
                         self._add_bg_task(task)
@@ -604,6 +738,8 @@ class _Bot:
 
             # 能力探测：拿到任意真实 id 才算"支持回执"。断连会 set_result(None)，
             # 不能据此误判为支持——否则 _supports_recall 永远停在 True，无法再 latch 为不支持。
+            if _record is not None and ids and _record.metadata is not None:
+                _record.metadata["msg_id"] = str(ids[0])
             if ids:
                 self._supports_recall = True
                 self._recall_timeout_streak = 0
